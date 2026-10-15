@@ -1422,6 +1422,19 @@ pub fn encode_directory(
     before
 }
 
+/// Where a walk reading a directory's entries in order stands
+/// ([`Directory::step`]): the next entry, its row's head and totals, its
+/// block's bases, and a bitmap presence's word left after the entry before.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct InOrder {
+    next: usize,
+    head: u32,
+    totals: [u32; 4],
+    base: [u32; 4],
+    w: usize,
+    word: u64,
+}
+
 /// Where a directory finds its groups: a bitmap over the segment's groups
 /// with each word's rank (the entries before it), or the groups' indexes.
 #[derive(Clone, Copy, Debug)]
@@ -1445,7 +1458,10 @@ enum Presence {
 /// its group indexes, and the entry's fields are a row's deltas from its
 /// block's bases, with its count and container length the next row's less
 /// its own. Nothing of the entries before it is decoded (TIN's footer entry
-/// likewise locates a group's container directly).
+/// likewise locates a group's container directly). A walk that visits
+/// every group the record holds, in order (a disjunction), reads the
+/// entries in order instead ([`Directory::step`]), each from the row
+/// after the one before, with no seek.
 ///
 /// The presence and the record's totals (the last row's) are checked when
 /// the directory is parsed; each entry is checked as it is read: its group
@@ -1462,6 +1478,8 @@ pub struct Directory {
     wide: usize,
     bases: usize,
     rows: usize,
+    /// Where the frontiers start, past the rows.
+    frontiers: usize,
     row_bits: u32,
     /// Where each column's delta lies in a row, and its mask.
     shift: [u32; 4],
@@ -1557,6 +1575,7 @@ impl Directory {
             wide,
             bases,
             rows,
+            frontiers: rows + ((len + 1) * row_bits as usize).div_ceil(8),
             row_bits,
             shift,
             mask,
@@ -1685,30 +1704,44 @@ impl Directory {
     #[inline(always)]
     fn row(&self, r: usize) -> (u32, [u32; 4]) {
         debug_assert!(r <= self.len);
-        let bit = r * self.row_bits as usize;
+        let (head, deltas) = self.deltas(r * self.row_bits as usize);
+        let base = self.base(r / DIRECTORY_BLOCK);
+        (
+            head,
+            std::array::from_fn(|c| base[c].wrapping_add(deltas[c])),
+        )
+    }
+
+    /// The row starting at bit `bit` of the rows: its head and its deltas
+    /// from its block's bases.
+    #[inline(always)]
+    fn deltas(&self, bit: usize) -> (u32, [u32; 4]) {
         let at = self.rows + bit / 8;
         // A row of at most 57 bits lies within eight bytes from its first:
         // read as a u64 (most records' rows; a u128 shift is several
         // instructions on x86-64).
-        let (head, deltas): (u32, [u64; 4]) = if self.row_bits <= 57 {
+        if self.row_bits <= 57 {
             let raw = u64::from_le_bytes(self.load(at)) >> (bit % 8);
             (
                 raw as u32 & 63,
-                std::array::from_fn(|c| (raw >> self.shift[c]) & self.mask[c]),
+                std::array::from_fn(|c| ((raw >> self.shift[c]) & self.mask[c]) as u32),
             )
         } else {
             let raw = u128::from_le_bytes(self.load(at)) >> (bit % 8);
             (
                 raw as u32 & 63,
-                std::array::from_fn(|c| (raw >> self.shift[c]) as u64 & self.mask[c]),
+                std::array::from_fn(|c| ((raw >> self.shift[c]) as u64 & self.mask[c]) as u32),
             )
-        };
-        let bases: [u8; BASE_BYTES] = self.load(self.bases + r / DIRECTORY_BLOCK * BASE_BYTES);
-        let total = |c: usize| {
-            let base = u32::from_le_bytes(bases[4 * c..4 * c + 4].try_into().expect("four bytes"));
-            base.wrapping_add(deltas[c] as u32)
-        };
-        (head, [total(0), total(1), total(2), total(3)])
+        }
+    }
+
+    /// Block `k`'s bases: its first row's totals.
+    #[inline(always)]
+    fn base(&self, k: usize) -> [u32; 4] {
+        let bases: [u8; BASE_BYTES] = self.load(self.bases + k * BASE_BYTES);
+        std::array::from_fn(|c| {
+            u32::from_le_bytes(bases[4 * c..4 * c + 4].try_into().expect("four bytes"))
+        })
     }
 
     /// The group index of entry `b`.
@@ -1891,6 +1924,25 @@ impl Directory {
         };
         let (next_head, next) = self.row(b + 1);
         self.ahead.set((b + 1, next_head, next));
+        let entry = self.checked(index, head, v, next, groups)?;
+        self.last.set((b, entry));
+        Ok(entry)
+    }
+
+    /// The entry of group `index` whose row has head `head` and totals
+    /// `v`, the next row's totals `next`, checked against the record and
+    /// the segment's `groups`: its group holds its count, its container's
+    /// length is its kind's, and its buckets and frontier lie within the
+    /// record's.
+    #[inline(always)]
+    fn checked(
+        &self,
+        index: u32,
+        head: u32,
+        v: [u32; 4],
+        next: [u32; 4],
+        groups: &[Group],
+    ) -> Result<GroupEntry> {
         let group = groups
             .get(index as usize)
             .ok_or(Error::Corrupt("postings group index"))?;
@@ -1926,21 +1978,76 @@ impl Directory {
             return Err(Error::Corrupt("group directory entry"));
         }
         self.read.set(self.read.get() + 1);
-        let frontiers = self.rows + ((self.len + 1) * self.row_bits as usize).div_ceil(8);
-        let entry = GroupEntry {
+        Ok(GroupEntry {
             index,
             count,
             kind,
             at: v[AT],
             len,
             first: v[FIRST],
-            frontier: (frontiers + v[FRONTIER] as usize) as u32,
+            frontier: (self.frontiers + v[FRONTIER] as usize) as u32,
             tf_bit: v[TF],
             width,
             max_bucket,
+        })
+    }
+
+    /// The entry after the one `order` stands at (the first, at its
+    /// start), read in order: its group the presence's next, its row's
+    /// totals the next row's, which the step before decoded, and the row
+    /// after it decoded from its block's bases, read only as a row starts a
+    /// block. No rank is counted and nothing is sought, for a walk that
+    /// visits a record's groups in order (a disjunction's); its entry, as
+    /// [`Self::entry_of`]'s, is the entry read last. `None` past the last.
+    #[inline]
+    pub fn step(
+        &self,
+        order: &mut InOrder,
+        groups: &[Group],
+    ) -> Result<Option<(usize, GroupEntry)>> {
+        let b = order.next;
+        if b >= self.len {
+            return Ok(None);
+        }
+        if b == 0 {
+            let (head, v) = self.row(0);
+            order.head = head;
+            order.totals = v;
+            order.base = self.base(0);
+            order.w = 0;
+            if let Presence::Bitmap { words, .. } = self.presence {
+                order.word = self.word(words, 0);
+            }
+        }
+        let index = match self.presence {
+            Presence::Indexes { at } => self.read_index(at + b * self.wide) as u32,
+            Presence::Bitmap { words, len, .. } => {
+                // The presence holds `len` entries (the parse counted
+                // them), so a bit is left.
+                while order.word == 0 {
+                    order.w += 1;
+                    if order.w >= len {
+                        return Err(Error::Corrupt("postings directory"));
+                    }
+                    order.word = self.word(words, order.w);
+                }
+                let index = (order.w * 64) as u32 + order.word.trailing_zeros();
+                order.word &= order.word - 1;
+                index
+            }
         };
+        let r = b + 1;
+        if r.is_multiple_of(DIRECTORY_BLOCK) {
+            order.base = self.base(r / DIRECTORY_BLOCK);
+        }
+        let (head, deltas) = self.deltas(r * self.row_bits as usize);
+        let next = std::array::from_fn(|c| order.base[c].wrapping_add(deltas[c]));
+        let entry = self.checked(index, order.head, order.totals, next, groups)?;
+        order.head = head;
+        order.totals = next;
+        order.next = r;
         self.last.set((b, entry));
-        Ok(entry)
+        Ok(Some((b, entry)))
     }
 
     /// Entry `b`, its group index found first: the entry read last as it
@@ -4914,6 +5021,18 @@ mod directory_tests {
                 );
             }
         }
+        // Read in order, every entry, each then the entry read last.
+        let mut order = InOrder::default();
+        for (b, e) in entries.iter().enumerate() {
+            assert_eq!(
+                dir.step(&mut order, groups).unwrap(),
+                Some((b, *e)),
+                "step {b}"
+            );
+            assert_eq!(dir.seek(e.index, 0), (b, e.index), "seek after step {b}");
+            assert_eq!(dir.get(b, groups).unwrap(), *e, "get after step {b}");
+        }
+        assert_eq!(dir.step(&mut order, groups).unwrap(), None, "past the last");
     }
 
     proptest! {
@@ -5108,6 +5227,10 @@ mod directory_tests {
                         for group in 0..g.len() as u32 {
                             dir.seek(group, 0);
                             dir.find(group);
+                        }
+                        let mut order = InOrder::default();
+                        while let Some((_, e)) = dir.step(&mut order, g)? {
+                            p.container(&e).all()?;
                         }
                         dir.check_entries(g)?;
                         p.slots(&t.geometry)?;

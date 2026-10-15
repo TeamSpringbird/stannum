@@ -20,7 +20,7 @@ use segment::tinshape::docs::DocSet;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::EfCursor;
 use segment::tinshape::positions::Positions;
-use segment::tinshape::postings::{Directory, Form, GroupEntry, KIND_GRID, Postings};
+use segment::tinshape::postings::{Directory, Form, GroupEntry, InOrder, KIND_GRID, Postings};
 use segment::tinshape::segment::{Area, Segment};
 use segment::{Error, Result};
 use tinql::runtime::{Query, SpanTermSlot};
@@ -418,6 +418,26 @@ impl<'a> TermSet<'a> {
         }
         Self::entry(dir, &self.docs, b, Some(index));
         Some(index)
+    }
+
+    /// A grouped term's next group in order and its entry, read in order
+    /// (see [`Directory::step`]): `hint` moved to it, and its group index
+    /// given; `None` past its last (and for a term without a directory).
+    /// For a walk that asks for every group a term holds, in order.
+    #[inline]
+    fn step_index(&self, order: &mut InOrder, hint: &mut usize) -> Option<u32> {
+        let dir = self.dir.as_ref()?;
+        match dir.step(order, &self.docs.geometry.groups) {
+            Ok(Some((b, entry))) => {
+                *hint = b;
+                Some(entry.index)
+            }
+            Ok(None) => {
+                *hint = dir.len();
+                None
+            }
+            Err(e) => crate::corrupt(format!("Stannum postings: {e}")),
+        }
     }
 
     /// The term's group `group`, if it holds it, looked for from `hint`

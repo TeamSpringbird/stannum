@@ -31,8 +31,8 @@ use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
-    Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
-    array_bytes, higher, lower,
+    Directory, Form, GroupEntry, GroupFrontier, InOrder, KIND_ARRAY, KIND_EF, KIND_GRID,
+    LazyFooter, array_bytes, higher, lower,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -500,8 +500,8 @@ impl<'s, 'a> Sc<'s, 'a> {
     /// [`Walk::group_done`]). Each block is bounded as it is decoded, and
     /// its frontier is not kept as pairs ([`LazyFooter::decode_bounds`]):
     /// most blocks' are never read again. A grouped record's entries are
-    /// decoded in one pass ([`Directory::decode_all`]) and bounded as its
-    /// groups are visited.
+    /// read in order as its groups are visited ([`Directory::step`]) and
+    /// bounded then.
     fn decode_all(&mut self) {
         let f = match &mut self.footer {
             Bounds::Blocks(f) => f,
@@ -3506,15 +3506,25 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut next = vec![0u32; n];
         let mut from = 0u32;
         let mut fresh = vec![false; n];
+        // A term is asked for its next group only once the walk has passed
+        // its group at hand (`from` one past it), so a grouped term's next
+        // is the entry after it: read in order, not sought.
+        let grouped: Vec<bool> = self.sc.iter().map(Sc::grouped).collect();
+        let mut order = vec![InOrder::default(); n];
         loop {
             let mut g = u32::MAX;
             for i in 0..n {
                 if !fresh[i] || next[i] < from {
                     let t = self.sc[i].term;
                     let set = self.terms[t].as_mut().expect("scoring");
-                    next[i] =
-                        next_group(set, self.geometry, from, &mut self.mems[t].hint, self.touch)
-                            .unwrap_or(u32::MAX);
+                    let hint = &mut self.mems[t].hint;
+                    next[i] = if grouped[i] {
+                        set.step_index(&mut order[i], hint)
+                    } else {
+                        next_group(set, self.geometry, from, hint, self.touch)
+                    }
+                    .unwrap_or(u32::MAX);
+                    debug_assert!(next[i] >= from);
                     fresh[i] = true;
                 }
                 g = g.min(next[i]);
