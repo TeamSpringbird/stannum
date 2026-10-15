@@ -2156,10 +2156,16 @@ impl<'a> Directory<'a> {
         if b >= self.len {
             return Err(Error::Corrupt("group directory entry"));
         }
-        self.fill(b / DIRECTORY_BLOCK)?;
+        // Rows `b` and `b + 1` lie in `b`'s block (as its last row, the
+        // next block's first). The row read ahead was read after its own
+        // block was copied, which holds the next row too unless that row
+        // begins a block: a walk in order checks a block once.
         let (head, v) = match self.ahead.get() {
-            (r, head, totals) if r == b => (head, totals),
-            _ => self.row(b),
+            (r, head, totals) if r == b && b % DIRECTORY_BLOCK != 0 => (head, totals),
+            _ => {
+                self.fill(b / DIRECTORY_BLOCK)?;
+                self.row(b)
+            }
         };
         let (next_head, next) = self.row(b + 1);
         self.ahead.set((b + 1, next_head, next));
