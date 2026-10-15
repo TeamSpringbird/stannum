@@ -3629,6 +3629,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     self.present_list.push(i);
                 }
             }
+            // A group ahead, as in a conjunction (see [`Walk::ask_next`]):
+            // each present term's next group is its next directory entry,
+            // whose first reads arrive while this group is walked.
+            for &i in &self.present_list {
+                let t = self.sc[i].term;
+                let set = self.terms[t].as_ref().expect("scoring");
+                set.prefetch_entry(self.mems[t].hint + 1, AHEAD_LINES);
+            }
             self.or_group(g)?;
             self.group_done();
             from = g + 1;
