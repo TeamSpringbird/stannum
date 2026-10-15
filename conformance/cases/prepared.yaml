@@ -1,0 +1,63 @@
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+area: prepared
+description: >
+  Prepared statements under a generic plan (plan_cache_mode =
+  force_generic_plan), where the planner sees LIMIT and the query text as
+  parameters. Whether an engine still ranks only the top k there is
+  observable only as time, so each case records whether a statement_timeout
+  well above the top-k time and well below the time of scoring every match
+  ended the statement (a cancel capture), not the elapsed time.
+
+  The corpus has 400,000 rows that all match 'common' and ten that also hold
+  'needle': scoring every match of 'needle OR common' takes tens to hundreds
+  of milliseconds, a top 10 well under one. TIN 1.0.4 probes on 1M rows
+  (stannum-lab/tin-probes/round3, C4) measured a generic plan with LIMIT $n
+  at about 380 ms against 5 ms with a constant LIMIT.
+
+corpora:
+  prep_topk:
+    setup_sql:
+      - >-
+        INSERT INTO {table} SELECT n, 'common w' || (n % 1000) || repeat(' pad', n % 7)
+        || CASE WHEN n % 40000 = 0 THEN ' needle' ELSE '' END FROM generate_series(1, 400000) n
+
+cases:
+  - id: prepared.generic_limit.1
+    description: >
+      Top 10 of 'needle OR common' by full_score under a generic plan: with a
+      constant LIMIT (the control), with LIMIT a parameter declared int, then
+      with the query text a parameter too; each under a 40 ms
+      statement_timeout.
+    corpus: prep_topk
+    settings:
+      plan_cache_mode: force_generic_plan
+    capture:
+      # The control: a constant LIMIT, which both engines rank as a top k.
+      - cancel:
+          as: limit_constant
+          sql: >-
+            DEALLOCATE ALL;
+            PREPARE prepared_topk(text) AS SELECT id FROM {table} WHERE body ==> $1
+            ORDER BY {engine}.full_score(ctid) DESC LIMIT 10;
+            EXECUTE prepared_topk('needle OR common')
+          timeout_ms: 40
+      - cancel:
+          as: limit_param
+          sql: >-
+            DEALLOCATE ALL;
+            PREPARE prepared_topk(int) AS SELECT id FROM {table} WHERE body ==> 'needle OR common'
+            ORDER BY {engine}.full_score(ctid) DESC LIMIT $1;
+            EXECUTE prepared_topk(10)
+          timeout_ms: 40
+      - cancel:
+          as: query_and_limit_params
+          sql: >-
+            DEALLOCATE ALL;
+            PREPARE prepared_topk(text, int) AS SELECT id FROM {table} WHERE body ==> $1
+            ORDER BY {engine}.full_score(ctid) DESC LIMIT $2;
+            EXECUTE prepared_topk('needle OR common', 10)
+          timeout_ms: 40
+      - ranked: {query: 'needle OR common'}

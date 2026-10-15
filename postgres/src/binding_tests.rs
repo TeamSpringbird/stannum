@@ -367,6 +367,56 @@ mod tests {
         }
     }
 
+    /// An index expression PostgreSQL folds when it loads it (an `IN` list
+    /// as an array constant, `repeat` on constants computed, the nested
+    /// AND of a BETWEEN flattened) binds the search written as the index
+    /// was, as TIN 1.0.4 does: round 4's d6 probe indexed such a CASE and
+    /// every query on it was refused with "cannot compute scores".
+    #[pg_test]
+    fn folded_index_expressions_bind_their_searches() {
+        let expressions = [
+            "CASE WHEN id > 0 AND (id BETWEEN 1 AND 40) THEN body ELSE 'x' END",
+            "body || repeat(' y', 2)",
+            "CASE WHEN id IN (3, 6, 9) THEN body ELSE 'x' END",
+        ];
+        for (i, expression) in expressions.iter().enumerate() {
+            Spi::run(&format!(
+                "CREATE TABLE bind_folded_{i} (id int, body text);
+                 INSERT INTO bind_folded_{i} SELECT n,
+                   CASE WHEN n % 3 = 0 THEN 'beer wine' ELSE 'beer' END
+                 FROM generate_series(1, 50) AS n;
+                 CREATE INDEX ON bind_folded_{i} USING stannum (({expression}));
+                 CREATE TABLE bind_folded_control_{i} AS
+                   SELECT id, {expression} AS document FROM bind_folded_{i};
+                 CREATE INDEX ON bind_folded_control_{i} USING stannum (document);"
+            ))
+            .unwrap();
+            let control = score_bits(&format!(
+                "SELECT array_agg(stannum.full_score(ctid) ORDER BY id)
+                 FROM bind_folded_control_{i} WHERE document ==> 'wine'"
+            ));
+            assert!(!control.is_empty(), "{expression}");
+            let folded = score_bits(&format!(
+                "SELECT array_agg(stannum.full_score(ctid) ORDER BY id)
+                 FROM bind_folded_{i} WHERE ({expression}) ==> 'wine'"
+            ));
+            assert_eq!(folded, control, "{expression}");
+            let top = |table: &str, document: &str| {
+                Spi::get_one::<Vec<i32>>(&format!(
+                    "SELECT array_agg(id) FROM (SELECT id FROM {table}
+                     WHERE ({document}) ==> 'wine OR beer'
+                     ORDER BY stannum.score(ctid) DESC LIMIT 5) AS top"
+                ))
+                .unwrap()
+            };
+            assert_eq!(
+                top(&format!("bind_folded_{i}"), expression),
+                top(&format!("bind_folded_control_{i}"), "document"),
+                "{expression}"
+            );
+        }
+    }
+
     #[pg_test]
     fn implied_partial_indexes_score_their_rows() {
         Spi::run(

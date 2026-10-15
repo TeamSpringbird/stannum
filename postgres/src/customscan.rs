@@ -43,6 +43,7 @@ static PROFILE_COUNT_SELECTION: GucSetting<bool> = GucSetting::<bool>::new(false
 static COUNT_PAGE_THRESHOLD: GucSetting<i32> = GucSetting::<i32>::new(0);
 static FORCE_COUNT_PAGES: GucSetting<bool> = GucSetting::<bool>::new(false);
 static COUNT_FOLD: GucSetting<bool> = GucSetting::<bool>::new(true);
+static COUNT_NATIVE: GucSetting<bool> = GucSetting::<bool>::new(true);
 
 /// Method tables hold C string pointers; they are immutable and never
 /// touched off the backend's main thread.
@@ -179,10 +180,42 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_bool_guc(
+        c"stannum.native_in_place",
+        c"Read segments in TIN's shape in place from pinned shared buffers",
+        c"Off copies what queries read into per-backend chunks kept across queries, for comparison.",
+        &crate::storage::NATIVE_IN_PLACE,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"stannum.share_buffer_hints",
+        c"Find the shared buffer an index page was last pinned in through a table every backend shares",
+        c"Off keeps a table per backend, for comparison.",
+        &crate::storage::SHARE_BUFFER_HINTS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"stannum.own_pins",
+        c"Pin index pages found through their hints with one atomic operation, outside PostgreSQL's per-pin bookkeeping",
+        c"Off pins them through ReadRecentBuffer, for comparison.",
+        &crate::storage::OWN_PINS,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
         c"stannum.count_fold",
         c"Count Boolean term queries by folding document-ordinal streams",
         c"Off keeps the scalar and page-bitmap strategies; other query shapes always use those.",
         &COUNT_FOLD,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_bool_guc(
+        c"stannum.count_native",
+        c"Fold counts over segments' ctid sets where the query lowers to that fold",
+        c"Off folds every segment's translated ordinal streams instead, for comparison.",
+        &COUNT_NATIVE,
         GucContext::Userset,
         GucFlags::default(),
     );
@@ -879,13 +912,37 @@ unsafe fn safe_bound_expr(expr: *mut pg_sys::Node) -> bool {
             pg_sys::NodeTag::T_Const => {
                 (*expr.cast::<pg_sys::Const>()).consttype == pg_sys::INT8OID
             }
-            pg_sys::NodeTag::T_Param => {
-                let param = &*expr.cast::<pg_sys::Param>();
-                param.paramkind == pg_sys::ParamKind::PARAM_EXTERN
-                    && param.paramtype == pg_sys::INT8OID
+            pg_sys::NodeTag::T_Param => extern_param(expr, pg_sys::INT8OID),
+            // A parameter declared `int` or `smallint` reaches LIMIT and
+            // OFFSET through its implicit cast to `bigint`, which cannot
+            // fail and has no side effects.
+            pg_sys::NodeTag::T_FuncExpr => {
+                let cast = &*expr.cast::<pg_sys::FuncExpr>();
+                cast.funcresulttype == pg_sys::INT8OID
+                    && cast.funcformat == pg_sys::CoercionForm::COERCE_IMPLICIT_CAST
+                    && pg_sys::list_length(cast.args) == 1
+                    && {
+                        let arg = pg_sys::list_nth(cast.args, 0).cast::<pg_sys::Node>();
+                        (cast.funcid == INT4_TO_INT8 && extern_param(arg, pg_sys::INT4OID))
+                            || (cast.funcid == INT2_TO_INT8 && extern_param(arg, pg_sys::INT2OID))
+                    }
             }
             _ => false,
         }
+    }
+}
+
+/// `int8(integer)` and `int8(smallint)`: pg_proc's casts to `bigint`.
+const INT4_TO_INT8: pg_sys::Oid = pg_sys::Oid::from_u32(pg_sys::F_INT8_INT4);
+const INT2_TO_INT8: pg_sys::Oid = pg_sys::Oid::from_u32(pg_sys::F_INT8_INT2);
+
+/// `expr` is an external parameter (of a prepared statement) of type `ty`.
+unsafe fn extern_param(expr: *mut pg_sys::Node, ty: pg_sys::Oid) -> bool {
+    unsafe {
+        !expr.is_null()
+            && (*expr).type_ == pg_sys::NodeTag::T_Param
+            && (*expr.cast::<pg_sys::Param>()).paramkind == pg_sys::ParamKind::PARAM_EXTERN
+            && (*expr.cast::<pg_sys::Param>()).paramtype == ty
     }
 }
 
@@ -925,9 +982,9 @@ unsafe extern "C-unwind" fn plan_search_path(
             && runtime_bound_shape(root, rel)
             && safe_bound_expr(parse.limitCount)
             && (parse.limitOffset.is_null() || safe_bound_expr(parse.limitOffset))
-            && ((*parse.limitCount).type_ == pg_sys::NodeTag::T_Param
+            && ((*parse.limitCount).type_ != pg_sys::NodeTag::T_Const
                 || (!parse.limitOffset.is_null()
-                    && (*parse.limitOffset).type_ == pg_sys::NodeTag::T_Param))
+                    && (*parse.limitOffset).type_ != pg_sys::NodeTag::T_Const))
         {
             expressions.push(pg_sys::copyObjectImpl(parse.limitCount.cast()).cast());
             if !parse.limitOffset.is_null() {
@@ -1124,6 +1181,8 @@ struct ScanExec {
     pruned_k: usize,
     /// The pruned walk ran over the ordinal streams.
     ordinal_walk: bool,
+    /// The pruned walk read segments in TIN's shape.
+    native_walk: bool,
     /// Index pages the ordinal walk spent before it started, and walking.
     walk_blocks: (i64, i64),
     /// Every location emitted before a completion, across completions.
@@ -1146,6 +1205,8 @@ struct ScanExec {
     skipped_pages: usize,
     page_masks: Option<bool>,
     count_fold: bool,
+    /// Segments a count folded through their ctid sets.
+    ctid_folds: usize,
     selection_calls: usize,
     selection_time: std::time::Duration,
     estimation_time: std::time::Duration,
@@ -1155,6 +1216,9 @@ struct ScanExec {
     ordered: bool,
     /// Identity under which the scan publishes its scorer.
     scan_id: u64,
+    /// EXPLAIN ANALYZE runs the scan: the counters only it reports
+    /// (distinct pages) are kept too.
+    analyzing: bool,
 }
 
 impl Drop for ScanExec {
@@ -1300,6 +1364,7 @@ unsafe extern "C-unwind" fn begin_scan(
             pruned: false,
             pruned_k: 0,
             ordinal_walk: false,
+            native_walk: false,
             walk_blocks: (0, 0),
             emitted: FxHashSet::default(),
             candidates: None,
@@ -1313,6 +1378,7 @@ unsafe extern "C-unwind" fn begin_scan(
             skipped_pages: 0,
             page_masks: None,
             count_fold: false,
+            ctid_folds: 0,
             selection_calls: 0,
             selection_time: std::time::Duration::ZERO,
             estimation_time: std::time::Duration::ZERO,
@@ -1321,6 +1387,7 @@ unsafe extern "C-unwind" fn begin_scan(
             count_estimate: None,
             ordered,
             scan_id: crate::score::scan_id(),
+            analyzing: (*estate).es_instrument != 0,
         };
         let holder = PgMemoryContexts::For((*estate).es_query_cxt)
             .leak_and_drop_on_delete(Some(Box::new(exec)));
@@ -1336,7 +1403,7 @@ unsafe extern "C-unwind" fn begin_scan(
 /// bound enumerate and score every candidate; unordered scans use a stream.
 unsafe fn gather(exec: &mut ScanExec) {
     unsafe {
-        crate::score::reset_walk_blocks();
+        crate::score::reset_walk_blocks(exec.analyzing);
         exec.scores.clear();
         exec.pruned = false;
         exec.scored = None;
@@ -1371,7 +1438,7 @@ unsafe fn gather(exec: &mut ScanExec) {
             // candidate, the walk folds whole chunks. With tiebreak keys
             // every match ties with the k-th, so all are needed.
             let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
-            let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
+            let mut stream = crate::stream::CandidateStream::lazy(view, scan_query(exec));
             if !stream.recheck {
                 let mut rows = Vec::with_capacity(k);
                 while rows.len() < k {
@@ -1415,6 +1482,7 @@ unsafe fn gather(exec: &mut ScanExec) {
             exec.pruned = !top.complete;
             exec.pruned_k = k;
             exec.ordinal_walk = top.ordinal;
+            exec.native_walk = top.native;
             exec.walk_blocks = crate::score::walk_blocks();
             let scorer = scorer.take().expect("a top k needs a scorer");
             crate::score::publish_scan_scorer(exec.scan_id, scorer, &top.rows);
@@ -1435,6 +1503,9 @@ unsafe fn gather(exec: &mut ScanExec) {
 /// yields, so they are read from it instead of scoring every match. A query
 /// of common words and one rare word otherwise scored millions of rows as
 /// soon as an updated row's dead version took a place in the first top k.
+/// The stream is lazy: it folds a segment's groups as it reaches them, so
+/// the rows read the groups they are in (TIN reads elided terms in ctid
+/// order only to fill k).
 ///
 /// A query the scorer cannot prune, such as a phrase, is scored from the
 /// candidate stream instead, holding only the top `k`.
@@ -1460,7 +1531,7 @@ unsafe fn top_rows(
     };
     if top.zero_fill {
         let view = unsafe { crate::storage::view(pg_sys::Oid::from(exec.private.index_oid)) };
-        let mut stream = crate::stream::CandidateStream::new(view, unsafe { scan_query(exec) });
+        let mut stream = crate::stream::CandidateStream::lazy(view, unsafe { scan_query(exec) });
         if stream.recheck {
             return None;
         }
@@ -1490,7 +1561,7 @@ unsafe fn scan_query(exec: &ScanExec) -> Query {
 
 unsafe fn start_stream(exec: &mut ScanExec) {
     unsafe {
-        crate::score::reset_walk_blocks();
+        crate::score::reset_walk_blocks(exec.analyzing);
         let query = scan_query(exec);
         let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
         let stream = crate::stream::CandidateStream::new(view, query);
@@ -1513,8 +1584,15 @@ unsafe fn candidates(exec: &mut ScanExec) -> Vec<Tid> {
 fn candidates_in_view(exec: &mut ScanExec, query: &Query, view: &crate::storage::View) -> Vec<Tid> {
     let limits = Limits::default();
     let mut tids = Vec::new();
-    for ((segment, dead), label) in view.sources.iter().zip(&view.labels) {
+    // Segments in TIN's shape fold the query over their ctid sets.
+    let lowering = crate::native::Lowering::new(std::slice::from_ref(query));
+    for (i, ((segment, dead), label)) in view.sources.iter().zip(&view.labels).enumerate() {
         pgrx::check_for_interrupts!();
+        if let Some(lowered) = lowering.get(view, i)
+            && crate::native::visit_matches(view, i, &lowered, &mut |tid| tids.push(tid))
+        {
+            continue;
+        }
         let planned = plan(query, segment, &limits)
             .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
         let mut cursor: Box<dyn segment::set::Cursor> = planned.cursor;
@@ -1635,7 +1713,7 @@ unsafe fn complete(exec: &mut ScanExec) {
                     None
                 } else {
                     let view = crate::storage::view(pg_sys::Oid::from(exec.private.index_oid));
-                    let mut stream = crate::stream::CandidateStream::new(view, scan_query(exec));
+                    let mut stream = crate::stream::CandidateStream::lazy(view, scan_query(exec));
                     (!stream.recheck).then(|| {
                         let mut rows = Vec::with_capacity(deeper);
                         while rows.len() < deeper {
@@ -2114,16 +2192,34 @@ unsafe fn fold_count(
             pgrx::check_for_interrupts!();
             if i < view.immutable_sources {
                 let mut pending: Vec<(u32, Vec<u16>)> = Vec::new();
-                let sure = crate::storage::codec_in(
-                    crate::fold::count_segment(
-                        source.as_ref(),
-                        &view.dead_sets[i],
-                        query,
-                        &visibility,
-                        |block, offsets| pending.push((block, offsets.to_vec())),
+                // The segment's ctid sets where the query lowers to their
+                // fold, else its ordinal streams.
+                let native = (COUNT_NATIVE.get() && !exec.recheck)
+                    .then(|| {
+                        crate::fold::count_native(&view, i, query, &visibility, |block, offsets| {
+                            pending.push((block, offsets.to_vec()))
+                        })
+                    })
+                    .flatten();
+                let sure = match native {
+                    Some(result) => {
+                        exec.ctid_folds += 1;
+                        Some(crate::storage::codec_in(result, label))
+                    }
+                    // A positional query the source cannot fold natively is
+                    // counted through its candidates below.
+                    None if !crate::fold::supported(query) => None,
+                    None => crate::storage::codec_in(
+                        crate::fold::count_segment(
+                            source.as_ref(),
+                            &view.dead_sets[i],
+                            query,
+                            &visibility,
+                            |block, offsets| pending.push((block, offsets.to_vec())),
+                        ),
+                        label,
                     ),
-                    label,
-                );
+                };
                 if let Some(sure) = sure {
                     exec.skipped_pages += usize::from(sure > 0);
                     candidates += sure as usize;
@@ -2179,7 +2275,7 @@ unsafe extern "C-unwind" fn exec_count(
         }
         let mut count = 0i64;
         let fetch_slot = exec.fetch_slot;
-        crate::score::reset_walk_blocks();
+        crate::score::reset_walk_blocks(exec.analyzing);
         if heap_fallback(exec) {
             // Count through a heap scan with the original clause.
             let scan = pg_sys::table_beginscan(exec.heap, snapshot, 0, std::ptr::null_mut());
@@ -2207,7 +2303,13 @@ unsafe extern "C-unwind" fn exec_count(
             let diagnostic = FORCE_COUNT_PAGES.get()
                 || COUNT_PAGE_THRESHOLD.get() > 0
                 || PROFILE_COUNT_SELECTION.get();
-            if COUNT_FOLD.get() && !diagnostic && !exec.recheck && crate::fold::supported(&query) {
+            // A Boolean query folds over any segment; a phrase (a span
+            // needing every word) over segments in TIN's shape, which AND
+            // its words a group at a time and read positions only for the
+            // documents left (any other source counts its candidates).
+            let foldable = crate::fold::supported(&query)
+                || COUNT_NATIVE.get() && engine::tinshape::lower(&query, &mut Vec::new()).is_some();
+            if COUNT_FOLD.get() && !diagnostic && !exec.recheck && foldable {
                 exec.count_fold = true;
                 count = fold_count(node, exec, &query, view, visibility);
             } else {
@@ -2347,6 +2449,10 @@ unsafe extern "C-unwind" fn end_scan(node: *mut pg_sys::CustomScanState) {
             let cscan = (*node).ss.ps.plan.cast::<pg_sys::CustomScan>();
             if (*cscan).scan.scanrelid == 0 {
                 pg_sys::table_close(exec.heap, pg_sys::AccessShareLock as _);
+            }
+            if exec.analyzing {
+                // EXPLAIN reported them already.
+                segment::tinshape::blob::count_distinct_pages(false);
             }
         }
     }
@@ -2511,6 +2617,13 @@ unsafe extern "C-unwind" fn explain(
                     c"ordinal fold".as_ptr(),
                     es,
                 );
+                // Segments counted through their ctid sets instead.
+                pg_sys::ExplainPropertyInteger(
+                    c"Ctid Folds".as_ptr(),
+                    std::ptr::null(),
+                    exec.ctid_folds as i64,
+                    es,
+                );
             } else if let Some(pages) = exec.page_masks {
                 pg_sys::ExplainPropertyText(
                     c"Count Strategy".as_ptr(),
@@ -2533,10 +2646,11 @@ unsafe extern "C-unwind" fn explain(
             if let Some(scored) = exec.scored {
                 pg_sys::ExplainPropertyText(
                     c"Pruning".as_ptr(),
-                    if exec.ordinal_walk {
-                        c"ordinal".as_ptr()
-                    } else {
-                        c"block-max".as_ptr()
+                    match (exec.native_walk, exec.ordinal_walk) {
+                        (true, true) => c"ctid+ordinal".as_ptr(),
+                        (true, false) => c"ctid".as_ptr(),
+                        (false, true) => c"ordinal".as_ptr(),
+                        (false, false) => c"block-max".as_ptr(),
                     },
                     es,
                 );
@@ -2622,6 +2736,37 @@ unsafe extern "C-unwind" fn explain(
                 recent,
                 es,
             );
+            let memo = segment::tinshape::segment::memo_counts();
+            for (label, n) in [
+                (c"Records Parsed", memo.records_parsed),
+                (c"Records Kept", memo.records_kept),
+                (c"Footers Decoded", memo.footers_decoded),
+                (c"Footers Kept", memo.footers_kept),
+                (c"Records Forgotten", memo.records_forgotten),
+                (c"Footer Blocks Decoded", memo.footer_blocks),
+                (c"Footer Bytes Parsed", memo.footer_bytes),
+                (c"Footer Blocks Used", memo.blocks_used),
+                (c"Footer Blocks Whole", memo.footer_blocks_whole),
+                (c"Footer Bytes Whole", memo.footer_bytes_whole),
+                (c"Directories Parsed", memo.directories),
+                (c"Directory Entries Decoded", memo.directory_entries),
+                (c"Directory Bytes Parsed", memo.directory_bytes),
+                (c"Directory Entries Reached", memo.entries_reached),
+                (c"Directory Entries Loaded", memo.entries_used),
+            ] {
+                pg_sys::ExplainPropertyInteger(
+                    label.as_ptr(),
+                    std::ptr::null(),
+                    i64::try_from(n).unwrap_or(i64::MAX),
+                    es,
+                );
+            }
+            pg_sys::ExplainPropertyInteger(
+                c"Stream Groups Folded".as_ptr(),
+                std::ptr::null(),
+                crate::native::groups_folded(),
+                es,
+            );
             pg_sys::ExplainPropertyInteger(
                 c"Positions Checked".as_ptr(),
                 std::ptr::null(),
@@ -2665,6 +2810,33 @@ unsafe extern "C-unwind" fn explain(
                 .join(", ");
             if let Ok(text) = CString::new(touched) {
                 pg_sys::ExplainPropertyText(c"Page Touches By Area".as_ptr(), text.as_ptr(), es);
+            }
+            let phases = crate::score::phase_blocks()
+                .iter()
+                .map(|(name, pages)| format!("{name} {pages}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            if let Ok(text) = CString::new(phases) {
+                pg_sys::ExplainPropertyText(
+                    c"Buffer Accesses By Phase".as_ptr(),
+                    text.as_ptr(),
+                    es,
+                );
+            }
+            let native = segment::tinshape::blob::stats()
+                .iter()
+                .zip(segment::tinshape::blob::KIND_NAMES)
+                .filter(|(s, _)| **s != segment::tinshape::blob::KindStats::default())
+                .map(|(s, name)| {
+                    format!(
+                        "{name}: copied {} B in {} pages, pinned {}, stitched {} B in {} reads, unique {}",
+                        s.copied, s.copied_pages, s.pinned, s.stitched, s.stitches, s.unique
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            if let Ok(text) = CString::new(native) {
+                pg_sys::ExplainPropertyText(c"Native Reads By Kind".as_ptr(), text.as_ptr(), es);
             }
             let phases = crate::score::phase_disk()
                 .iter()

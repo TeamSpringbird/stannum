@@ -133,6 +133,10 @@ def crash_between_run_write_and_publication(sql, command, env, data, root, start
     The kill is timed on relation growth and lands on the folding backend
     itself, which stops writing at once; a kill that lands before the run
     write starts leaves the buffer intact, so the attempt simply repeats.
+    Whether the seal survives the kill depends on whether the WAL writer
+    flushed its record first: the orphans may be the promotion's run pages
+    behind a sealed write segment, or pages extended for it (zeroed) behind
+    a write buffer that is still open. The repeat covers both.
     Returns the number of orphaned pages reported."""
     page_warnings = ("SELECT count(*) FROM stannum.verify_index('docs_idx') "
                      "WHERE severity = 'warning' AND location LIKE 'page %'")
@@ -180,16 +184,23 @@ def crash_between_run_write_and_publication(sql, command, env, data, root, start
             continue
         assert grown, "orphans without observed growth"
         free_before = int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0"))
-        sql("VACUUM (INDEX_CLEANUP ON) docs")
+        # The seal was published before the crash, so its write segment is
+        # still sealed; in manual mode VACUUM leaves its promotion to the
+        # insert below rather than taking the reclaimed pages itself.
+        sql("SET stannum.index_maintenance_mode=manual;\nVACUUM (INDEX_CLEANUP ON) docs")
         assert sql(page_warnings) == "0"
         assert sql("SELECT count(*) FROM stannum.verify_index('docs_idx', true) WHERE severity = 'error'") == "0"
         free_after = int(sql("SELECT count(*) FROM pg_freespace('docs_idx') WHERE avail > 0"))
         assert free_after >= free_before + orphans, (free_before, free_after, orphans)
         reclaimed = sql("SELECT string_agg(blkno::text, ',') FROM pg_freespace('docs_idx') WHERE avail > 0")
-        # The interrupted fold repeats and takes the reclaimed pages first.
-        sql("SET stannum.write_buffer_docs=1; SET stannum.max_merge_docs=0; INSERT INTO docs VALUES (98000, 'orphan')")
-        # Pages taken leave the free space map at once; retired runs the
-        # insert reclaims may join it, so count only the pages VACUUM freed.
+        # The interrupted promotion repeats and takes the reclaimed pages
+        # first. The insert seals the write buffer if the seal was lost, and
+        # promote() then promotes the sealed segment either way.
+        sql("""SET stannum.index_maintenance_mode=manual; SET stannum.write_buffer_docs=1;
+            INSERT INTO docs VALUES (98000, 'orphan'); SELECT stannum.promote('docs_idx');""")
+        assert sql("SELECT count(*) FROM stannum.segment_info('docs_idx') WHERE kind = 'sealed'") == "0"
+        # Pages taken leave the free space map at once; other pages the
+        # promotion frees may join it, so count only the reclaimed ones.
         still_free = int(sql("SELECT count(*) FROM pg_freespace('docs_idx') "
                              "WHERE avail > 0 AND blkno = ANY('{%s}'::bigint[])" % reclaimed))
         assert still_free < free_after, (still_free, free_after)

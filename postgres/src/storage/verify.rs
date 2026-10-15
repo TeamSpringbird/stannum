@@ -18,7 +18,7 @@
 //!    the next one), pending-free entries and the buffer state;
 //! 2. every directory run and its page table: page kinds, chain length, byte
 //!    counts, the page table listing exactly the chain's blocks;
-//! 3. every segment blob through [`segment::verify::verify_segment`], plus
+//! 3. every segment blob through [`segment::tinshape::verify::verify_segment`], plus
 //!    its directory entry's document count and total length;
 //! 4. every dead list: decodes, sorted, a subset of the document table;
 //! 5. the write buffer chain and stream: page kinds, full pages before the
@@ -37,7 +37,8 @@ use std::ffi::c_void;
 
 use pgrx::{FromDatum, pg_guard, pg_sys};
 use segment::Tid;
-use segment::verify::{Finding, Findings, verify_dead_list, verify_forward_stream, verify_segment};
+use segment::tinshape::verify::verify_segment;
+use segment::verify::{Finding, Findings, verify_dead_list, verify_forward_stream};
 
 use super::layout::{
     self, BufferState, CHAIN_CAPACITY, KIND_BUFFER, KIND_FREE, KIND_META, KIND_RUN, Meta, NONE, Run,
@@ -180,7 +181,7 @@ impl Checker {
     /// Walks a run on behalf of `owner`. Directory runs (`exact`) must have
     /// every page but the last full, exactly `run.bytes` bytes and no link
     /// past the last page; pending runs are only required to be chains of
-    /// run pages. Returns the bytes and the blocks visited, or `None` when
+    /// run or buffer pages. Returns the bytes and the blocks visited, or `None` when
     /// the bytes could not be assembled.
     unsafe fn run(&mut self, run: Run, owner: &str, exact: bool) -> Option<(Vec<u8>, Vec<u32>)> {
         if run.is_empty() {
@@ -219,7 +220,8 @@ impl Checker {
                 break;
             };
             visited.push(block);
-            if page.kind != KIND_RUN {
+            // A pending run may be a promoted write segment's buffer pages.
+            if page.kind != KIND_RUN && (exact || page.kind != KIND_BUFFER) {
                 self.error(
                     owner.to_owned(),
                     format!(
@@ -386,8 +388,8 @@ impl Checker {
         }
     }
 
-    unsafe fn check_buffer(&mut self, state: &BufferState) {
-        let owner = "write buffer";
+    /// The write buffer, or a sealed write segment (`owner` names which).
+    unsafe fn check_buffer(&mut self, state: &BufferState, owner: &str) {
         if state.head == NONE {
             self.error(owner, "buffer state has no head page");
             return;
@@ -808,7 +810,10 @@ pub unsafe fn verify(index: pg_sys::Relation, heap_check: bool) -> Vec<Row> {
                     pgrx::check_for_interrupts!();
                     checker.check_segment(position, entry);
                 }
-                checker.check_buffer(&meta.buffer);
+                checker.check_buffer(&meta.buffer, "write buffer");
+                for (position, sealed) in meta.sealed.iter().enumerate() {
+                    checker.check_buffer(sealed, &format!("sealed write segment {position}"));
+                }
                 checker.check_pending(&meta);
                 checker.check_unreferenced();
                 checker.check_duplicates();
@@ -828,7 +833,7 @@ pub unsafe fn verify(index: pg_sys::Relation, heap_check: bool) -> Vec<Row> {
         .collect()
 }
 
-/// The pages of a chain starting at `first`: up to `limit` pages of `kind`,
+/// The pages of a chain starting at `first`: up to `limit` pages of `kinds`,
 /// stopping without complaint at the end of the chain, at a page beyond the
 /// index, of another kind or unreadable. Returns the pages and the block the
 /// walk stopped at: `NONE` when the chain ended, otherwise the page it could
@@ -841,7 +846,7 @@ pub(super) unsafe fn chain_pages(
     index: pg_sys::Relation,
     first: u32,
     limit: u32,
-    kind: u8,
+    kinds: &[u8],
 ) -> (Vec<u32>, u32) {
     let nblocks = unsafe { blocks(index) };
     let mut pages = Vec::new();
@@ -852,7 +857,7 @@ pub(super) unsafe fn chain_pages(
             break;
         }
         let buffer = unsafe { Buffer::read(index, block, false) };
-        if layout::kind(buffer.page()) != Ok(kind) {
+        if !layout::kind(buffer.page()).is_ok_and(|kind| kinds.contains(&kind)) {
             break;
         }
         let Ok((next, _)) = layout::chain(buffer.page()) else {
@@ -863,6 +868,10 @@ pub(super) unsafe fn chain_pages(
     }
     (pages, block)
 }
+
+/// The page kinds a pending (retired) chain holds: runs, and the buffer pages
+/// of promoted write segments.
+pub(super) const RETIRED: &[u8] = &[KIND_RUN, KIND_BUFFER];
 
 /// Every page `meta` references, by the ownership rules of the checker:
 /// page 0, each directory entry's run through its page table, the page-table
@@ -951,21 +960,26 @@ pub(super) unsafe fn referenced_pages(
             }
         }
     }
-    let (pages, ended) = unsafe { chain_pages(index, meta.buffer.head, extent, KIND_BUFFER) };
-    if ended != NONE {
-        return Err(format!(
-            "write buffer chain cannot continue at page {ended}"
-        ));
-    }
-    for block in pages {
-        mark(block);
+    for (owner, head) in std::iter::once(("write buffer".to_owned(), meta.buffer.head)).chain(
+        meta.sealed
+            .iter()
+            .enumerate()
+            .map(|(i, sealed)| (format!("sealed write segment {i}"), sealed.head)),
+    ) {
+        let (pages, ended) = unsafe { chain_pages(index, head, extent, &[KIND_BUFFER]) };
+        if ended != NONE {
+            return Err(format!("{owner} chain cannot continue at page {ended}"));
+        }
+        for block in pages {
+            mark(block);
+        }
     }
     for pending in &meta.pending {
         if already.is_some_and(|earlier| earlier.pending.contains(pending)) {
             continue;
         }
         let (pages, _) =
-            unsafe { chain_pages(index, pending.run.first, pending.run.blocks, KIND_RUN) };
+            unsafe { chain_pages(index, pending.run.first, pending.run.blocks, RETIRED) };
         for block in pages {
             mark(block);
         }

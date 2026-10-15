@@ -70,6 +70,8 @@ pub(crate) struct IndexScorer {
     dead: Vec<crate::storage::DeadSet>,
     /// The scoring terms and the query, which the ranked walk reads.
     scoring: Scorer,
+    /// The scoring terms' names, in the scorer's order.
+    names: Vec<String>,
     /// Computed on first request: the maximum over matching documents.
     max: Option<f32>,
     /// Scores the search scan already computed for the rows it emits, so the
@@ -643,9 +645,28 @@ impl IndexScorer {
     }
 
     /// Score of the document at `tid` in the first source listing it live.
+    /// A segment in TIN's shape finds it by its slot (see
+    /// [`engine::tinshape::score_at`]); the write buffer and sealed segments
+    /// by ordinal.
     fn score_listed(&mut self, tid: Tid) -> Option<f32> {
         for i in 0..self.view.sources.len() {
             let label = self.view.labels[i].as_str();
+            let terms = &self.scoring.terms;
+            let names = &self.names;
+            // Not this segment's row: the walk below would say so too.
+            if crate::storage::native_holds(&self.view, i, tid) == Some(false) {
+                continue;
+            }
+            if let Some(found) =
+                crate::storage::with_native_rows(&self.view, i, names, |segment, sets| {
+                    engine::tinshape::score_at_in(segment, terms, sets, tid)
+                })
+            {
+                match segment_error_in(found, label) {
+                    Some(score) => return Some(score),
+                    None => continue,
+                }
+            }
             let reader = &mut self.sources[i];
             let Some(ordinal) = reader.ordinal_of(tid, label) else {
                 continue;
@@ -780,22 +801,32 @@ thread_local! {
     /// that segment areas do not cover: the heap, and the index structures
     /// storage reads without a segment reader.
     static PHASE_DISK: RefCell<Vec<(&'static str, i64)>> = const { RefCell::new(Vec::new()) };
+    /// Shared buffers accessed (hit or read) per named phase: phases nest
+    /// (a run source's page reads within a native read), so they overlap.
+    static PHASE_BLOCKS: RefCell<Vec<(&'static str, i64)>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Runs `body`, charging the pages it reads from storage to `label`.
 pub(crate) fn charging<T>(label: &'static str, body: impl FnOnce() -> T) -> T {
     let before = disk_pages();
+    let accessed = blocks_used();
     let value = body();
-    let pages = disk_pages() - before;
-    if pages != 0 {
-        PHASE_DISK.with_borrow_mut(|phases| {
+    let add = |phases: &mut Vec<(&'static str, i64)>, pages: i64| {
+        if pages != 0 {
             match phases.iter_mut().find(|(name, _)| *name == label) {
                 Some(entry) => entry.1 += pages,
                 None => phases.push((label, pages)),
             }
-        });
-    }
+        }
+    };
+    PHASE_DISK.with_borrow_mut(|phases| add(phases, disk_pages() - before));
+    PHASE_BLOCKS.with_borrow_mut(|phases| add(phases, blocks_used() - accessed));
     value
+}
+
+/// Shared buffers accessed per phase since the counters were reset.
+pub(crate) fn phase_blocks() -> Vec<(&'static str, i64)> {
+    PHASE_BLOCKS.with_borrow(Clone::clone)
 }
 
 /// Pages read from storage per phase since the counters were reset.
@@ -823,13 +854,20 @@ pub(crate) fn area_bytes() -> [u64; segment::cache::AREAS] {
     segment::cache::area_bytes()
 }
 
-pub(crate) fn reset_walk_blocks() {
+/// Resets the walk counters as a scan starts; `analyzing` (EXPLAIN
+/// ANALYZE) also counts what only EXPLAIN reports, distinct pages.
+pub(crate) fn reset_walk_blocks(analyzing: bool) {
     segment::cache::reset_areas();
     engine::walk::reset_counters();
     VISIBILITY_CHECKS.set(0);
     VM_HITS.set(0);
     PHASE_DISK.with_borrow_mut(Vec::clear);
+    PHASE_BLOCKS.with_borrow_mut(Vec::clear);
+    segment::tinshape::blob::reset_stats();
+    segment::tinshape::blob::count_distinct_pages(analyzing);
+    segment::tinshape::segment::reset_memo_counts();
     crate::storage::reset_held_peak();
+    crate::native::reset_groups_folded();
 }
 
 /// Heap visibility checks since the last reset.
@@ -840,36 +878,6 @@ pub(crate) fn visibility_checks() -> i64 {
 /// Visibility checks the visibility map answered since the last reset.
 pub(crate) fn vm_hits() -> i64 {
     VM_HITS.get()
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-thread_local! {
-    /// For tests: the chunk load of a scan at which to cancel the query,
-    /// zero for none, and the pages held pinned when it was canceled.
-    static CANCEL_AT_LOAD: Cell<(i64, i64)> = const { Cell::new((0, 0)) };
-}
-
-/// Cancels the running query at its `load`-th chunk load, as a user's
-/// cancel request arriving mid-walk would; returns the pages held pinned
-/// at the last such cancel.
-#[cfg(any(test, feature = "pg_test"))]
-pub(crate) fn cancel_at_chunk_load(load: i64) -> i64 {
-    engine::walk::set_chunk_load_hook(Some(cancel_if_asked));
-    CANCEL_AT_LOAD.replace((load, 0)).1
-}
-
-#[cfg(any(test, feature = "pg_test"))]
-fn cancel_if_asked() {
-    let (at, _) = CANCEL_AT_LOAD.get();
-    if at != 0 && engine::walk::chunk_loads() >= at {
-        CANCEL_AT_LOAD.set((0, crate::storage::held_pages().0));
-        // SAFETY: the flags a cancel request's signal handler sets.
-        unsafe {
-            pg_sys::QueryCancelPending = 1;
-            pg_sys::InterruptPending = 1;
-        }
-        pgrx::check_for_interrupts!();
-    }
 }
 
 /// The seeded threshold, if any: ties are admitted, as the latest location.
@@ -933,6 +941,7 @@ impl IndexScorer {
             scored,
             zero_fill: false,
             ordinal: false,
+            native: false,
             streamed: true,
         })
     }
@@ -947,12 +956,17 @@ impl IndexScorer {
     /// With a `filter`, only rows that pass it are kept, so the rows are the
     /// best of those.
     pub(crate) fn top_k(&self, k: usize, ties: bool, filter: Option<RowFilter>) -> Option<TopK> {
+        let natives = crate::storage::natives(&self.view);
         let sources: Vec<Source<'_>> = (0..self.view.sources.len())
             .map(|i| Source {
                 index: &*self.view.sources[i].0,
                 label: &self.view.labels[i],
                 dead: &self.view.dead_sets[i],
                 key: self.view.keys.get(i).copied(),
+                native: natives
+                    .get(i)
+                    .and_then(Option::as_ref)
+                    .map(|native| native as &dyn engine::walk::NativeSegment),
             })
             .collect();
         let config = WalkConfig {
@@ -1314,6 +1328,7 @@ fn build_index_scorer_inner(
         sources,
         view,
         dead,
+        names: scorers.iter().map(|(name, _)| name.clone()).collect(),
         scoring: Scorer {
             terms: scorers,
             query,
@@ -1331,7 +1346,17 @@ impl IndexScorer {
             return max;
         }
         let mut candidates = BTreeSet::new();
-        for ((segment, dead), label) in self.view.sources.iter().zip(&self.view.labels) {
+        let lowering = crate::native::Lowering::new(std::slice::from_ref(&self.scoring.query));
+        for (i, ((segment, dead), label)) in
+            self.view.sources.iter().zip(&self.view.labels).enumerate()
+        {
+            if let Some(lowered) = lowering.get(&self.view, i)
+                && crate::native::visit_matches(&self.view, i, &lowered, &mut |tid| {
+                    candidates.insert(tid);
+                })
+            {
+                continue;
+            }
             let planned = plan(&self.scoring.query, &**segment, &Limits::default())
                 .unwrap_or_else(|error| pgrx::error!("Stannum query plan: {error}"));
             let mut cursor = planned.cursor;
@@ -1727,6 +1752,11 @@ pub(crate) unsafe fn matching_stannum_indexes(
     let stannum_am = unsafe { pg_sys::get_index_am_oid(stannum_name.as_ptr(), false) };
     let normalized = unsafe { pg_sys::copyObjectImpl(operand.cast()).cast::<pg_sys::Node>() };
     unsafe { pg_sys::ChangeVarNodes(normalized, query_varno, 1, 0) };
+    // Folded as `RelationGetIndexExpressions` folds an index's expression:
+    // `id IN (1, 2)` keeps its array as a constant, `repeat(' y', 2)` is
+    // computed and nested ANDs (a BETWEEN in a CASE) are flattened, so an
+    // operand written as the index was is found equal to it.
+    let normalized = unsafe { pg_sys::eval_const_expressions(std::ptr::null_mut(), normalized) };
     let normalized = unsafe { pg_sys::strip_implicit_coercions(normalized) };
     let heap = unsafe { pg_sys::table_open(heap_oid, pg_sys::AccessShareLock as _) };
     let indexes = unsafe { PgList::<pg_sys::Oid>::from_pg(pg_sys::RelationGetIndexList(heap)) };

@@ -27,3 +27,6 @@ segment = { path = "../segment" }
 thiserror.workspace = true
 tinql = { path = "../tinql" }
 tokenizer = { path = "../tokenizer" }
+
+[dev-dependencies]
+proptest = "1"

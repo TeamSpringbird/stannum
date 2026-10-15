@@ -33,8 +33,6 @@ def main():
     parser.add_argument('--workload', choices=['contention', 'vacuum'], default='contention')
     parser.add_argument('--docs', type=positive, default=32768)
     parser.add_argument('--scenario', choices=['merge', 'rewrite', 'mixed'], default='merge')
-    parser.add_argument('--baseline-vacuum-strategy', choices=['auto', 'direct', 'reconstruct'])
-    parser.add_argument('--integrated-vacuum-strategy', choices=['auto', 'direct', 'reconstruct'])
     parser.add_argument('--writer-rate', type=positive)
     parser.add_argument('--repeat', type=positive, default=200)
     parser.add_argument('--seconds', type=positive, default=20)
@@ -53,7 +51,7 @@ def main():
         'checkpoint_control': args.checkpoint_control, 'workload': args.workload, 'scenario': args.scenario, 'docs': args.docs,
         'seconds': args.seconds, 'rounds': args.rounds, 'repeat': args.repeat, 'writer_rate': args.writer_rate,
         'vacuum_config': {key: getattr(args, key) for key in ('delete_percent', 'vocabulary', 'distribution', 'query_shapes', 'reader_rate', 'reader_seconds', 'readers')},
-        'builds': {name: {'vacuum_strategy': getattr(args, name + '_vacuum_strategy'), 'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
+        'builds': {name: {'path': str(path), 'sha256': hashlib.sha256(path.read_bytes()).hexdigest()}
                    for name, path in binaries.items()},
         'harness_sha256': hashlib.sha256(harness.read_bytes()).hexdigest(),
     }
@@ -110,8 +108,7 @@ def main():
                         label + '-checkpoint')
                 print('START ' + label, flush=True)
                 if args.workload == 'vacuum':
-                    strategy = getattr(args, name + '_vacuum_strategy')
-                    workload = [] if strategy is None else ['--vacuum-strategy', strategy]
+                    workload = []
                     for key in ('delete_percent', 'vocabulary', 'distribution', 'query_shapes', 'reader_rate', 'reader_seconds', 'readers'):
                         value = getattr(args, key)
                         if value is not None:

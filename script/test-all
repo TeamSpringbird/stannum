@@ -182,6 +182,7 @@ step() {
                 run crash-before-publication python3 postgres/tests/crash_before_publication.py
                 run count-under-vacuum python3 postgres/tests/count_under_vacuum.py
                 run maintenance-worker-crash python3 postgres/tests/maintenance_worker_crash.py
+                run own-pins python3 postgres/tests/own_pins.py
             fi
             echo "== note: a pg_test build is installed; 'script/test-all install' restores the release build" ;;
         install)

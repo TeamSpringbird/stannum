@@ -10,9 +10,9 @@
 //!
 //! A format plugs in by providing, for an open index of its kind:
 //!
-//! - `promote`: make everything written so far immutable now (today: fold
-//!   the write buffer into a segment; a format with a sealed write segment
-//!   promotes it), merging nothing, and report it as a [`FoldReport`];
+//! - `promote`: make the sealed write segments immutable now, merging
+//!   nothing, and report it as a [`FoldReport`]; the write buffer (TIN's
+//!   mutable write segment) is left alone until it is full and sealed;
 //! - `merge`: merge toward a [`MergeRequest`]'s target and report a
 //!   [`MergeReport`];
 //! - `pass`: do what a queued job's kinds ask ([`PassRequest`]) and report a
@@ -33,14 +33,16 @@
 
 use pgrx::pg_sys;
 
-/// What [`promote`] did.
+/// What [`promote`] did, in TIN's `promote()` terms.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct FoldReport {
-    /// Documents moved from the write buffer into the new segment.
+    /// Sealed write segments consumed (TIN's `consumed_controls`).
+    pub consumed: u32,
+    /// Documents moved into immutable segments.
     pub docs: u64,
-    /// Distinct terms of the new segment.
+    /// Distinct terms of each promotion's documents, summed over promotions.
     pub terms: u64,
-    /// Segments published: one, or zero for an empty buffer.
+    /// Immutable segments published (TIN's `linked_segments`).
     pub segments: u32,
 }
 
@@ -81,6 +83,7 @@ pub struct MergeReport {
 /// What a maintenance worker's job asks for (see [`super::queue::kind`]).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PassRequest {
+    pub promote: bool,
     pub merge: bool,
     pub rewrite: bool,
     pub reclaim: bool,
@@ -93,12 +96,21 @@ pub struct PassReport {
     pub rewrites: u32,
 }
 
-/// Makes everything written to `index` so far immutable now. See the module.
+/// Promotes `index`'s sealed write segments now, each into one immutable
+/// segment or, with `extent_cap_bytes`, into several of about that many
+/// bytes of input. See the module.
 ///
 /// # Safety
 /// As the module's contract says.
-pub unsafe fn promote(index: pg_sys::Relation) -> FoldReport {
-    unsafe { crate::storage::fold_buffer(index) }
+pub unsafe fn promote(index: pg_sys::Relation, extent_cap_bytes: Option<u64>) -> FoldReport {
+    unsafe {
+        crate::storage::promote_sealed(
+            index,
+            crate::storage::layout::MAX_SEALED,
+            extent_cap_bytes,
+            0,
+        )
+    }
 }
 
 /// Merges `index` toward `request`'s target. See the module.
@@ -113,6 +125,7 @@ pub unsafe fn merge(index: pg_sys::Relation, request: MergeRequest) -> MergeRepo
 pub fn pass_request(kinds: u8) -> PassRequest {
     use super::queue::kind;
     PassRequest {
+        promote: kinds & kind::PROMOTE != 0,
         merge: kinds & kind::MERGE != 0,
         rewrite: kinds & kind::REWRITE != 0,
         reclaim: kinds & kind::RECLAIM != 0,

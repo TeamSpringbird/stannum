@@ -179,6 +179,26 @@ class PairedMeasurementsTests(unittest.TestCase):
         tin.bench.save(root / 'paired.json', campaign)
         return campaign
 
+    def test_trials_with_different_pinning_or_score_function_are_incompatible(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self.fixture(root)
+            self.assertTrue(tin.paired_report(root))
+            for directory, key, value in (('r01-baseline', 'cpu_pinning', dict(server_cpuset='0-7')),
+                                          ('r01-baseline', 'config', 'full_score')):
+                path = root / directory / 'manifest.json'
+                original = path.read_text()
+                manifest = json.loads(original)
+                if key == 'config':
+                    manifest['config']['score_function'] = value
+                else:
+                    manifest[key] = value
+                path.write_text(json.dumps(manifest))
+                with self.subTest(key=key):
+                    self.assertFalse(tin.paired_report(root))
+                    self.assertIn('incompatible', (root / 'report.md').read_text())
+                path.write_text(original)
+
     def test_visibility_drift_rejected_but_mutation_outcome_is_not_an_input(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -406,3 +426,175 @@ class SqlBatchTransportTests(unittest.TestCase):
             tin.sql_output('VACUUM documents', {})
             self.assertIn('-c', call.call_args.args[0])
             self.assertNotIn('--single-transaction', call.call_args.args[0])
+
+
+AWS_TOPOLOGY = Path(__file__).resolve().parent / 'aws/topology'
+
+
+def i7i():
+    # 16 cores x 2 threads, siblings numbered 16 apart, as Linux numbers an i7i.8xlarge.
+    return (AWS_TOPOLOGY / 'i7i.8xlarge-assumed.lscpu').read_text()
+
+
+class CpuPinningTests(unittest.TestCase):
+    def test_cpusets_round_trip_and_reject_bad_input(self):
+        self.assertEqual(tin.parse_cpuset('0-3,16-19'), [0, 1, 2, 3, 16, 17, 18, 19])
+        self.assertEqual(tin.format_cpuset([19, 0, 1, 2, 3, 16, 17, 18]), '0-3,16-19')
+        self.assertEqual(tin.format_cpuset([0, 2, 4]), '0,2,4')
+        for bad in ('', '3-1', '0,0', 'a', '1-'):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                tin.parse_cpuset(bad)
+
+    def test_lscpu_parsing_reads_vm_rows_without_numa(self):
+        rows = tin.parse_lscpu('CPU CORE SOCKET NODE ONLINE\n  0    0      0    -    yes\n  1    1      0    -    no\n')
+        self.assertEqual(rows, [dict(cpu=0, core=0, socket=0, node=0, online=True),
+                                dict(cpu=1, core=1, socket=0, node=0, online=False)])
+        with self.assertRaises(ValueError):
+            tin.parse_lscpu('Architecture: x86_64\n')
+
+    def test_siblings_take_whole_cores_and_the_client_gets_the_other_cores(self):
+        plan = tin.plan_cpus(i7i(), 8, 'siblings')
+        self.assertEqual((plan['server_cpuset'], plan['server_physical_cores'], plan['threads_per_core']),
+                         ('0-3,16-19', 4, 2))
+        self.assertEqual(plan['client_cpuset'], '4-15,20-31')
+        self.assertEqual(plan['idle_siblings'], '')
+        self.assertTrue(plan['smt'])
+
+    def test_distinct_cores_leave_their_siblings_idle_rather_than_to_the_client(self):
+        plan = tin.plan_cpus(i7i(), 8, 'distinct-cores')
+        self.assertEqual((plan['server_cpuset'], plan['server_physical_cores']), ('0-7', 8))
+        self.assertEqual(plan['idle_siblings'], '16-23')
+        self.assertEqual(plan['client_cpuset'], '8-15,24-31')
+
+    def test_without_smt_both_readings_are_the_same_cpus(self):
+        text = (AWS_TOPOLOGY / 'i8g.8xlarge-assumed.lscpu').read_text()
+        self.assertEqual(tin.plan_cpus(text, 8, 'siblings')['server_cpuset'],
+                         tin.plan_cpus(text, 8, 'distinct-cores')['server_cpuset'])
+        self.assertFalse(tin.plan_cpus(text, 8, 'siblings')['smt'])
+
+    def test_explicit_cpusets_and_impossible_requests_fail_loudly(self):
+        self.assertEqual(tin.plan_cpus(i7i(), 8, 'none', '8-11,24-27')['layout'], 'explicit')
+        with self.assertRaisesRegex(ValueError, '--cpus'):
+            tin.plan_cpus(i7i(), 8, 'none', '0-3')
+        with self.assertRaisesRegex(ValueError, 'does not have'):
+            tin.plan_cpus(i7i(), 8, 'none', '0-3,60-63')
+        with self.assertRaisesRegex(ValueError, 'whole number'):
+            tin.plan_cpus(i7i(), 7, 'siblings')
+        with self.assertRaisesRegex(ValueError, 'fewer than'):
+            tin.plan_cpus(i7i(), 17, 'distinct-cores')
+
+    def test_client_is_pinned_only_where_the_driver_shares_the_kernel(self):
+        plan = tin.plan_cpus(i7i(), 8, 'siblings')
+        prefix, note = tin.client_pinning(plan, 'Darwin')
+        self.assertEqual(prefix, [])
+        self.assertIn('4-15,20-31', note)
+        prefix, _ = tin.client_pinning(plan, 'Linux')
+        self.assertEqual(prefix, ['taskset', '-c', '4-15,20-31'])
+        self.assertEqual(tin.client_pinning(None, 'Linux')[0], [])
+
+
+def parsed(*extra):
+    return tin.parser().parse_args(['--driver', '/x/driver', 'run', '--dataset', '/x/data', '--output', '/x/out',
+                                    '--image', 'stannum-bench:test', *extra])
+
+
+class ProfileAndServerCommandTests(unittest.TestCase):
+    def test_unprofiled_runs_keep_the_old_defaults(self):
+        args = tin.apply_profile(parsed())
+        self.assertEqual((args.cpus, args.memory, args.shared_buffers, args.maintenance_work_mem, args.clients,
+                          args.shm_size, args.cpu_layout, args.build_memory, args.score_function),
+                         (4, '4g', '1GB', '512MB', 2, '1g', 'none', None, 'score'))
+
+    def test_v2_is_tin_106s_setup_and_explicit_flags_still_win(self):
+        args = tin.apply_profile(parsed('--profile', 'v2'))
+        self.assertEqual((args.cpus, args.memory, args.build_memory, args.shared_buffers, args.maintenance_work_mem,
+                          args.cpu_layout, args.max_parallel_maintenance_workers, args.clients, args.shm_size),
+                         (8, '64g', '64g', '24GB', '24GB', 'siblings', 8, 8, '16g'))
+        args = tin.apply_profile(parsed('--profile', 'v2', '--memory', '8g', '--cpu-layout', 'distinct-cores'))
+        self.assertEqual((args.memory, args.cpu_layout, args.build_memory), ('8g', 'distinct-cores', '64g'))
+
+    def test_legacy_is_the_launch_posts_quota_without_pinning(self):
+        args = tin.apply_profile(parsed('--profile', 'legacy'))
+        self.assertEqual((args.memory, args.build_memory, args.cpu_layout, args.max_parallel_maintenance_workers),
+                         ('32g', '64g', 'none', None))
+
+    def test_namespaces_built_by_hand_get_the_new_options(self):
+        args = tin.apply_profile(argparse.Namespace(cpus=8, memory='2g', shared_buffers='1GB'))
+        self.assertEqual((args.profile, args.score_function, args.cpuset_cpus, args.paradedb_image),
+                         (None, 'score', None, tin.PARADEDB_IMAGE))
+
+    def test_server_command_pins_and_sizes_each_engine(self):
+        args = tin.apply_profile(parsed('--profile', 'v2'))
+        plan = tin.plan_cpus(i7i(), 8, 'siblings')
+        stannum = tin.server_command(args, 'n', 'img', 'vol', Path('/p'), 'stannum', plan, ['--x'])
+        self.assertEqual(stannum[stannum.index('--cpuset-cpus') + 1], '0-3,16-19')
+        self.assertEqual(stannum[stannum.index('--memory') + 1], '64g')
+        self.assertEqual(stannum[stannum.index('--shm-size') + 1], '16g')
+        self.assertIn('--x', stannum)
+        settings = [stannum[i + 1] for i, a in enumerate(stannum) if a == '-c']
+        self.assertIn('max_parallel_maintenance_workers=8', settings)
+        self.assertIn('jit=off', settings)
+        paradedb = tin.server_command(args, 'n', 'pdb', 'vol', Path('/p'), 'paradedb', plan, [])
+        settings = [paradedb[i + 1] for i, a in enumerate(paradedb) if a == '-c']
+        # As the benchmarker starts ParadeDB: its auto-tuned work_mem and JIT stay.
+        self.assertNotIn('jit=off', settings)
+        self.assertNotIn('work_mem=16MB', settings)
+        self.assertIn('max_parallel_workers_per_gather=2', settings)
+        unpinned = tin.server_command(tin.apply_profile(parsed('--profile', 'legacy')), 'n', 'img', 'vol', Path('/p'),
+                                      'stannum', None, [])
+        self.assertNotIn('--cpuset-cpus', unpinned)
+        self.assertNotIn('max_parallel_maintenance_workers=8', unpinned)
+
+    def test_dry_run_prints_commands_without_docker_or_driver(self):
+        import io
+        from contextlib import redirect_stdout
+        args = parsed('--profile', 'v2', '--lscpu-file', str(AWS_TOPOLOGY / 'i7i.8xlarge-assumed.lscpu'),
+                      '--engines', 'stannum', 'paradedb', '--score-function', 'full_score', '--dry-run')
+        out = io.StringIO()
+        with redirect_stdout(out), patch.object(tin, 'output', side_effect=AssertionError('no docker')):
+            tin.run(args)
+        text = out.getvalue()
+        self.assertEqual(text.count('docker run -d'), 2)
+        self.assertIn('--cpuset-cpus 0-3,16-19', text)
+        self.assertIn('STANNUM_SCORE_FUNCTION=full_score', text)
+        self.assertIn('taskset -c 4-15,20-31', text)
+        self.assertIn(tin.PARADEDB_IMAGE, text)
+
+    def test_score_function_reaches_checks_and_plans(self):
+        query = ('7:phrase', '"a b"', "'a' <-> 'b'", 'a b')
+        self.assertIn('stannum.full_score(ctid)', tin.ranked_check_sql([query], 'stannum', 'full_score'))
+        self.assertIn('stannum.full_score(ctid)',
+                      tin.prepared_plan_sql(query, 'stannum', 'topk', 'force_custom_plan', 'full_score'))
+        plan = tin.prepared_plan_sql(query, 'paradedb', 'topk', 'force_custom_plan')
+        self.assertIn('body ### $1', plan)
+        self.assertIn("EXECUTE stannum_bench_plan('a b')", plan)
+        self.assertEqual(tin.paradedb_count_sql([('3:disjunction', '', '', "it's")]),
+                         "SELECT '3:disjunction', count(*) FROM documents WHERE body ||| 'it''s';")
+
+    def test_index_bytes_per_query_is_the_benchmarkers_per_query(self):
+        self.assertEqual(tin.index_mib_per_query({'indexReadBytes': 2**20, 'indexHitBytes': 3 * 2**20}, 2), 2.0)
+        self.assertIsNone(tin.index_mib_per_query({'indexReadBytes': 1}, 2))
+        self.assertIsNone(tin.index_mib_per_query({'indexReadBytes': 1, 'indexHitBytes': 1}, 0))
+
+    def test_a_saved_database_vouches_for_the_corpus_without_the_csv(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / 'driver/datasets/stackexchange').mkdir(parents=True)
+            (root / 'driver/datasets/stackexchange/data-manifest.json').write_text(json.dumps({'csv': {'sha256': 'c'}}))
+            (root / 'db').mkdir()
+            (root / 'db/snapshot.json').write_text(json.dumps(dict(
+                published_corpus='stackexchange', input_sha256='i', source_run='build')))
+            corpus = tin.saved_corpus(root / 'driver', 'stackexchange', root / 'db')
+            self.assertEqual((corpus['rows'], corpus['csv'], corpus['verified_by']),
+                             (150000000, {'sha256': 'c'}, dict(saved_database='build', input_sha256='i')))
+            with self.assertRaisesRegex(ValueError, '--dataset is required'):
+                tin.saved_corpus(root / 'driver', 'stackexchange', None)
+            (root / 'db/snapshot.json').write_text(json.dumps(dict(published_corpus='wikipedia', input_sha256='i')))
+            with self.assertRaisesRegex(ValueError, 'no import'):
+                tin.saved_corpus(root / 'driver', 'stackexchange', root / 'db')
+
+    def test_target_cpu_is_refused_off_x86(self):
+        args = argparse.Namespace(target_cpu='x86-64-v4', output=Path('/nonexistent/never'), base=None)
+        with patch.object(tin.platform, 'machine', return_value='aarch64'):
+            with self.assertRaisesRegex(ValueError, 'x86-64'):
+                tin.build_image(args)

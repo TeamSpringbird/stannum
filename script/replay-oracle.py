@@ -20,7 +20,7 @@ Stannum. `postgres` runs the benchmark's two statements per query,
     SELECT count(*) FROM <table> WHERE body ==> $1
 
 and writes each ranked answer as `id:<score bits>` in order and each count,
-as the replay does. It needs psycopg 3 (STANNUM_PYTHON) and libpq settings
+as the replay does (`--ranked-only` leaves the counts out). It needs psycopg 3 (STANNUM_PYTHON) and libpq settings
 naming the database; the extension's release build should be installed and
 the table's index built, with no write buffer or VACUUM since the dump.
 """
@@ -54,7 +54,8 @@ def answer(args):
     import psycopg
 
     trace = [line.split("\t", 2) for line in Path(args.trace).read_text().splitlines() if line]
-    ranked_sql = (f"SELECT {args.id_column}, stannum.score(ctid) AS score FROM {args.table} "
+    score = "stannum.full_score" if args.full else "stannum.score"
+    ranked_sql = (f"SELECT {args.id_column}, {score}(ctid) AS score FROM {args.table} "
                   f"WHERE {args.column} ==> %s ORDER BY score DESC LIMIT {args.k}")
     count_sql = f"SELECT count(*) FROM {args.table} WHERE {args.column} ==> %s"
     out = []
@@ -65,8 +66,9 @@ def answer(args):
         for n, (name, style, text) in enumerate(trace):
             rows = connection.execute(ranked_sql, (text,)).fetchall()
             out.append(f"{name}\t{style}\tranked\t" + ",".join(f"{row[0]}:{bits(row[1]):08x}" for row in rows))
-            count, = connection.execute(count_sql, (text,)).fetchone()
-            out.append(f"{name}\t{style}\tcount\t{count}")
+            if not args.ranked_only:
+                count, = connection.execute(count_sql, (text,)).fetchone()
+                out.append(f"{name}\t{style}\tcount\t{count}")
             if (n + 1) % 500 == 0:
                 print(f"{n + 1} of {len(trace)}", file=sys.stderr)
     Path(args.out).write_text("\n".join(out) + "\n")
@@ -87,6 +89,10 @@ def main():
     pg.add_argument("--column", default="body")
     pg.add_argument("--id-column", default="id")
     pg.add_argument("--k", type=int, default=10)
+    pg.add_argument("--ranked-only", action="store_true",
+                    help="skip the counts (slow on a large table)")
+    pg.add_argument("--full", action="store_true",
+                    help="rank with stannum.full_score (no dense term elided) instead of stannum.score")
     args = parser.parse_args()
     if args.command == "trace":
         write_trace(args.queries, args.out)

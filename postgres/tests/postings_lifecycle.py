@@ -220,7 +220,7 @@ def main():
         assert sql("SELECT count(*) FROM docs WHERE id=99998 AND body ==> 'needle';") == '1'
         assert sql('SELECT count(*) FROM volatile_docs;') == '0'
         assert sql("SELECT pg_relation_size('volatile_search', 'init');") == str(2 * 8192)
-        assert sql("SELECT count(*) FROM stannum.segment_info('volatile_search');") == '0'
+        assert sql("SELECT count(*) FROM stannum.segment_info('volatile_search') WHERE source_state = 'current';") == '0'
         assert sql("SELECT pg_relation_size('volatile_search');") == str(2 * 8192)
         assert sql("SELECT count(*) FROM volatile_docs WHERE body ==> 'needle';") == '0'
         sql("INSERT INTO volatile_docs VALUES('needle');")

@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+# Optimizes the code layout of a built ELF file (an executable or a shared
+# library such as the extension's stannum.so) with LLVM BOLT, from a profile
+# of a training command. See docs/benchmarks.md#bolt-and-cpu-levels.
+#
+#   script/bolt-build ELF [--out FILE] [--mode instrument|lbr|sample] [--profile DIR] -- CMD...
+#
+# ELF must be linked with relocations kept (-C link-arg=-Wl,--emit-relocs),
+# so that BOLT can move functions as well as blocks. CMD is the training
+# run; it must run ELF from its own path (an executable it starts, or a
+# library a server it starts loads).
+#
+# --mode instrument (default): BOLT writes an instrumented copy, which
+# replaces ELF while CMD runs (the original is put back afterwards, also
+# on failure). Each process that ran it writes its exact edge counts when it
+# exits. Needs no hardware support, so it also works in containers and VMs.
+# --mode lbr: CMD runs under `perf record -e cycles:u -j any,u` (branch
+# stacks: needs LBR, which most VMs do not expose). --mode sample: plain
+# cycle samples (`perf2bolt -nl`), the weakest profile.
+#
+# Writes FILE (default ELF.bolt), keeps the profile in DIR (default
+# ELF.bolt-profile/), and prints BOLT's dynamic statistics. BOLT's flags
+# default to $BOLT_FLAGS if set. Finds llvm-bolt, merge-fdata and perf2bolt
+# on PATH or in the newest /usr/lib/llvm-*/bin (apt.llvm.org's bolt-NN).
+set -euo pipefail
+
+usage() {
+    sed -n '/^# Optimizes the code/,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
+    exit "${1:-2}"
+}
+
+elf=${1:-}
+[ -n "$elf" ] && [ "$elf" != -h ] && [ "$elf" != --help ] || usage 0
+shift
+out='' mode=instrument profile=''
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --out) out=${2:?--out needs a file}; shift 2 ;;
+        --mode) mode=${2:?--mode needs instrument, lbr or sample}; shift 2 ;;
+        --profile) profile=${2:?--profile needs a directory}; shift 2 ;;
+        --) shift; break ;;
+        *) usage ;;
+    esac
+done
+[ $# -gt 0 ] || usage
+[ -f "$elf" ] || { echo "no such file: $elf" >&2; exit 2; }
+elf=$(cd "$(dirname "$elf")" && pwd)/$(basename "$elf")
+out=${out:-$elf.bolt}
+profile=${profile:-$elf.bolt-profile}
+
+tool() { # name -> path
+    if command -v "$1" >/dev/null 2>&1; then command -v "$1"; return; fi
+    local dir
+    dir=$(ls -d /usr/lib/llvm-*/bin 2>/dev/null | sort -t- -k2 -n | tail -1)
+    [ -n "$dir" ] && [ -x "$dir/$1" ] && { echo "$dir/$1"; return; }
+    echo "no $1: install LLVM BOLT (apt.llvm.org's bolt-NN)" >&2
+    exit 2
+}
+bolt=$(tool llvm-bolt)
+
+# Without relocations BOLT can only reorder blocks within functions in place.
+readelf -SW "$elf" | grep -q '\.rela\.text' ||
+    { echo "$elf has no relocations: link it with -C link-arg=-Wl,--emit-relocs" >&2; exit 2; }
+
+rm -rf "$profile"
+mkdir -p "$profile"
+fdata=$profile/profile.fdata
+case "$mode" in
+instrument)
+    # One file per process (a server forks a backend per connection).
+    "$bolt" "$elf" -o "$profile/instrumented" -instrument \
+        -instrumentation-file="$profile/run" -instrumentation-file-append-pid
+    cp -p "$elf" "$profile/original"
+    trap 'cp -p "$profile/original" "$elf"' EXIT
+    cp "$profile/instrumented" "$elf"
+    "$@"
+    cp -p "$profile/original" "$elf"
+    trap - EXIT
+    ls "$profile"/run.*.fdata >/dev/null 2>&1 || { echo "the training wrote no profile" >&2; exit 1; }
+    "$(tool merge-fdata)" "$profile"/run.*.fdata > "$fdata"
+    rm -f "$profile"/run.*.fdata "$profile/instrumented" "$profile/original"
+    ;;
+lbr|sample)
+    branches=() nl=()
+    if [ "$mode" = lbr ]; then branches=(-j any,u); else nl=(-nl); fi
+    perf record -e cycles:u "${branches[@]}" -o "$profile/perf.data" -- "$@"
+    "$(tool perf2bolt)" "$elf" -p "$profile/perf.data" -o "$fdata" "${nl[@]}"
+    ;;
+*) usage ;;
+esac
+
+# Layout: hot blocks in a straight line (ext-tsp), callers near callees
+# (cdsort), cold blocks split out of hot functions, identical code folded.
+# (BOLT 20 turned -icf into a level, all or safe, and deprecated -icf=1.)
+icf=-icf=1
+[ "$("$bolt" --version | sed -n 's/.*LLVM version \([0-9]*\).*/\1/p')" -ge 20 ] 2>/dev/null && icf=-icf=all
+read -r -a flags <<< "${BOLT_FLAGS:--reorder-blocks=ext-tsp -reorder-functions=cdsort -split-functions -split-all-cold -split-eh $icf -dyno-stats}"
+"$bolt" "$elf" -o "$out" -data "$fdata" "${flags[@]}"
+echo "wrote $out (profile $fdata)"

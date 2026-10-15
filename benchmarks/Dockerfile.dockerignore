@@ -10,4 +10,8 @@
 **/target/**
 
 !segment/**
+!engine/**
+!bench/**
+!benchmarks/pgo/**
+!script/pgo-check
 **/target/**

@@ -51,12 +51,13 @@ fn prepare(index: &PgRelation, function: &str) {
     }
 }
 
-/// Makes the index's write buffer an immutable segment now, whatever its
-/// size, and merges nothing; TIN's `promote()`. Returns one row: whether a
-/// buffer was consumed and a segment linked (1) or the buffer was empty (0),
-/// the documents it held and the distinct terms of the new segment.
-/// `extent_cap_bytes` must be positive when given; Stannum writes one
-/// segment per fold whatever its value.
+/// Promotes the index's sealed write segments into immutable segments now
+/// and merges nothing; TIN's `promote()`. The write buffer, TIN's mutable
+/// write segment, is left alone until it fills and is sealed. Returns one
+/// row: the sealed segments consumed, the immutable segments linked, the
+/// documents promoted and their distinct terms. With `extent_cap_bytes`
+/// (positive) each sealed segment is split into segments of about that many
+/// bytes of forward records, as many as the directory has room for.
 #[pg_extern(volatile, parallel_unsafe)]
 #[allow(clippy::type_complexity)]
 fn promote(
@@ -77,12 +78,12 @@ fn promote(
     }
     prepare(&index, "promote");
     let report = if unsafe { crate::storage::present(index.as_ptr()) } {
-        unsafe { ops::promote(index.as_ptr()) }
+        unsafe { ops::promote(index.as_ptr(), extent_cap_bytes.map(|cap| cap as u64)) }
     } else {
         ops::FoldReport::default()
     };
     TableIterator::once((
-        report.segments as i32,
+        report.consumed as i32,
         report.segments as i32,
         report.docs as i64,
         report.terms as i64,

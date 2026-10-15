@@ -17,6 +17,7 @@ mod highlight;
 mod highlight_udfs;
 mod maintenance;
 mod match_positions;
+mod native;
 mod operator;
 pub(crate) mod options;
 mod query_limits;
@@ -34,6 +35,10 @@ mod array_search;
 #[cfg(feature = "pg_test")]
 mod tin_conformance;
 
+/// Maintenance functions and settings without preloading (see the module).
+#[cfg(feature = "pg_test")]
+mod maintenance_tests;
+
 /// Stemming against TIN 1.0.4's recorded answers (see the module).
 #[cfg(feature = "pg_test")]
 mod tin_stemming;
@@ -41,10 +46,6 @@ mod tin_stemming;
 /// Which `==>` clauses bind scoring and highlighting (see the module).
 #[cfg(feature = "pg_test")]
 mod binding_tests;
-
-/// Maintenance functions and settings without preloading (see the module).
-#[cfg(feature = "pg_test")]
-mod maintenance_tests;
 
 /// The query front end's stack backstop (`tinql::limits::set_stack_check`):
 /// PostgreSQL's `check_stack_depth`, whose ERROR pgrx turns into a panic that
@@ -98,6 +99,23 @@ mod tests {
     use pgrx::Json;
     use pgrx::prelude::*;
 
+    /// A ranked scan's `Pruning`, a pruned walk's labels (`ctid` over
+    /// segments in TIN's shape, `ordinal` over the write segment's streams,
+    /// or both) read as `ordinal`; the streamed path's `block-max` as is.
+    fn walk_kind(pruning: &serde_json::Value) -> serde_json::Value {
+        match pruning.as_str() {
+            Some("ctid" | "ctid+ordinal") => "ordinal".into(),
+            _ => pruning.clone(),
+        }
+    }
+
+    /// Whether an EXPLAIN in JSON shows a pruned walk.
+    fn walked(plan: &str) -> bool {
+        ["ctid", "ordinal", "ctid+ordinal"]
+            .iter()
+            .any(|kind| plan.contains(&format!("\"Pruning\":\"{kind}\"")))
+    }
+
     #[pg_test]
     fn bitmap_index_rechecks_heap_pages_without_preloading() {
         assert_eq!(
@@ -132,10 +150,12 @@ mod tests {
 
     #[pg_test]
     fn a_build_packs_its_segments_into_its_lowest_pages() {
-        // Small build segments and a low merge cap (2 MB, below the smallest
-        // max_merged_segment_size): the build's tier merges retire many runs
-        // and end with several segments among their holes.
-        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some(2 << 20));
+        // Small build segments and a low merge cap (1.25 MiB, below the
+        // smallest max_merged_segment_size): the build's tier merges retire
+        // many runs and end with several segments among their holes. The
+        // packing is greedy (highest run first): at some caps, 1 MiB among
+        // them, the runs it moves leave holes it cannot fill.
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some(5 << 18));
         Spi::run(
             "CREATE TABLE packed(id int, body text);
              INSERT INTO packed SELECT n, 'common ' || (SELECT string_agg('w' || (n * k % 1009), ' ')
@@ -160,9 +180,11 @@ mod tests {
             .map(|(run, map)| (run.len() + map.len()) as i64)
             .sum();
         // Meta page, the write buffer's page, and the runs: nothing else.
+        let pending = unsafe { crate::storage::testing::pending_entries(index.as_ptr()) };
         assert_eq!(
             value("SELECT pg_relation_size('packed_idx') / 8192"),
-            live + 2
+            live + 2,
+            "{pending} pending runs"
         );
         // And the free space map lists none of them: a reused page left
         // there is a page every later allocation reads under the meta lock.
@@ -1226,7 +1248,7 @@ mod tests {
                             assert!(plan.contains("\"Order\":\"score DESC\""), "{query}: {plan}");
                             assert!(plan.contains("\"Top K\":10"), "{query}: {plan}");
                             if scorer == "stannum.full_score(ctid)" && query == "common OR rare" {
-                                assert!(plan.contains("\"Pruning\":\"ordinal\""), "{plan}");
+                                assert!(walked(&plan), "{plan}");
                             }
                         }
                         let scores = |sql: &str| -> Vec<u32> {
@@ -1459,6 +1481,107 @@ mod tests {
         }
     }
 
+    /// A LIMIT or OFFSET parameter declared `int` or `smallint` reaches the
+    /// plan through a cast to `bigint`; a generic plan still ranks only the
+    /// top k (TIN 1.0.4 scores every match there).
+    #[pg_test]
+    fn generic_ranked_runtime_bounds_accept_integer_parameters() {
+        Spi::run(
+            "CREATE TABLE runtime_int(id int, body text);
+             INSERT INTO runtime_int SELECT n, repeat('common ', n % 7 + 1) ||
+                 CASE WHEN n % 2 = 0 THEN 'blue' ELSE 'red' END FROM generate_series(1,1000) n;
+             CREATE INDEX runtime_int_idx ON runtime_int USING stannum(body);
+             ANALYZE runtime_int;
+             SET LOCAL plan_cache_mode = force_generic_plan;
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL enable_bitmapscan = off;
+             SET LOCAL enable_indexscan = off;",
+        )
+        .unwrap();
+        let ranked = |sql: &str| -> Vec<(i32, u32)> {
+            Spi::connect(|client| {
+                client
+                    .select(sql, None, &[])
+                    .unwrap()
+                    .map(|row| {
+                        (
+                            row.get::<i32>(1).unwrap().unwrap(),
+                            row.get::<f32>(2).unwrap().unwrap().to_bits(),
+                        )
+                    })
+                    .collect()
+            })
+        };
+        for (types, bounds, args, literal, top_k) in [
+            (
+                "text, int",
+                "LIMIT $2",
+                "'common OR blue', 10",
+                "LIMIT 10",
+                10,
+            ),
+            (
+                "text, smallint",
+                "LIMIT $2",
+                "'common OR blue', 7",
+                "LIMIT 7",
+                7,
+            ),
+            (
+                "text, int, int",
+                "LIMIT $2 OFFSET $3",
+                "'common OR blue', 7, 12",
+                "LIMIT 7 OFFSET 12",
+                19,
+            ),
+            (
+                "text, bigint, int",
+                "LIMIT $2 OFFSET $3",
+                "'blue', 5, 3",
+                "LIMIT 5 OFFSET 3",
+                8,
+            ),
+        ] {
+            Spi::run(&format!(
+                "PREPARE runtime_int_bound({types}) AS
+                 SELECT id, stannum.full_score(ctid) AS score FROM runtime_int
+                 WHERE body ==> $1 ORDER BY score DESC {bounds}"
+            ))
+            .unwrap();
+            let sql = format!("EXECUTE runtime_int_bound({args})");
+            let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0
+                .to_string();
+            assert!(
+                plan.contains(&format!("\"Top K\":{top_k}")),
+                "{types}: {plan}"
+            );
+            let query = args.split(',').next().unwrap();
+            // Ties may be taken in either order: compare the scores, and
+            // each returned row's score with the row's own.
+            let scores =
+                |rows: Vec<(i32, u32)>| rows.into_iter().map(|(_, s)| s).collect::<Vec<_>>();
+            let expected = ranked(&format!(
+                "SELECT id, score FROM (SELECT id, stannum.full_score(ctid) AS score
+                 FROM runtime_int WHERE body ==> {query}) s ORDER BY score DESC {literal}"
+            ));
+            let actual = ranked(&sql);
+            let own: std::collections::HashMap<i32, u32> = ranked(&format!(
+                "SELECT id, stannum.full_score(ctid) FROM runtime_int WHERE body ==> {query}"
+            ))
+            .into_iter()
+            .collect();
+            assert!(
+                actual.iter().all(|(id, s)| own.get(id) == Some(s)),
+                "{types}"
+            );
+            assert_eq!(scores(actual), scores(expected), "{types}");
+            Spi::run("DEALLOCATE runtime_int_bound").unwrap();
+        }
+    }
+
     #[pg_test]
     fn generic_ranked_scan_rescans_and_preserves_remaining_filters() {
         Spi::run(
@@ -1577,6 +1700,218 @@ mod tests {
                 })
                 .collect()
         })
+    }
+
+    #[pg_test]
+    fn ranked_scans_walk_segments_in_tin_shape_with_their_dead_documents() {
+        Spi::run(
+            "CREATE TABLE native_rank(id int, body text);
+             INSERT INTO native_rank SELECT n,
+               CASE WHEN n % 17 = 0 THEN 'alpha beta ' ELSE 'alpha ' END
+               || repeat('pad ', n % 11) || CASE WHEN n % 23 = 0 THEN 'gamma' ELSE '' END
+               FROM generate_series(1, 3000) n;
+             CREATE INDEX native_rank_idx ON native_rank USING stannum(body);",
+        )
+        .unwrap();
+        let pruning = |query: &str| -> String {
+            Spi::run("SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off")
+                .unwrap();
+            let plan = Spi::get_one::<Json>(&format!(
+                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM native_rank
+                 WHERE body ==> '{query}' ORDER BY stannum.score(ctid) DESC LIMIT 10"
+            ))
+            .unwrap()
+            .unwrap()
+            .0
+            .to_string();
+            ["ctid+ordinal", "ctid", "ordinal", "block-max"]
+                .into_iter()
+                .find(|kind| plan.contains(&format!("\"Pruning\":\"{kind}\"")))
+                .unwrap_or_else(|| panic!("{query}: {plan}"))
+                .to_owned()
+        };
+        let queries = [
+            "alpha AND beta",
+            "beta OR gamma",
+            "\"alpha beta\"",
+            "beta AND NOT gamma",
+        ];
+        let check = |kind: &str| {
+            for query in queries {
+                assert_eq!(pruning(query), kind, "{query}");
+                for order_by in ["stannum.score(ctid)", "stannum.full_score(ctid)"] {
+                    assert_eq!(
+                        ranked_in("native_rank", true, query, order_by, "LIMIT 10"),
+                        ranked_in("native_rank", false, query, order_by, "LIMIT 10"),
+                        "{query} by {order_by}"
+                    );
+                }
+            }
+        };
+        // A built index is one segment: every walk reads it natively.
+        check("ctid");
+        // Rows VACUUM lists dead are skipped inside the walk, even while
+        // their heap tuples stay visible (a slot reused after VACUUM).
+        let dead = tids("SELECT ctid::text FROM native_rank WHERE id % 4 = 0");
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'native_rank_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        drop(index);
+        check("ctid");
+        for query in queries {
+            let ids = ranked_in(
+                "native_rank",
+                true,
+                query,
+                "stannum.score(ctid)",
+                "LIMIT 3000",
+            );
+            assert!(ids.iter().all(|(id, _)| id % 4 != 0), "{query}: {ids:?}");
+        }
+        // Rows in the write buffer are walked over its ordinal streams.
+        Spi::run(
+            "INSERT INTO native_rank SELECT n, 'alpha beta beta gamma' FROM generate_series(5001, 5020) n",
+        )
+        .unwrap();
+        check("ctid+ordinal");
+    }
+
+    /// Distinct pages per blob kind (EXPLAIN's `unique`) are counted
+    /// only under EXPLAIN ANALYZE: a plain query hashes no page.
+    #[pg_test]
+    fn distinct_pages_are_counted_only_under_explain_analyze() {
+        Spi::run(
+            "CREATE TABLE distinct_pages(id int, body text);
+             INSERT INTO distinct_pages SELECT n,
+               'alpha ' || CASE WHEN n % 3 = 0 THEN 'beta ' ELSE '' END
+               || repeat('pad ', n % 7) FROM generate_series(1, 20000) n;
+             CREATE INDEX distinct_pages_idx ON distinct_pages
+               USING stannum(body);
+             SET LOCAL stannum.enable_custom_scan = on;
+             SET LOCAL enable_seqscan = off",
+        )
+        .unwrap();
+        let unique = || -> u64 {
+            segment::tinshape::blob::stats()
+                .iter()
+                .map(|s| s.unique)
+                .sum()
+        };
+        let query = "SELECT id FROM distinct_pages
+            WHERE body ==> 'alpha OR beta'
+            ORDER BY stannum.score(ctid) DESC LIMIT 10";
+        let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {query}"))
+            .unwrap()
+            .unwrap()
+            .0
+            .to_string();
+        let reads = plan
+            .split("\"Native Reads By Kind\":\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .unwrap_or_else(|| panic!("{plan}"))
+            .to_owned();
+        let reported: u64 = reads
+            .split("unique ")
+            .skip(1)
+            .map(|n| n.split(';').next().unwrap().trim().parse::<u64>().unwrap())
+            .sum();
+        assert!(reported > 0, "{reads}");
+        assert_eq!(unique(), reported);
+        Spi::run(&format!("SELECT count(*) FROM ({query}) q")).unwrap();
+        let stats = segment::tinshape::blob::stats();
+        assert!(stats.iter().any(|s| s.pinned + s.copied_pages > 0));
+        assert_eq!(unique(), 0, "a plain query counts no distinct page");
+    }
+
+    /// `score()` over a term in every document (elided: it scores nothing)
+    /// is the first k matches in ctid order, and an OR of elided terms
+    /// likewise: the candidate stream folds the groups they are in, one
+    /// first and then twice as many each time. It folded every group for any
+    /// k (on TIN's probe corpus 15 or 16 payload pages where TIN read 1 or
+    /// 2). A plain scan's stream still folds every group at once.
+    #[pg_test]
+    fn a_zero_fill_folds_the_groups_of_its_rows() {
+        // 185 rows a heap page: five groups of 256 pages.
+        Spi::run(
+            "CREATE TABLE zero_fill(id int, body text);
+             INSERT INTO zero_fill SELECT n,
+               CASE WHEN n % 50000 = 7 THEN 'alpha gamma'
+                    WHEN n % 2 = 0 THEN 'alpha' ELSE 'beta' END
+               FROM generate_series(1, 5 * 256 * 185) n;
+             CREATE INDEX zero_fill_idx ON zero_fill USING stannum(body);",
+        )
+        .unwrap();
+        Spi::run("SET LOCAL stannum.enable_custom_scan = on; SET LOCAL enable_seqscan = off")
+            .unwrap();
+        let folded = |sql: &str| -> i64 {
+            let plan = Spi::get_one::<Json>(&format!("EXPLAIN (ANALYZE, FORMAT JSON) {sql}"))
+                .unwrap()
+                .unwrap()
+                .0
+                .to_string();
+            plan.split("\"Stream Groups Folded\":")
+                .nth(1)
+                .and_then(|rest| rest.split([',', '}']).next())
+                .unwrap_or_else(|| panic!("{sql}: {plan}"))
+                .parse()
+                .unwrap()
+        };
+        let ids = |sql: &str| -> Vec<i32> {
+            Spi::get_one::<Vec<i32>>(&format!("SELECT array_agg(id) FROM ({sql}) AS q"))
+                .unwrap()
+                .unwrap_or_default()
+        };
+        let first_by_ctid = |filter: &str, k: usize| -> Vec<i32> {
+            ids(&format!(
+                "SELECT id FROM zero_fill WHERE {filter} ORDER BY ctid LIMIT {k}"
+            ))
+        };
+        // Matches a group: alpha about 23,680, alpha OR beta 47,360.
+        for (query, filter, per_group) in [
+            ("alpha", "body LIKE 'alpha%'", 23_680),
+            ("alpha OR beta", "true", 47_360),
+        ] {
+            // Every row scores zero: ties rank in heap order.
+            for k in [10, 4_096] {
+                let ranked = format!(
+                    "SELECT id FROM zero_fill WHERE body ==> '{query}'
+                     ORDER BY stannum.score(ctid) DESC LIMIT {k}"
+                );
+                assert_eq!(folded(&ranked), 1, "{ranked}");
+                assert_eq!(ids(&ranked), first_by_ctid(filter, k), "{ranked}");
+            }
+            // A plain scan's stream, kept between executor calls, folds
+            // every group at once.
+            let k = per_group + 10;
+            let plain = format!("SELECT id FROM zero_fill WHERE body ==> '{query}' LIMIT {k}");
+            assert_eq!(folded(&plain), 5, "{plain}");
+            assert_eq!(ids(&plain), first_by_ctid(filter, k), "{plain}");
+            let all = format!("SELECT id FROM zero_fill WHERE body ==> '{query}'");
+            assert_eq!(folded(&all), 5, "{all}");
+            assert_eq!(ids(&all), first_by_ctid(filter, 5 * 256 * 185), "{all}");
+        }
+        // Five rows score (gamma, tied, in heap order); the rest of the top
+        // k are alpha's other rows in heap order, from the first group.
+        for k in [10, 4_096] {
+            let ranked = format!(
+                "SELECT id FROM zero_fill WHERE body ==> 'gamma OR alpha'
+                 ORDER BY stannum.score(ctid) DESC LIMIT {k}"
+            );
+            assert_eq!(folded(&ranked), 1, "{ranked}");
+            let want = ids(&format!(
+                "SELECT id FROM (
+                   SELECT id, ctid, 0 AS rank FROM zero_fill WHERE body LIKE '%gamma%'
+                   UNION ALL
+                   SELECT id, ctid, 1 FROM zero_fill WHERE body = 'alpha') AS rows
+                 ORDER BY rank, ctid LIMIT {k}"
+            ));
+            assert_eq!(want[..5], [7, 50_007, 100_007, 150_007, 200_007]);
+            assert_eq!(ids(&ranked), want, "{ranked}");
+        }
     }
 
     #[pg_test]
@@ -1724,7 +2059,7 @@ mod tests {
         .unwrap()
         .0
         .to_string();
-        assert!(plan.contains("\"Pruning\":\"ordinal\""), "{plan}");
+        assert!(walked(&plan), "{plan}");
     }
 
     /// A disjunction's walk loads a term's chunk only where a candidate
@@ -1801,189 +2136,16 @@ mod tests {
                 .find_map(search_scan)
         }
         let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         // Three chunks in the first chunk of ordinals; delta and gamma in
         // the second, whose AND leaves nothing for alpha's chunk to settle.
-        // Loading every present term's chunk up front read six.
-        assert_eq!(scan["Chunks Loaded"], 5, "{scan}");
+        // Loading every present term's chunk up front read six. (Chunks are
+        // the ordinal walk's; a segment in TIN's shape is walked natively.)
+        if scan["Pruning"] == "ordinal" {
+            assert_eq!(scan["Chunks Loaded"], 5, "{scan}");
+        }
     }
 
-    #[pg_test]
-    fn ranked_walks_release_the_pages_they_hold() {
-        // 20,000 documents in one segment: its class table spans three
-        // pages and its length table ten, so a walk moves its held pages.
-        Spi::run(
-            "CREATE TABLE held(id int primary key, body text);
-             SET LOCAL stannum.build_segment_docs = 100000;
-             INSERT INTO held SELECT n,
-               repeat('alpha ', 1 + n % 3) ||
-               CASE WHEN n % 7 = 0 THEN 'beta ' ELSE '' END ||
-               repeat('pad ', n % 40) || 'tail'
-               FROM generate_series(1, 20000) n;
-             CREATE INDEX held_idx ON held USING stannum(body);
-             SET LOCAL enable_seqscan = off;
-             SET LOCAL enable_bitmapscan = off;",
-        )
-        .unwrap();
-        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
-            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
-                return Some(node.clone());
-            }
-            node["Plans"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find_map(search_scan)
-        }
-        let before = crate::storage::held_pages();
-        assert_eq!(before.0, 0, "{before:?}");
-        for query in [
-            "alpha OR beta",
-            "pad OR beta",
-            "alpha AND beta",
-            "\"alpha beta\"",
-        ] {
-            let plan = Spi::get_one::<Json>(&format!(
-                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM held WHERE body ==> '{query}'
-                 ORDER BY stannum.score(ctid, 1.0) DESC LIMIT 10"
-            ))
-            .unwrap()
-            .unwrap()
-            .0;
-            let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
-            assert_eq!(scan["Pruning"], "ordinal", "{query}: {scan}");
-            assert_eq!(scan["Actual Rows"].as_f64(), Some(10.0), "{query}: {scan}");
-            let held = crate::storage::held_pages();
-            assert_eq!(held.0, 0, "{query}: {held:?}");
-        }
-        let after = crate::storage::held_pages();
-        assert!(after.1 > before.1 + 4, "the walks held no pages: {after:?}");
-    }
-
-    #[pg_test]
-    fn walks_release_the_chunk_and_position_pages_they_read_in_place() {
-        // 140,000 documents in one segment: three chunks of ordinals per
-        // term, bitmaps with their bucket nibbles running over pages past
-        // the members for all but rare, whose chunks are arrays, and
-        // position lists over many pages for the phrases. Beta and gamma
-        // are dense enough to be elided from the default score, delta and
-        // eps not.
-        Spi::run(
-            "CREATE TABLE inplace(id int primary key, body text);
-             SET LOCAL stannum.build_segment_docs = 200000;
-             INSERT INTO inplace SELECT n,
-               repeat('alpha ', 1 + n % 3) ||
-               CASE WHEN n % 7 = 0 THEN 'beta ' ELSE '' END ||
-               CASE WHEN n % 3 = 0 THEN repeat('gamma ', 1 + n % 4) ELSE '' END ||
-               CASE WHEN n % 13 = 0 THEN 'delta ' ELSE '' END ||
-               CASE WHEN n % 29 = 0 THEN repeat('eps ', 1 + n % 2) ELSE '' END ||
-               CASE WHEN n % 97 = 0 THEN 'rare ' ELSE '' END ||
-               repeat('pad ', n % 5) || 'tail'
-               FROM generate_series(1, 140000) n;
-             CREATE INDEX inplace_idx ON inplace USING stannum(body);
-             SET LOCAL enable_seqscan = off;
-             SET LOCAL enable_bitmapscan = off;",
-        )
-        .unwrap();
-        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
-            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
-                return Some(node.clone());
-            }
-            node["Plans"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find_map(search_scan)
-        }
-        let before = crate::storage::held_pages();
-        assert_eq!(before.0, 0, "{before:?}");
-        let mut peak = 0;
-        let mut walks = 0;
-        for query in [
-            "alpha OR beta",
-            "delta OR eps OR rare",
-            "alpha AND beta",
-            "delta AND eps",
-            "delta AND gamma AND rare",
-            "delta AND NOT eps",
-            "(delta OR rare) AND gamma",
-            "\"alpha beta\"",
-            "\"delta eps\"",
-            "\"alpha beta\" OR rare",
-            "\"gamma delta\" AND eps",
-        ] {
-            for score in ["stannum.score(ctid)", "stannum.score(ctid, 1.0)"] {
-                let plan = Spi::get_one::<Json>(&format!(
-                    "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM inplace WHERE body ==> '{query}'
-                     ORDER BY {score} DESC LIMIT 10"
-                ))
-                .unwrap()
-                .unwrap()
-                .0;
-                let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
-                assert_eq!(scan["Actual Rows"].as_f64(), Some(10.0), "{query}: {scan}");
-                walks += usize::from(scan["Pruning"] == "ordinal");
-                peak = peak.max(scan["Pages Held Peak"].as_i64().unwrap_or(0));
-                let held = crate::storage::held_pages();
-                assert_eq!(held.0, 0, "{query}, {score}: {held:?}");
-            }
-        }
-        let after = crate::storage::held_pages();
-        assert!(
-            after.1 > before.1 + 20,
-            "the walks held no pages: {after:?}"
-        );
-        assert!(walks >= 16, "{walks} walks");
-        assert!(peak >= 4, "no walk held a chunk's pages: {peak}");
-        // A walk canceled mid-way, with chunk pages held, releases them as
-        // the cancel unwinds it.
-        for query in [
-            "alpha OR beta OR gamma",
-            "beta AND gamma AND delta",
-            "\"gamma delta\"",
-        ] {
-            let plan = Spi::get_one::<Json>(&format!(
-                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM inplace WHERE body ==> '{query}'
-                 ORDER BY stannum.score(ctid, 1.0) DESC LIMIT 10"
-            ))
-            .unwrap()
-            .unwrap()
-            .0;
-            let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
-            let loads = scan["Chunks Loaded"].as_i64().unwrap_or(0);
-            assert!(
-                loads >= 2 && scan["Pruning"] == "ordinal",
-                "{query}: {scan}"
-            );
-            crate::score::cancel_at_chunk_load(loads / 2 + 1);
-            Spi::run(&format!(
-                "DO $$ BEGIN
-                   PERFORM id FROM inplace WHERE body ==> '{query}'
-                     ORDER BY stannum.score(ctid, 1.0) DESC LIMIT 10;
-                   RAISE EXCEPTION 'the walk was not canceled';
-                 EXCEPTION WHEN query_canceled THEN NULL;
-                 END $$"
-            ))
-            .unwrap();
-            let holding = crate::score::cancel_at_chunk_load(0);
-            assert!(holding > 0, "{query}: canceled holding no pages");
-            let held = crate::storage::held_pages();
-            assert_eq!(held.0, 0, "{query}: canceled walk left {held:?}");
-        }
-        // And the next walk reads as before.
-        let count = Spi::get_one::<i64>(
-            "SELECT count(*) FROM (SELECT id FROM inplace WHERE body ==> 'alpha AND beta'
-             ORDER BY stannum.score(ctid) DESC LIMIT 10) top",
-        )
-        .unwrap();
-        assert_eq!(count, Some(10));
-        assert_eq!(crate::storage::held_pages().0, 0);
-    }
-
-    /// A backend exiting on FATAL drops its cached readers with a walk's
-    /// hold span still open, after PostgreSQL released the span's pin and
-    /// relation reference itself; the reader must not release them again.
-    /// postgres/tests/exit_during_walk.py drives the real exit on Linux.
     #[pg_test]
     fn a_reader_dropped_at_exit_leaves_its_pins_to_postgres() {
         Spi::run(
@@ -1995,139 +2157,44 @@ mod tests {
         let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'exiting_idx'::regclass::oid")
             .unwrap()
             .unwrap();
+        let refcount = |buffer: pg_sys::Buffer| unsafe {
+            let desc = pg_sys::BufferDescriptors.add(buffer as usize - 1);
+            std::ptr::read_volatile(std::ptr::addr_of!((*desc).bufferdesc.state.value))
+                & pg_sys::BUF_REFCOUNT_MASK
+        };
         let before = crate::storage::held_pages().0;
         // Otherwise the drop releases the span's page and relation.
-        unsafe { crate::storage::drop_holding_source(oid, false) };
+        let (buffers, _) = unsafe { crate::storage::drop_holding_source(oid, false) };
         assert_eq!(crate::storage::held_pages().0, before);
+        for (buffer, _) in buffers {
+            assert_eq!(refcount(buffer), 0, "a pin outlived its span");
+        }
         // At exit it leaves both to the resource owner, so releasing them
         // here, as exit processing would, releases each once: a second
-        // release raises "not owned by resource owner".
-        let (buffer, relation) = unsafe { crate::storage::drop_holding_source(oid, true) };
+        // release raises "not owned by resource owner". A page pinned
+        // through its hint is the span's own pin, released through the
+        // span's ledger the owner remembers.
+        let (buffers, relation) = unsafe { crate::storage::drop_holding_source(oid, true) };
         assert_eq!(crate::storage::held_pages().0, before);
+        assert!(
+            buffers.iter().any(|(_, owned)| *owned),
+            "the page pinned again, through its hint, was not the span's own pin"
+        );
+        for (buffer, _) in buffers {
+            assert!(refcount(buffer) > 0, "the drop at exit released a pin");
+        }
         unsafe {
-            pg_sys::ReleaseBuffer(buffer);
+            for (buffer, owned) in buffers {
+                if !owned {
+                    pg_sys::ReleaseBuffer(buffer);
+                }
+            }
+            crate::storage::release_spans_of_owner();
             pg_sys::RelationClose(relation);
         }
-    }
-
-    #[pg_test]
-    fn held_pages_are_pinned_through_the_buffers_they_were_last_in() {
-        // A walk pins a held page through the buffer the backend last
-        // pinned its block in. The buffer is only a hint: after eviction,
-        // other relations' pages, or a rebuild that reuses the block
-        // numbers under a new relfilenode, the walk must read the pages it
-        // asks for, and still release every pin.
-        Spi::run(
-            "CREATE EXTENSION IF NOT EXISTS pg_buffercache;
-             CREATE TABLE recent(id int primary key, body text);
-             SET LOCAL stannum.build_segment_docs = 200000;
-             INSERT INTO recent SELECT n,
-               repeat('alpha ', 1 + n % 3) ||
-               CASE WHEN n % 7 = 0 THEN 'beta ' ELSE '' END ||
-               CASE WHEN n % 13 = 0 THEN 'delta ' ELSE '' END ||
-               CASE WHEN n % 29 = 0 THEN repeat('eps ', 1 + n % 2) ELSE '' END ||
-               repeat('pad ', n % 5) || 'tail'
-               FROM generate_series(1, 90000) n;
-             CREATE INDEX recent_idx ON recent USING stannum(body);
-             CREATE TABLE other(id int, body text);
-             INSERT INTO other SELECT n, repeat('beta alpha ', 1 + n % 4) || 'tail'
-               FROM generate_series(1, 90000) n;
-             CREATE INDEX other_idx ON other USING stannum(body);
-             SET LOCAL enable_seqscan = off;
-             SET LOCAL enable_bitmapscan = off;",
-        )
-        .unwrap();
-        fn search_scan(node: &serde_json::Value) -> Option<serde_json::Value> {
-            if node["Custom Plan Provider"] == "Stannum Text Search Scan" {
-                return Some(node.clone());
-            }
-            node["Plans"]
-                .as_array()
-                .into_iter()
-                .flatten()
-                .find_map(search_scan)
+        for (buffer, _) in buffers {
+            assert_eq!(refcount(buffer), 0, "the owner's release left a pin");
         }
-        let queries = [
-            "alpha OR beta",
-            "delta OR eps",
-            "beta AND delta",
-            "\"alpha beta\"",
-            "\"delta eps\"",
-        ];
-        let top = |table: &str, query: &str| {
-            Spi::get_one::<String>(&format!(
-                "SELECT coalesce(string_agg(id || ':' || score, ',' ORDER BY score DESC, id), '') FROM
-                   (SELECT id, stannum.score(ctid) AS score FROM {table}
-                    WHERE body ==> '{query}' ORDER BY score DESC LIMIT 10) top"
-            ))
-            .unwrap()
-            .unwrap()
-        };
-        // (pages pinned, of those through their recent buffer)
-        let pins = |table: &str, query: &str| {
-            let plan = Spi::get_one::<Json>(&format!(
-                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT id FROM {table} WHERE body ==> '{query}'
-                 ORDER BY stannum.score(ctid) DESC LIMIT 10"
-            ))
-            .unwrap()
-            .unwrap()
-            .0;
-            let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
-            let held = crate::storage::held_pages();
-            assert_eq!(held.0, 0, "{table}, {query}: {held:?}");
-            (
-                scan["Pages Pinned"].as_i64().unwrap(),
-                scan["Pages Pinned Recent"].as_i64().unwrap(),
-            )
-        };
-        let expected: Vec<String> = queries.iter().map(|query| top("recent", query)).collect();
-        let others: Vec<String> = queries.iter().map(|query| top("other", query)).collect();
-        // Repeated, a walk pins its pages through the buffers it saw them in.
-        let mut walked = 0;
-        for query in queries {
-            pins("recent", query);
-            let (pinned, recent) = pins("recent", query);
-            walked += usize::from(pinned > 0);
-            assert_eq!(recent, pinned, "{query}: repeated but pinned afresh");
-        }
-        assert!(walked >= 3, "{walked} walks held pages");
-        let evict = |relation: &str| {
-            Spi::run(&format!(
-                "SELECT count(pg_buffercache_evict(bufferid)) FROM pg_buffercache
-                 WHERE relfilenode = pg_relation_filenode('{relation}')"
-            ))
-            .unwrap();
-            let left = Spi::get_one::<i64>(&format!(
-                "SELECT count(*) FROM pg_buffercache
-                 WHERE relfilenode = pg_relation_filenode('{relation}')"
-            ))
-            .unwrap();
-            assert_eq!(left, Some(0), "{relation} kept buffers");
-        };
-        let check = |round: &str| {
-            for (query, expected) in queries.iter().zip(&expected) {
-                assert_eq!(&top("recent", query), expected, "{round}: {query}");
-                pins("recent", query);
-            }
-            for (query, expected) in queries.iter().zip(&others) {
-                assert_eq!(&top("other", query), expected, "{round}: other, {query}");
-            }
-        };
-        // Evicted, the remembered buffers go to other pages, the other
-        // index's among them; the walks read their own.
-        evict("recent_idx");
-        evict("other_idx");
-        check("evicted");
-        evict("recent_idx");
-        check("evicted again");
-        // Rebuilt, the index has the same block numbers in a new file.
-        Spi::run("REINDEX INDEX recent_idx").unwrap();
-        check("reindexed");
-        for query in queries {
-            let (pinned, recent) = pins("recent", query);
-            assert_eq!(recent, pinned, "reindexed, repeated: {query}");
-        }
-        assert_eq!(crate::storage::held_pages().0, 0);
     }
 
     #[pg_test]
@@ -2294,17 +2361,29 @@ mod tests {
         assert_eq!(scan["Top K"], 10);
         // A disjunction, of one term here, walks the ordinal streams; a
         // conjunction walks the TID postings with block bounds.
-        assert_eq!(scan["Pruning"], "ordinal");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal");
         // The ten best rows share the best score and are the earliest such
         // rows, so once they are found every later sub-block of 1,024
         // ordinals is skipped; the first ones are scored to the last tie.
+        // The native walk prunes only bounds below the bar: a candidate that
+        // can tie it is scored (and then ranks after it, by ctid).
         let scored = scan["Scored Candidates"].as_i64().unwrap();
-        assert!(scored > 0 && scored < 1500, "{scan}");
+        let most = if scan["Pruning"] == "ordinal" {
+            1500
+        } else {
+            3001
+        };
+        assert!(scored > 0 && scored < most, "{scan}");
         // ...and the conjunction and disjunction too.
         for (query, pruning) in [("alpha AND beta", "ordinal"), ("alpha OR gamma", "ordinal")] {
             let scan = explain(query);
-            assert_eq!(scan["Pruning"], pruning, "{query}");
-            assert!(scan["Scored Candidates"].as_i64().unwrap() < 1500, "{scan}");
+            assert_eq!(walk_kind(&scan["Pruning"]), pruning, "{query}");
+            let most = if scan["Pruning"] == "ordinal" {
+                1500
+            } else {
+                3001
+            };
+            assert!(scan["Scored Candidates"].as_i64().unwrap() < most, "{scan}");
         }
         // Mixed shapes walk the disjunction of their scoring terms, and
         // score nothing exhaustively.
@@ -2320,10 +2399,15 @@ mod tests {
             "AT LEAST 2 OF [alpha beta gamma]",
         ] {
             let scan = explain(query);
-            assert_eq!(scan["Pruning"], "ordinal", "{query}: {scan}");
+            assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{query}: {scan}");
             assert_eq!(scan["Exhaustive Score Calls"], 0, "{query}: {scan}");
+            let most = if scan["Pruning"] == "ordinal" {
+                1500
+            } else {
+                3001
+            };
             assert!(
-                scan["Scored Candidates"].as_i64().unwrap() < 1500,
+                scan["Scored Candidates"].as_i64().unwrap() < most,
                 "{query}: {scan}"
             );
         }
@@ -2331,7 +2415,11 @@ mod tests {
         // would rank and that no other child already admits.
         let scan = explain("\"alpha beta\" OR \"beta gamma\"");
         let checked = scan["Positions Checked"].as_i64().unwrap();
-        assert!(checked > 0 && checked < 1300, "{scan}");
+        // The native walk checks a candidate's span when it would rank.
+        assert!(
+            (scan["Pruning"] != "ordinal" || checked > 0) && checked < 1300,
+            "{scan}"
+        );
         let scan = explain("gamma OR \"alpha beta\"");
         assert!(scan["Positions Checked"].as_i64().unwrap() < 1300, "{scan}");
         // An expansion is left to full scoring.
@@ -2352,7 +2440,7 @@ mod tests {
             .0;
             let scan = search_scan(&plan[0]["Plan"]).unwrap();
             assert_eq!(
-                scan["Pruning"] == "ordinal",
+                walk_kind(&scan["Pruning"]) == "ordinal",
                 pruned,
                 "LIMIT {limit}: {scan}"
             );
@@ -2367,7 +2455,7 @@ mod tests {
         .unwrap()
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         // A phrase or conjunction of elided words alone still walks by
         // ordinal, as a conjunction of filters: nothing is scored, and the
         // walk stops at the first k matches in heap order, so the positions
@@ -2387,7 +2475,7 @@ mod tests {
             .unwrap()
             .0;
             let scan = search_scan(&plan[0]["Plan"]).unwrap();
-            assert_eq!(scan["Pruning"], pruning, "{query}: {scan}");
+            assert_eq!(walk_kind(&scan["Pruning"]), pruning, "{query}: {scan}");
             assert_eq!(scan["Scored Candidates"], 0, "{query}: {scan}");
             assert!(
                 scan["Positions Checked"].as_i64().unwrap() < 100,
@@ -2416,7 +2504,7 @@ mod tests {
         .unwrap()
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal");
         // The walk checks visibility as rows enter its top k, so the deleted
         // rows never take a place and the scan needs no completion.
         assert_eq!(scan["Top-K Completions"], 0, "{scan}");
@@ -2430,7 +2518,7 @@ mod tests {
         // documents holding both words.
         Spi::run("SET LOCAL stannum.enable_custom_scan = on;").unwrap();
         let scan = explain("\"alpha beta\"");
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         let checked = scan["Positions Checked"].as_i64().unwrap();
         assert!(checked > 0 && checked < 1300, "{scan}");
         // A span shape not every slot of which must occur is left to full
@@ -2913,14 +3001,14 @@ mod tests {
         .unwrap();
         let layout = Spi::get_one::<String>(
             "SELECT string_agg(kind || ' ' || docs, ', ' ORDER BY ordinal)
-             FROM stannum.segment_info('warm_idx')",
+             FROM stannum.segment_info('warm_idx') WHERE source_state = 'current'",
         )
         .unwrap()
         .unwrap();
         // `alpha`, `beta` and `gamma` are in every chunk of ordinals of
         // every source.
         let every = Spi::get_one::<i64>(
-            "SELECT sum((docs + 65535) / 65536)::bigint FROM stannum.segment_info('warm_idx')",
+            "SELECT sum((docs + 65535) / 65536)::bigint FROM stannum.segment_info('warm_idx') WHERE source_state = 'current'",
         )
         .unwrap()
         .unwrap();
@@ -2950,7 +3038,12 @@ mod tests {
             .unwrap()
             .0;
             let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
-            assert_eq!(scan["Pruning"], "ordinal", "{query}: {scan}");
+            assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{query}: {scan}");
+            // Warm-up ranks the ordinal walk's chunks; segments in TIN's
+            // shape are walked natively, before it.
+            if scan["Pruning"] != "ordinal" {
+                continue;
+            }
             assert_eq!(
                 scan["Warm-up Chunks"].as_i64(),
                 chunks,
@@ -2994,7 +3087,7 @@ mod tests {
         .unwrap();
         let layout = Spi::get_one::<String>(
             "SELECT string_agg(kind || ' ' || docs, ', ' ORDER BY ordinal)
-             FROM stannum.segment_info('warm_span_idx')",
+             FROM stannum.segment_info('warm_span_idx') WHERE source_state = 'current'",
         )
         .unwrap()
         .unwrap();
@@ -3070,8 +3163,10 @@ mod tests {
         .unwrap()
         .0;
         let scan = search_scan(&plan[0]["Plan"]).unwrap_or_else(|| panic!("{plan}"));
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
-        assert_eq!(scan["Warm-up Chunks"].as_i64(), Some(1), "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
+        if scan["Pruning"] == "ordinal" {
+            assert_eq!(scan["Warm-up Chunks"].as_i64(), Some(1), "{scan}");
+        }
     }
 
     #[pg_test]
@@ -3109,7 +3204,7 @@ mod tests {
             |query: &str, filter: &str| explain_by(query, filter, "stannum.full_score(ctid)");
         let ordinary = explain("alpha", "");
         let scan = search_scan(&ordinary[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal");
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(scan["Top-K Completions"], 0);
 
@@ -3118,7 +3213,7 @@ mod tests {
         // 640 and 2,560 rows; the last holds all 1,000 and the ten that pass.
         let filtered = explain("alpha", "AND id > 990");
         let scan = search_scan(&filtered[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal");
         assert_eq!(scan["Top-K Completions"], 4);
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(filtered[0]["Plan"]["Actual Rows"].as_f64(), Some(10.0));
@@ -3127,7 +3222,7 @@ mod tests {
         // positions only for the candidates that enter its top ten.
         let phrase = explain("\"alpha beta\"", "");
         let scan = search_scan(&phrase[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         assert_eq!(scan["Top-K Completions"], 0);
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(scan["Positions Checked"], 10, "{scan}");
@@ -3146,7 +3241,7 @@ mod tests {
         // and only their positions are read.
         let elided = explain_by("\"alpha beta\"", "", "stannum.score(ctid)");
         let scan = search_scan(&elided[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         assert_eq!(scan["Scored Candidates"], 0, "{scan}");
         assert_eq!(scan["Positions Checked"], 10, "{scan}");
         assert_eq!(scan["Top-K Completions"], 0);
@@ -3157,7 +3252,7 @@ mod tests {
         // admits alone: 10 + 40 + 160 + 640 + 1,000.
         let elided = explain_by("\"alpha beta\"", "AND id > 990", "stannum.score(ctid)");
         let scan = search_scan(&elided[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "ordinal", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "ordinal", "{scan}");
         assert_eq!(scan["Top-K Completions"], 4, "{scan}");
         assert_eq!(scan["Exhaustive Score Calls"], 0);
         assert_eq!(scan["Positions Checked"], 1850, "{scan}");
@@ -3166,7 +3261,7 @@ mod tests {
         // the candidate stream.
         let single = explain_by("alpha", "", "stannum.score(ctid)");
         let scan = search_scan(&single[0]["Plan"]).unwrap();
-        assert_eq!(scan["Pruning"], "block-max", "{scan}");
+        assert_eq!(walk_kind(&scan["Pruning"]), "block-max", "{scan}");
         assert_eq!(scan["Scored Candidates"], 0, "{scan}");
     }
 
@@ -3546,7 +3641,7 @@ mod tests {
             client
                 .select(
                     "SELECT kind, docs, dead_docs, sum_doc_lengths, total_pages
-                     FROM stannum.segment_info('si_idx') ORDER BY ordinal",
+                     FROM stannum.segment_info('si_idx') WHERE source_state = 'current' ORDER BY ordinal",
                     None,
                     &[],
                 )
@@ -5127,7 +5222,7 @@ mod tests {
         };
         assert_eq!(
             &read_page(root as u32)[DATA_AT as usize..DATA_AT as usize + 4],
-            segment::segment::MAGIC
+            segment::tinshape::segment::MAGIC
         );
         drop(index);
         corrupt("release_format_idx", 0, KIND_AT + 1, "ff");
@@ -5523,9 +5618,22 @@ mod tests {
             value("SELECT count(*) FROM direct_merge_cancel WHERE body ==> 'needle'"),
             2
         );
+        // The insert sealed the write segment holding the second document
+        // and published its own before the promotion failed: the aborted
+        // row's entry stays, as any index's would, until VACUUM; the sealed
+        // segment waits for the next promotion.
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx')"),
-            2
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx') WHERE source_state = 'current'"
+            ),
+            3
+        );
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('direct_merge_cancel_idx')
+                 WHERE kind = 'sealed'"
+            ),
+            1
         );
         Spi::run("INSERT INTO direct_merge_cancel VALUES (3,'needle third')").unwrap();
         assert_eq!(
@@ -5655,7 +5763,9 @@ mod tests {
         );
         Spi::run("CREATE INDEX build_cancel_idx ON build_cancel USING stannum(body)").unwrap();
         assert_eq!(
-            value("SELECT count(*) FROM stannum.segment_info('build_cancel_idx')"),
+            value(
+                "SELECT count(*) FROM stannum.segment_info('build_cancel_idx') WHERE source_state = 'current'"
+            ),
             1
         );
         assert_clean("build_cancel_idx");
@@ -5745,17 +5855,13 @@ mod tests {
         Spi::run("CREATE INDEX reproducible_whole ON reproducible USING stannum(body)").unwrap();
         assert_eq!(
             build_digest("reproducible_capped"),
-            "56,900,27900,15,9,ae0c93790dc792b76cefcb5ac997350b;\
-             102,900,27900,15,16,dd5b8d00ea07c3c5e74a4efedb3d3436;\
-             78,900,27900,15,23,89ce88852f2b101249dde1f7636bafc0;\
-             62,900,27900,15,30,5a8e51148ea4c6c288d60f736cb7ee52;\
-             30,900,27900,15,37,13a5b66972e1f6b71bc78fed2aa12f9e;\
-             14,900,27900,15,44,6a7c5b6ce2cecc129f0ef094f9f531e6;\
-             2,600,18600,11,47,ce729ed109fa944b0e16c29f9a604554 size 901120"
+            "44,1800,55800,17,48,4340f15e36ef6a0977810e2175eb894c;\
+             26,1800,55800,17,49,1973333a564bb9d4888c4a352fc26451;\
+             2,2400,74400,23,50,398d277200a50fd9128a60ac1c656ec3 size 507904"
         );
         assert_eq!(
             build_digest("reproducible_whole"),
-            "2,6000,186000,115,46,d6398d2a106f33c3f02a604d8a8bba58 size 966656"
+            "2,6000,186000,51,46,6a81758d8bb7c11e761c6246a2058f4a size 442368"
         );
         assert_clean("reproducible_capped");
         assert_clean("reproducible_whole");
@@ -5809,7 +5915,9 @@ mod tests {
             1
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('merge_budget_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('merge_budget_idx') WHERE source_state = 'current'"
+            ),
             33
         );
         assert_eq!(
@@ -5867,7 +5975,9 @@ mod tests {
             96
         );
         assert_eq!(
-            value("SELECT max(docs) FROM stannum.segment_info('merge_full_idx')"),
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_full_idx') WHERE source_state = 'current'"
+            ),
             2
         );
         // With a budget that covers it, the cheapest merge brings the
@@ -5883,7 +5993,9 @@ mod tests {
             3
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('merge_full_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('merge_full_idx') WHERE source_state = 'current'"
+            ),
             100
         );
         assert_eq!(
@@ -5925,7 +6037,9 @@ mod tests {
         Spi::run("INSERT INTO merge_soft VALUES ('needle')").unwrap();
         assert_eq!(segments(), 5);
         assert_eq!(
-            value("SELECT max(docs) FROM stannum.segment_info('merge_soft_idx')"),
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_soft_idx') WHERE source_state = 'current'"
+            ),
             2
         );
         Spi::run("INSERT INTO merge_soft VALUES ('needle')").unwrap();
@@ -5936,7 +6050,9 @@ mod tests {
             .unwrap();
         assert_eq!(segments(), 4);
         assert_eq!(
-            value("SELECT max(docs) FROM stannum.segment_info('merge_soft_idx')"),
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_soft_idx') WHERE source_state = 'current'"
+            ),
             5
         );
         // VACUUM's cleanup enforces the soft bound with no budget at all.
@@ -6046,7 +6162,7 @@ mod tests {
             "insert:prepared",
             "INSERT INTO insert_race_observed SELECT
                  (SELECT count(*) FROM insert_race WHERE body ==> 'Beer'),
-                 (SELECT sum(docs) FROM stannum.segment_info('insert_race_idx'));
+                 (SELECT sum(docs) FROM stannum.segment_info('insert_race_idx') WHERE source_state = 'current');
              INSERT INTO insert_race VALUES (2, 'Craft Beer'), (3, 'craft beer');",
         );
         Spi::run("INSERT INTO insert_race VALUES (4, 'Craft Beer')").unwrap();
@@ -6069,7 +6185,9 @@ mod tests {
             vec![1, 2, 4]
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('insert_race_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('insert_race_idx') WHERE source_state = 'current'"
+            ),
             4
         );
         assert_clean("insert_race_idx");
@@ -6187,35 +6305,12 @@ mod tests {
     }
 
     #[pg_test]
-    fn reconstructed_vacuum_cancels_before_output_and_retries() {
-        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
-        direct_vacuum_cancels_before_output_and_retries();
-    }
-
-    #[pg_test]
-    fn reconstructed_vacuum_discards_retired_inputs() {
-        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
-        direct_vacuum_discards_inputs_retired_during_construction();
-    }
-
-    #[pg_test]
-    fn reconstructed_vacuum_classifies_corruption_and_stale_errors() {
-        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
-        direct_vacuum_distinguishes_corruption_from_retired_inputs();
-    }
-
-    #[pg_test]
-    fn reconstructed_vacuum_removes_all_dead_sources() {
-        Spi::run("SET LOCAL stannum.experimental_vacuum_merge_strategy = 'reconstruct'").unwrap();
-        direct_vacuum_removes_all_dead_sources_without_empty_successors();
-    }
-
-    #[pg_test]
     fn direct_vacuum_cancels_before_output_and_retries() {
         use std::{cell::Cell, rc::Rc};
         direct_vacuum_fixture();
-        let before =
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx')");
+        let before = value(
+            "SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx') WHERE source_state = 'current'",
+        );
         let queued = Rc::new(Cell::new(false));
         let built = Rc::new(Cell::new(false));
         let q = queued.clone();
@@ -6247,7 +6342,9 @@ mod tests {
             "cancel before writing merge output"
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx') WHERE source_state = 'current'"
+            ),
             before
         );
         assert_clean("direct_vacuum_idx");
@@ -6289,7 +6386,9 @@ mod tests {
             19
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('direct_vacuum_idx') WHERE source_state = 'current'"
+            ),
             19
         );
         assert_clean("direct_vacuum_idx");
@@ -6341,7 +6440,9 @@ mod tests {
         }
         unsafe { crate::storage::cleanup(index.as_ptr()) };
         assert_eq!(
-            value("SELECT count(*) FROM stannum.segment_info('direct_vacuum_idx')"),
+            value(
+                "SELECT count(*) FROM stannum.segment_info('direct_vacuum_idx') WHERE source_state = 'current'"
+            ),
             0
         );
         assert_clean("direct_vacuum_idx");
@@ -6351,6 +6452,149 @@ mod tests {
             18
         );
         assert_clean("direct_vacuum_idx");
+    }
+
+    /// Counts folded over segments' ctid sets agree with the ordinal fold
+    /// and with the heap, over several segments with a published dead list,
+    /// rows deleted since (whose pages the heap settles) and a sealed
+    /// segment and buffer beside them; and the plan says how many segments
+    /// the ctid fold counted.
+    #[pg_test]
+    fn ctid_counts_match_the_ordinal_fold_and_the_heap() {
+        Spi::run(
+            "CREATE TABLE ctid_counts(id int, body text);
+             INSERT INTO ctid_counts SELECT n, 'w' || (n % 7) || ' x' || (n % 13)
+                 || CASE WHEN n % 5 = 0 THEN ' rare' ELSE '' END || ' tail'
+                 FROM generate_series(1, 3000) n;
+             SET LOCAL stannum.build_segment_docs = 1000;
+             SET LOCAL stannum.merge_tier_factor = 64;",
+        )
+        .unwrap();
+        // A merge cap no two segments fit under: the build keeps three.
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some(1));
+        Spi::run("CREATE INDEX ctid_counts_idx ON ctid_counts USING stannum(body)").unwrap();
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(None);
+        let dead = tids("DELETE FROM ctid_counts WHERE id % 11 = 0 RETURNING ctid::text");
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'ctid_counts_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        unsafe {
+            let index = pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _);
+            crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead);
+        }
+        Spi::run(
+            "DELETE FROM ctid_counts WHERE id % 17 = 0;
+             SET LOCAL stannum.index_maintenance_mode = manual;
+             SET LOCAL stannum.write_buffer_docs = 4;
+             INSERT INTO ctid_counts SELECT n, 'w1 x2 rare fresh' FROM generate_series(3001, 3006) n;",
+        )
+        .unwrap();
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('ctid_counts_idx')
+                 WHERE kind = 'immutable' AND dead_docs > 0"
+            ),
+            3
+        );
+        let count = |query: &str, native: bool| {
+            Spi::run(&format!(
+                "SET LOCAL stannum.count_native = {native}; SET LOCAL enable_seqscan = off;"
+            ))
+            .unwrap();
+            value(&format!(
+                "SELECT count(*) FROM ctid_counts WHERE body ==> '{query}'"
+            ))
+        };
+        for query in [
+            "w1",
+            "w1 AND x2",
+            "w1 OR rare",
+            "rare AND NOT w3",
+            "\"w2 x5\"",
+            "w1 OR w2 OR x3",
+            "(w1 OR w2) AND (x3 OR rare)",
+            "tail AND NOT rare",
+            "absent OR w6",
+        ] {
+            let native = count(query, true);
+            assert_eq!(native, count(query, false), "{query}");
+            Spi::run(
+                "SET LOCAL stannum.enable_custom_scan = off; SET LOCAL enable_indexscan = off;
+                 SET LOCAL enable_bitmapscan = off; SET LOCAL enable_seqscan = on;",
+            )
+            .unwrap();
+            let heap = value(&format!(
+                "SELECT count(*) FROM ctid_counts WHERE body ==> '{query}'"
+            ));
+            Spi::run(
+                "RESET stannum.enable_custom_scan; RESET enable_indexscan; RESET enable_bitmapscan;",
+            )
+            .unwrap();
+            assert_eq!(native, heap, "{query}");
+        }
+        Spi::run("SET LOCAL stannum.count_native = on; SET LOCAL enable_seqscan = off").unwrap();
+        let plan = Spi::get_one::<pgrx::Json>(
+            "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM ctid_counts WHERE body ==> 'w1 AND x2'",
+        )
+        .unwrap()
+        .unwrap()
+        .0
+        .to_string();
+        assert!(plan.contains("\"Ctid Folds\":3"), "{plan}");
+    }
+
+    /// VACUUM removes dead documents from sealed write segments: each is
+    /// rewritten without them under a new stamp and its old chain retired;
+    /// one left without a document goes. Promotion then sees the rest.
+    #[pg_test]
+    fn bulk_delete_rewrites_sealed_write_segments() {
+        Spi::run(
+            "CREATE TABLE sealed_vac(id int, body text);
+             CREATE INDEX sealed_vac_idx ON sealed_vac USING stannum(body);
+             SET LOCAL stannum.index_maintenance_mode = manual;
+             SET LOCAL stannum.write_buffer_docs = 4;
+             INSERT INTO sealed_vac SELECT n, 'needle k' || n FROM generate_series(1, 9) n;",
+        )
+        .unwrap();
+        let directory = || {
+            Spi::get_one::<String>(
+                "SELECT string_agg(kind || ':' || docs, ',' ORDER BY ordinal)
+                 FROM stannum.segment_info('sealed_vac_idx')",
+            )
+            .unwrap()
+            .unwrap()
+        };
+        assert_eq!(directory(), "mutable:1,sealed:4,sealed:4");
+        let dead = tids("DELETE FROM sealed_vac WHERE id IN (2, 5, 6, 7, 8) RETURNING ctid::text");
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'sealed_vac_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let index =
+            unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
+        let (live, removed) =
+            unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
+        assert_eq!((live, removed), (4, 5));
+        assert_eq!(directory(), "mutable:1,sealed:3");
+        assert_clean("sealed_vac_idx");
+        assert_eq!(
+            value("SELECT count(*) FROM sealed_vac WHERE body ==> 'needle'"),
+            4
+        );
+        Spi::run("SELECT stannum.promote('sealed_vac_idx')").unwrap();
+        assert_eq!(directory(), "immutable:3,mutable:1,retired:3");
+        // Once its pages are reclaimed the retired source is no longer listed.
+        crate::storage::testing::PENDING_REMOVABLE.set(true);
+        unsafe {
+            let index = pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _);
+            crate::storage::cleanup(index.as_ptr());
+        }
+        crate::storage::testing::PENDING_REMOVABLE.set(false);
+        assert_eq!(directory(), "immutable:3,mutable:1");
+        assert_clean("sealed_vac_idx");
+        assert_eq!(
+            value("SELECT sum(id)::bigint FROM sealed_vac WHERE body ==> 'needle'"),
+            17
+        );
     }
 
     #[pg_test]
@@ -6378,7 +6622,9 @@ mod tests {
                 value(
                     "SELECT count(*) FROM stannum.segment_info('vac_race_idx') WHERE kind = 'immutable'",
                 ),
-                value("SELECT sum(dead_docs)::bigint FROM stannum.segment_info('vac_race_idx')"),
+                value(
+                    "SELECT sum(dead_docs)::bigint FROM stannum.segment_info('vac_race_idx') WHERE source_state = 'current'",
+                ),
             )
         };
         assert_eq!(counts(), (29, 0));
@@ -6689,9 +6935,11 @@ mod tests {
     #[pg_test]
     fn failure_after_a_chain_join_before_publication_leaves_published_runs_whole() {
         direct_merge_fixture();
-        // The third insert folds and merges both singletons; retiring their
-        // runs joins them into one pending chain. The merge then fails
-        // before the meta page is written, so both are still published.
+        // The third insert seals and promotes the second document, and the
+        // promotion merges both singletons; retiring their runs joins them
+        // into one pending chain. The merge then fails before the meta page
+        // is written, so both are still published, the sealed segment still
+        // waits, and the insert's own entry, published by the seal, stays.
         let fired = fail_at_race_point("merge:released");
         Spi::run(
             "DO $$BEGIN
@@ -6705,8 +6953,10 @@ mod tests {
         assert!(fired.get());
         assert_only_orphans("direct_merge_cancel_idx");
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx')"),
-            2
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('direct_merge_cancel_idx') WHERE source_state = 'current'"
+            ),
+            3
         );
         // The same merge again retires the same published runs.
         Spi::run("INSERT INTO direct_merge_cancel VALUES (3,'needle third')").unwrap();
@@ -6875,7 +7125,9 @@ mod tests {
         assert!(fired.get());
         assert_only_orphans("vacuum_buffer_idx");
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('vacuum_buffer_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('vacuum_buffer_idx') WHERE source_state = 'current'"
+            ),
             400
         );
         assert_eq!(
@@ -6890,7 +7142,9 @@ mod tests {
             200
         );
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('vacuum_buffer_idx')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('vacuum_buffer_idx') WHERE source_state = 'current'"
+            ),
             200
         );
         let index = unsafe { pgrx::PgRelation::open_with_name("vacuum_buffer_idx") }.unwrap();
@@ -6970,7 +7224,9 @@ mod tests {
             2
         );
         assert_eq!(
-            value("SELECT max(docs) FROM stannum.segment_info('merge_bytes_idx')"),
+            value(
+                "SELECT max(docs) FROM stannum.segment_info('merge_bytes_idx') WHERE source_state = 'current'"
+            ),
             1
         );
         assert_eq!(
@@ -7087,7 +7343,9 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            value("SELECT sum(docs)::bigint FROM stannum.segment_info('np_part')"),
+            value(
+                "SELECT sum(docs)::bigint FROM stannum.segment_info('np_part') WHERE source_state = 'current'"
+            ),
             4
         );
         // CHECK constraints and stored generated columns likewise.
@@ -7260,7 +7518,9 @@ mod tests {
         .0;
         let scan = &plan[0]["Plan"]["Plans"][0];
         assert_eq!(scan["Custom Plan Provider"], "Stannum Text Search Scan");
-        assert_eq!(scan["Candidate Strategy"], "streaming page bitmaps");
+        // The segment hands over its matches folded over its ctid sets, a
+        // document at a time; page bitmaps are the write buffer's.
+        assert_eq!(scan["Candidate Strategy"], "streaming scalar");
         assert_eq!(scan["Candidates Visited"], 10);
         assert!(
             scan.get("Candidates").is_none(),
@@ -7517,6 +7777,13 @@ mod tests {
                 "common AND (red OR green)",
                 "absent OR needle OR green",
                 "absent AND common",
+                // Phrases fold too: the words' members ANDed per group,
+                // positions read only for those left.
+                "\"common red\"",
+                "\"needle red\"",
+                "\"red common\"",
+                "\"needle common green\"",
+                "\"common red\" OR needle",
             ] {
                 let sql = format!("SELECT count(*) FROM fold_counts WHERE body ==> '{query}'");
                 Spi::run("SET LOCAL stannum.count_fold=off").unwrap();
@@ -7533,14 +7800,10 @@ mod tests {
                 value("SELECT count(*) FROM fold_counts WHERE body ==> 'needle'"),
                 value("SELECT count(*) FROM fold_counts WHERE body LIKE '%needle%'")
             );
-            // Positional queries keep the existing strategies.
-            let plan = Spi::get_one::<Json>(
-                "EXPLAIN (ANALYZE, FORMAT JSON) SELECT count(*) FROM fold_counts WHERE body ==> '\"common red\"'",
-            )
-            .unwrap()
-            .unwrap()
-            .0;
-            assert_ne!(plan[0]["Plan"]["Count Strategy"], "ordinal fold");
+            assert_eq!(
+                value("SELECT count(*) FROM fold_counts WHERE body ==> '\"common red\"'"),
+                value("SELECT count(*) FROM fold_counts WHERE body LIKE '%common red%'")
+            );
         }
     }
 
@@ -7990,6 +8253,314 @@ mod tests {
     }
 
     #[pg_test]
+    fn a_ranked_phrase_of_common_words_keeps_what_it_reads() {
+        // Every row holds both words of the phrase, many times. A backend
+        // loaded each query word's whole positions stream (and the whole DL
+        // sidecar) into private memory and kept it: at 150M rows one phrase
+        // of two common words grew a backend by over a gigabyte, and eight
+        // clients overran a 32 GB container. It must keep only what the
+        // walk reads, and what it keeps must count against
+        // `stannum.reader_cache_mb`.
+        // (Reads that copy what they read: in place, a query keeps none of
+        // it, see `ranked_queries_read_segments_in_place_and_keep_nothing`.)
+        use crate::storage::testing::{NATIVE_DROPS, READER_CACHE_BYTES, native_bytes};
+        Spi::run(
+            "CREATE TABLE commonwords(id int primary key, body text);
+             INSERT INTO commonwords
+             SELECT n, repeat('alpha beta ', 1 + n % 37) || repeat('pad ', n % 101) || 'w' || n
+             FROM generate_series(1, 20000) n;
+             CREATE INDEX commonwords_idx ON commonwords USING stannum(body);
+             SET LOCAL enable_seqscan = off;
+             SET LOCAL stannum.native_in_place = off;",
+        )
+        .unwrap();
+        let index_bytes = Spi::get_one::<i64>("SELECT pg_relation_size('commonwords_idx')")
+            .unwrap()
+            .unwrap() as usize;
+        crate::storage::testing::clear_reader_caches();
+        let ranked = || -> Vec<i32> {
+            Spi::connect(|client| {
+                client
+                    .select(
+                        "SELECT id FROM commonwords WHERE body ==> '\"alpha beta\"'
+                         ORDER BY stannum.score(ctid) DESC LIMIT 10",
+                        None,
+                        &[],
+                    )
+                    .unwrap()
+                    .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                    .collect()
+            })
+        };
+        let first = ranked();
+        assert_eq!(first.len(), 10);
+        let held = native_bytes();
+        assert!(held > 0, "the phrase did not take the native path");
+        assert!(
+            held < index_bytes / 4,
+            "a ranked phrase kept {held} bytes of a {index_bytes} byte index"
+        );
+        // Under a budget below what it keeps, the next view drops it.
+        let drops = NATIVE_DROPS.get();
+        READER_CACHE_BYTES.set(Some(
+            crate::storage::testing::reader_arena_bytes() + held / 2,
+        ));
+        let again = ranked();
+        READER_CACHE_BYTES.set(None);
+        assert_eq!(again, first);
+        assert!(NATIVE_DROPS.get() > drops, "{held} native bytes were kept");
+    }
+
+    #[pg_test]
+    fn ranked_queries_read_segments_in_place_and_keep_nothing() {
+        // At 150M rows the chunks the native paths copied into a backend
+        // overflowed its share of the reader cache, so every query copied
+        // again what the last had: some 15,000 pages a query. Read in place
+        // from pinned shared buffers, a query answers as the copies did,
+        // keeps nothing it read and holds no pin once it ends, error or not.
+        use crate::storage::testing::{NATIVE_READ_FAULT, clear_reader_caches, native_loaded};
+        Spi::run(
+            "CREATE TABLE inplace(id int primary key, body text);
+             INSERT INTO inplace
+             SELECT n, repeat('alpha beta ', 1 + n % 37) || repeat('pad ', n % 101)
+                       || 'w' || n || ' v' || (n % 97)
+             FROM generate_series(1, 20000) n;
+             CREATE INDEX inplace_idx ON inplace USING stannum(body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        let queries = [
+            "alpha AND v5",
+            "alpha OR v5",
+            "\"alpha beta\"",
+            "v5 OR v7 OR w9",
+        ];
+        let answers = || -> Vec<(Vec<i32>, i64)> {
+            queries
+                .iter()
+                .map(|q| {
+                    let ids = Spi::connect(|client| {
+                        client
+                            .select(
+                                &format!(
+                                    "SELECT id FROM inplace WHERE body ==> '{q}'
+                                     ORDER BY stannum.score(ctid) DESC LIMIT 10"
+                                ),
+                                None,
+                                &[],
+                            )
+                            .unwrap()
+                            .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                            .collect::<Vec<i32>>()
+                    });
+                    let count = Spi::get_one::<i64>(&format!(
+                        "SELECT count(*) FROM inplace WHERE body ==> '{q}'"
+                    ))
+                    .unwrap()
+                    .unwrap();
+                    (ids, count)
+                })
+                .collect()
+        };
+        Spi::run("SET LOCAL stannum.native_in_place = off").unwrap();
+        clear_reader_caches();
+        let copied = answers();
+        assert!(
+            native_loaded() > 0,
+            "the queries did not take the native path"
+        );
+        Spi::run("SET LOCAL stannum.native_in_place = on").unwrap();
+        clear_reader_caches();
+        let pinned = crate::storage::held_pages().0;
+        assert_eq!(answers(), copied);
+        assert_eq!(
+            native_loaded(),
+            0,
+            "a query read in place kept what it read"
+        );
+        assert_eq!(crate::storage::held_pages().0, pinned);
+        // An error raised with the read's pages still pinned releases them
+        // as it unwinds.
+        NATIVE_READ_FAULT.set(true);
+        Spi::run(
+            "DO $$ BEGIN
+               PERFORM id FROM inplace WHERE body ==> 'alpha OR v5'
+               ORDER BY stannum.score(ctid) DESC LIMIT 10;
+               RAISE EXCEPTION 'no fault';
+             EXCEPTION WHEN OTHERS THEN
+               IF SQLERRM NOT LIKE '%fault injected%' THEN RAISE; END IF;
+             END $$",
+        )
+        .unwrap();
+        NATIVE_READ_FAULT.set(false);
+        assert_eq!(crate::storage::held_pages().0, pinned);
+        assert_eq!(answers(), copied);
+        assert_eq!(native_loaded(), 0);
+    }
+
+    /// A table of 20,000 rows indexed as `hints_idx` (immutable segments),
+    /// and its ranked answers to a few queries, as ids.
+    fn buffer_hint_fixture() -> impl Fn() -> Vec<Vec<i32>> {
+        Spi::run(
+            "CREATE TABLE hints(id int primary key, body text);
+             INSERT INTO hints
+             SELECT n, repeat('alpha beta ', 1 + n % 37) || repeat('pad ', n % 101)
+                       || 'w' || n || ' v' || (n % 97)
+             FROM generate_series(1, 20000) n;
+             CREATE INDEX hints_idx ON hints USING stannum(body);
+             SET LOCAL enable_seqscan = off;",
+        )
+        .unwrap();
+        || {
+            ["alpha AND v5", "alpha OR v5", "\"alpha beta\" v7"]
+                .iter()
+                .map(|q| {
+                    Spi::connect(|client| {
+                        client
+                            .select(
+                                &format!(
+                                    "SELECT id FROM hints WHERE body ==> '{q}'
+                                     ORDER BY stannum.score(ctid) DESC LIMIT 10"
+                                ),
+                                None,
+                                &[],
+                            )
+                            .unwrap()
+                            .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                            .collect::<Vec<i32>>()
+                    })
+                })
+                .collect()
+        }
+    }
+
+    #[pg_test]
+    fn a_backend_pins_pages_other_backends_pinned_through_their_buffers() {
+        // At 150M rows a backend found a third to a half of the pages it
+        // pinned in the buffer it had last pinned them in; the rest, pages
+        // it had not pinned before (other backends had) or whose entry in
+        // its own table another page had taken, went through the buffer
+        // mapping table's hash and partition lock. Where a page was last
+        // pinned is shared by every backend, so a backend that never read
+        // a page still pins it through its buffer.
+        use crate::storage::testing::{clear_reader_caches, forget_recent_buffers};
+        let ranked = buffer_hint_fixture();
+        let first = ranked();
+        // This backend forgets which buffers it pinned pages in, as one
+        // that never ran these queries knows nothing of them.
+        forget_recent_buffers();
+        clear_reader_caches();
+        Spi::run("SET LOCAL stannum.share_buffer_hints = off").unwrap();
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(pins > 0, "the last query pinned no page");
+        // (A page the query pins again, in another span, it pins through
+        // the buffer it pinned it in moments before.)
+        assert!(
+            recent * 4 < pins,
+            "{recent} of {pins} forgotten pages pinned through their buffer"
+        );
+        forget_recent_buffers();
+        clear_reader_caches();
+        Spi::run("SET LOCAL stannum.share_buffer_hints = on").unwrap();
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(pins > 0, "the last query pinned no page");
+        assert!(
+            recent * 10 >= pins * 9,
+            "{recent} of {pins} pages pinned through the buffer they were last pinned in"
+        );
+    }
+
+    #[pg_test]
+    fn a_buffer_hint_left_by_a_rebuilt_index_pins_nothing_of_it() {
+        // A hint names a buffer, not a page: once the index is rebuilt in a
+        // new file its blocks are new pages, and a hint left by the old
+        // file's pages must be refused (ReadRecentBuffer checks the tag).
+        let ranked = buffer_hint_fixture();
+        let first = ranked();
+        Spi::run("REINDEX INDEX hints_idx").unwrap();
+        crate::storage::testing::forget_recent_buffers();
+        crate::storage::testing::clear_reader_caches();
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(pins > 0, "the last query pinned no page");
+        // Only the pages it pins a second time, in another span.
+        assert!(
+            recent * 4 < pins,
+            "{recent} of {pins} pages of the rebuilt index pinned through old hints"
+        );
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(
+            recent * 10 >= pins * 9,
+            "{recent} of {pins} pinned through hints"
+        );
+    }
+
+    #[pg_test]
+    fn a_backend_that_cannot_attach_the_shared_hints_answers_through_its_own() {
+        // The table lives in dynamic shared memory created on first use; a
+        // failure there (no room in /dev/shm, no free segment slot) raises
+        // an error with the registry's locks held. The attach runs in a
+        // subtransaction of its own, so the error is rolled back with what
+        // it took, and the backend goes on with its own table.
+        use crate::storage::testing::{
+            HINTS_SIZE_SKEW, clear_reader_caches, forget_recent_buffers, reattach_shared_hints,
+        };
+        let ranked = buffer_hint_fixture();
+        let first = ranked();
+        assert!(reattach_shared_hints(), "the shared table was not attached");
+        // A size other than the existing segment's: the attach fails.
+        HINTS_SIZE_SKEW.set(1);
+        forget_recent_buffers();
+        clear_reader_caches();
+        let failed = ranked();
+        HINTS_SIZE_SKEW.set(0);
+        assert_eq!(failed, first);
+        assert!(
+            !reattach_shared_hints(),
+            "a failed attach left the table attached"
+        );
+        // A transaction-level statement after the rolled-back attach.
+        assert_eq!(
+            Spi::get_one::<i64>("SELECT count(*) FROM hints").unwrap(),
+            Some(20000)
+        );
+        assert_eq!(ranked(), first);
+        assert!(
+            reattach_shared_hints(),
+            "the attach failed again with the right size"
+        );
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(
+            recent * 10 >= pins * 9,
+            "{recent} of {pins} pinned through hints"
+        );
+    }
+
+    #[pg_test]
+    fn a_page_pinned_through_its_buffer_counts_as_used() {
+        // `ReadRecentBuffer` pins without raising the buffer's usage count,
+        // which `ReadBuffer` raises (up to 5) on every pin: with nearly all
+        // of an index's pins taken through hints, its pages would look
+        // unused to the clock sweep and be evicted before the heap's.
+        let _ = buffer_hint_fixture();
+        let oid = Spi::get_one::<pg_sys::Oid>("SELECT 'hints_idx'::regclass::oid")
+            .unwrap()
+            .unwrap();
+        let (before, after) = unsafe { crate::storage::testing::usage_through_hints(oid, 6) };
+        assert!(
+            before < 5,
+            "no block of the index had a usage count below 5"
+        );
+        assert_eq!(
+            after, 5,
+            "usage count {before} became {after} after six pins"
+        );
+    }
+
+    #[pg_test]
     fn a_backend_holds_dead_documents_in_about_a_bit_per_document() {
         // VACUUM publishes a dead list per segment, and every backend that
         // queries the segment decodes it. Held as a set of locations plus a
@@ -8043,8 +8614,11 @@ mod tests {
             assert!(ids.iter().all(|id| id % 10 >= tenths), "{ids:?}");
             let extra_peak = peak.saturating_sub(clean_peak);
             let extra_kept = kept.saturating_sub(clean_kept);
-            // Two bits per document: the dead list as stored plus decoded.
-            let bound = DOCS / 4 + 16 * 1024;
+            // Four bits per document: the dead list as stored, decoded by
+            // ordinal (for the write segment's paths and queries that do not
+            // lower), and as the segment's liveness in slot space (1.6 slots
+            // a document on Stack Exchange's heap) for the native walks.
+            let bound = DOCS / 2 + 16 * 1024;
             within &= extra_peak <= bound && extra_kept <= bound;
             report.push(format!(
                 "{} dead: {extra_peak} bytes more at peak ({:.1} per dead row), \
@@ -8093,7 +8667,9 @@ mod tests {
         unsafe { crate::storage::testing::bulk_delete_with(index.as_ptr(), &dead) };
         drop(index);
         assert_eq!(
-            value("SELECT sum(dead_docs)::bigint FROM stannum.segment_info('dense_dead_idx')"),
+            value(
+                "SELECT sum(dead_docs)::bigint FROM stannum.segment_info('dense_dead_idx') WHERE source_state = 'current'"
+            ),
             1800,
             "the dead list is published, not rewritten away"
         );
@@ -8343,5 +8919,31 @@ mod tests {
             pg_sys::table_close(relation, pg_sys::AccessShareLock as _);
             status & pg_sys::VISIBILITYMAP_ALL_VISIBLE as u8 != 0
         }
+    }
+
+    /// The shared reference count of the buffer holding `block` of `index`
+    /// (used by postgres/tests/own_pins.py).
+    #[pg_extern]
+    fn buffer_refcount(index: pg_sys::Oid, block: i64) -> i64 {
+        i64::from(unsafe { crate::storage::testing::shared_refcount(index, block as u32) })
+    }
+
+    /// Holds an own pin on `block` of `index` for `hold_ms`; the buffer's
+    /// reference count right after the release.
+    #[pg_extern]
+    fn own_pin_held(index: pg_sys::Oid, block: i64, hold_ms: i64) -> i64 {
+        i64::from(unsafe {
+            crate::storage::testing::own_pin_held(index, block as u32, hold_ms as u64)
+        })
+    }
+
+    /// Holds the header lock of the buffer holding `block` of `index` for
+    /// `hold_ms`, as the bgwriter, a checkpoint or `pg_buffercache` hold it
+    /// for a moment; the reference count read under the lock.
+    #[pg_extern]
+    fn buffer_header_locked(index: pg_sys::Oid, block: i64, hold_ms: i64) -> i64 {
+        i64::from(unsafe {
+            crate::storage::testing::header_locked(index, block as u32, hold_ms as u64)
+        })
     }
 }

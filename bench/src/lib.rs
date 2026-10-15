@@ -11,6 +11,7 @@ pub mod areas;
 pub mod dump;
 pub mod paged;
 pub mod replay;
+pub mod tinshape;
 pub mod whatif;
 
 /// A query of a trace: its name, style and TINQL text.

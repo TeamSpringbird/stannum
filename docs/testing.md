@@ -72,6 +72,7 @@ job. "Step" is the `script/test-all` step that runs it.
 | Crashes before publication | `postgres/tests/crash_before_publication.py`: crash hooks that exist only in the pg_test build | right after `cargo pgrx test`, under the same lock hold | the pg_test build installed | CI build-and-test; step `pgrx` |
 | Count under VACUUM | `postgres/tests/count_under_vacuum.py`: a count paused at its `count:view` race point while VACUUM removes a row its view lists; a private cluster, so no other session holds the removal horizon | right after `cargo pgrx test`, under the same lock hold | the pg_test build installed | CI build-and-test; step `pgrx` |
 | Maintenance worker crashes | `postgres/tests/maintenance_worker_crash.py`: a preloaded private cluster whose maintenance worker crashes the server between writing a merged run and publishing it, or is terminated at a merge checkpoint (`stannum.debug_maintenance_race`, pg_test builds only) | right after `cargo pgrx test`, under the same lock hold | the pg_test build installed | CI build-and-test; step `pgrx` |
+| Own pins | `postgres/tests/own_pins.py`: a run page's own pin released while another session holds its buffer header lock (`tests.own_pin_held`, `tests.buffer_header_locked`, `tests.buffer_refcount`, pg_test builds only), then walks beside `pg_buffercache` readers, VACUUMs, REINDEXes, cancellations and terminations; nothing may stay pinned, the log clean, the index droppable (`pg_buffercache` installed with the server) | right after `cargo pgrx test`, under the same lock hold | the pg_test build installed | CI build-and-test; step `pgrx` |
 | Cluster tests | `postgres/tests/`: `extension_upgrade.py`, `postings_lifecycle.py`, `merge_lifecycle.py`, `maintenance_workers.py` (background workers with the library preloaded), `ranked_fuzz.py --smoke`, `vacuum_cleanup_pins.py`; and `benchmarks/mutation_targets.py` (the benchmark writers' target selection) | `python3 postgres/tests/<test>.py` | the release build installed; each starts its own throwaway cluster | CI build-and-test; step `cluster` |
 | Conformance against TIN 1.0.3 and 1.0.4 | `conformance/`: 258 cases checked against `conformance/expected/tin-1.0.3` and `conformance/expected/tin-1.0.4` ([README](../conformance/README.md)) | `conformance/run.py --engine stannum --check conformance/expected/tin-1.0.4` (and `tin-1.0.3`) | `STANNUM_PYTHON`; the release build installed | CI build-and-test (PostgreSQL 18); step `conformance`, in a throwaway cluster |
 | Reference oracle | `script/reference-oracle`: 47 query shapes in five mutation states against PlanetScale's Lead, built as `tin` | `PGHOST=... PGPORT=... script/reference-oracle OUT` | a running server; a Lead checkout (`LEAD_REF_DIR`) | CI reference-oracle; step `oracle` |
@@ -232,6 +233,11 @@ most of it the image build):
 STANNUM_PYTHON=.venv/bin/python benchmarks/local/exit-test.sh
 # STANNUM_EXIT_IMAGE=... reuses an image built earlier
 ```
+
+It also runs against a local server dedicated to it (a cassert build, say)
+whose log file it can read, `--log FILE --pgdata DIR` instead of
+`--container`, the shutdown through `pg_ctl`; on macOS the thread-local
+destructors do not run at exit, so only the exit itself is tested there.
 
 The table has 4.6 million documents because a walk checks for interrupts
 only every 64 chunks of 65,536 rows. Below that, every termination lands

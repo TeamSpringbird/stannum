@@ -44,6 +44,38 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: the offline replay's command line and report."
     },
+    "bench/src/bin/tinshape.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid-addressed format's converter, size report and trace replay."
+    },
+    "bench/src/bin/tnsef.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: Elias-Fano decoding measured on a dump's own containers, by width and length, at each kernel level."
+    },
+    "bench/src/bin/tnsreplay.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ranked trace replay over dumped TNS1 segments, read in place as the extension reads them."
+    },
+    "bench/src/bin/tnsdirskim.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the per-entry cost of skimming and decoding a dumped TNS1 segment's group directories, against decoding them a varint at a time."
+    },
+    "bench/src/bin/tnsdocsets.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the decoded size and decode time of each dumped TNS1 segment's document set, as a backend's reader cache keeps them."
+    },
+    "bench/src/bin/tnsfootcensus.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a census of a dumped TNS1 segment's records by form and df band (footer, directory, container, TF and inline-length bytes)."
+    },
+    "bench/src/bin/tnsreencode.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: re-encodes a page layout version 6 dump's grouped records to version 8 (frontiers in the directory, TF tail per group) and reports the cost."
+    },
+    "bench/src/bin/tnsunits.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: counts of TNS1 units spanning page boundaries and 64-byte lines over a dump, with the padding that would avoid them."
+    },
     "bench/src/dump.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: reading script/dump-segments.py's dumps for the offline replay."
@@ -59,6 +91,10 @@
     "bench/src/replay.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the offline replay's query execution through the engine crate."
+    },
+    "bench/src/tinshape.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: conversion of dumped ordinal segments to the ctid-addressed format, its exact check and page accounting."
     },
     "bench/src/whatif.rs": {
       "owner": "ben",
@@ -92,6 +128,10 @@
       "owner": "ben",
       "evidence": "Original Stannum temporary AWS benchmark setup; no upstream source copied."
     },
+    "benchmarks/aws/v2-campaign.sh": {
+      "owner": "ben",
+      "evidence": "New Stannum AWS orchestration for benchmarks v2 (TIN v1.0.6 setup); not copied from Lead."
+    },
     "benchmarks/baselines.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
@@ -103,6 +143,10 @@
     "benchmarks/compare/compare.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; the TIN vs Stannum comparison kit, written for this repository on 2026-10-09."
+    },
+    "benchmarks/compare/h2h.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the head-to-head replay of the TIN probes' corpus and queries, written for this repository on 2026-10-09."
     },
     "benchmarks/contention.py": {
       "owner": "ben",
@@ -180,6 +224,18 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 7ee73ff00e2643ecb2142a819e86ae24fb274c85."
     },
+    "benchmarks/local/profile/areas.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: area shares and folded stacks from perf script output. Added on branch tinshape/profile-v2."
+    },
+    "benchmarks/local/profile/explain_table.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: per-query buffer accesses from EXPLAIN-sampled runs beside pg_statio. Added on branch tinshape/profile-v2."
+    },
+    "benchmarks/local/profile/stacks.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: folds perf script output and answers queries over the stacks. Added on branch tinshape/profile-v2."
+    },
     "benchmarks/local/report.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Introduced in 7ee73ff00e2643ecb2142a819e86ae24fb274c85."
@@ -191,6 +247,10 @@
     "benchmarks/local/timeseries.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history, no upstream counterpart. Added on branch bench/long-run on 2026-09-27."
+    },
+    "benchmarks/local/vm_ab.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: interleaved A/B of images on a saved database, counted in the VM's instructions retired."
     },
     "benchmarks/local/workload.sh": {
       "owner": "ben",
@@ -348,6 +408,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation for bounded remote TIN experiments and safety checks; no upstream source copied."
     },
+    "benchmarks/test_v2.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum tests for the benchmarks v2 campaign and report."
+    },
     "benchmarks/test_vacuum_cleanup.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 9bc663ac5d84082a04ae1ff0578be824dd2018d3."
@@ -371,6 +435,10 @@
     "benchmarks/tin_experiments.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation for bounded remote TIN experiments and safety checks; no upstream source copied."
+    },
+    "benchmarks/v2.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum benchmarks v2 campaign and report over the pinned PlanetScale/ParadeDB benchmark driver."
     },
     "benchmarks/vacuum_cleanup.py": {
       "owner": "ben",
@@ -594,6 +662,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
     },
+    "conformance/cases/prepared.yaml": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-09."
+    },
     "conformance/cases/tiebreak.yaml": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; the engine-agnostic TIN interface conformance suite, written for this repository on 2026-10-08."
@@ -722,6 +794,34 @@
       "upstream_revision": "e3ed2f4ce1388167b0254a0c0c706a61d0a37d83",
       "evidence": "Scoring-term collection, moved from postgres/src/score.rs (inherited upstream file with Stannum changes), and the statistics fold of the indexed scorer; retain PlanetScale credit. Lead's span leaf weighting (b8018ac) merged in."
     },
+    "engine/src/tinshape.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: counts and ranked top-k over the ctid-addressed segment format."
+    },
+    "engine/src/tinshape/kernels.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the word kernels of the ctid-addressed segment format, per instruction set (NEON, AVX2, AVX-512) with a portable reference, moved out of engine/src/tinshape.rs."
+    },
+    "engine/src/tinshape/kernels/array.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: array containers (a group's local slots as sorted u16s) widened into a list (NEON, AVX2, portable), set in a row, and galloped through in place."
+    },
+    "engine/src/tinshape/kernels/ef.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: Elias-Fano lists decoded a block at a time (a table per highs byte, a shuffle per eight low parts), per instruction set (NEON, AVX2) with a portable reference."
+    },
+    "engine/src/tinshape/kernels/rows.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a group's ascending members set as bits in a row without reading back the word stored before (NEON eight at a time at byte grain, a register-held word elsewhere), and marked intersection through such a row."
+    },
+    "engine/src/tinshape/kernels/weigh.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a disjunction's words and members weighed by their terms' bounds in lanes (words, or a word's members), per instruction set (NEON, AVX2) with a portable reference."
+    },
+    "engine/src/tinshape/rank.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: ranked top-k over the ctid-addressed segment format, a 256-page group at a time."
+    },
     "engine/src/walk.rs": {
       "owner": "mixed",
       "upstream_path": "postgres/src/score.rs",
@@ -773,6 +873,10 @@
     "postgres/src/fold.rs": {
       "owner": "ben",
       "evidence": "Original Boolean count executor over document ordinals, written for Stannum: the extension's visibility-map read for engine/src/fold.rs."
+    },
+    "postgres/src/native.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: Boolean matching over segments in TIN's shape for the index scans, written for Stannum."
     },
     "postgres/src/heap_probe.rs": {
       "owner": "ben",
@@ -938,6 +1042,10 @@
       "owner": "ben",
       "evidence": "Original Stannum wide-query fuzzer generation regression tests. Moved from benchmarks/test_wide_cursor.py."
     },
+    "postgres/tests/own_pins.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum regression: an own pin released under another session's buffer header lock, and walks with own pins under pg_buffercache readers, VACUUM, REINDEX, cancellation and termination."
+    },
     "postgres/tests/vacuum_cleanup_pins.py": {
       "owner": "ben",
       "evidence": "Original Stannum regression reproducing reader-pinned heap cleanup and validating benchmark accounting. Moved from benchmarks/vacuum_cleanup_pins.py."
@@ -955,6 +1063,14 @@
     "script/dump-segments.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
+    },
+    "script/pgo-build": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: trains the profile-guided optimization profiles (the extension in PostgreSQL, the offline replay)."
+    },
+    "script/pgo-check": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: checks a profile-guided build's hot functions against the built library and the compiler's warnings."
     },
     "script/pgrx-lock.py": {
       "owner": "ben",
@@ -991,14 +1107,6 @@
     "segment/examples/breakdown.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in d968a6e59d5a2b9f16b284e8a06c2a85baf4cf86."
-    },
-    "segment/examples/merge_memory.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 80e5f85e05b178c58e24a73d30a794a9004c4a18."
-    },
-    "segment/examples/vacuum_diagnostic.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in a70ba90f4658fdc1f3b91cfb313a55429a76810c."
     },
     "segment/src/bound.rs": {
       "owner": "ben",
@@ -1044,14 +1152,6 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
     },
-    "segment/src/merge.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 26b9d1ec0f2cad8e84386cf26b63afe3dadcd42c."
-    },
-    "segment/src/merge_strategy.rs": {
-      "owner": "ben",
-      "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in 6f8189c269c66d941502d0da662e142e1f898cc4."
-    },
     "segment/src/ordinals.rs": {
       "owner": "ben",
       "evidence": "Original ordinal stream codec and chunked Boolean evaluator, written for Stannum."
@@ -1093,6 +1193,54 @@
     "segment/src/tid.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation; reviewed new-path history and compared against upstream source. Introduced in b740f5dcb3eda81badd396d75a9ba9debd307ad7."
+    },
+    "segment/src/tinshape/bits.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: bit packing for the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/blob.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a segment blob loaded on demand a chunk at a time for the ctid-native paths."
+    },
+    "segment/src/tinshape/docs.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid grid, document set, DL sidecar and liveness bitmap of the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/ef.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: Elias-Fano coding for the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/index.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a ctid-addressed segment read through a page source behind the ordinal query interface."
+    },
+    "segment/src/tinshape/merge.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: merging ctid-addressed segments without their dead documents."
+    },
+    "segment/src/tinshape/mod.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid-addressed segment format in TIN's shape."
+    },
+    "segment/src/tinshape/positions.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: positions streams of the ctid-addressed format with finer skips for frequent terms."
+    },
+    "segment/src/tinshape/postings.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: ctid posting sets, footers and TF tails of the ctid-addressed segment format."
+    },
+    "segment/src/tinshape/segment.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the ctid-addressed segment blob and its reader."
+    },
+    "segment/src/tinshape/tests.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: property tests of the ctid-addressed reader and merge against the ordinal format."
+    },
+    "segment/src/tinshape/verify.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: corruption checks of a ctid-addressed segment blob."
     },
     "segment/src/varint.rs": {
       "owner": "ben",
@@ -1383,6 +1531,70 @@
     "tokenizer/tests/tin_stemming.rs": {
       "owner": "ben",
       "evidence": "Original Stannum tests of stemmed tokenization against TIN 1.0.4's recorded answers."
+    },
+    "benchmarks/aws/devbox.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: runs one command on a spot x86 AWS box through SSM and copies the results home."
+    },
+    "benchmarks/aws/devbox-box.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the devbox's side of devbox.sh (toolchain, sources, dump, command, results)."
+    },
+    "benchmarks/aws/devbox-footers-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of a format change, re-encoding the dump on the box."
+    },
+    "benchmarks/aws/devbox-pgrid-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of two stacked format changes, re-encoding the dump twice on the box."
+    },
+    "benchmarks/aws/devbox-walk-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for a three-way replay A/B of walk changes over page layout 9, re-encoding the dump on the box, with the dense-pair tail."
+    },
+    "benchmarks/aws/devbox-r3r4-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for a two-way replay A/B of a disjunction walk change over page layout 9, re-encoding the dump on the box."
+    },
+    "benchmarks/aws/devbox-arrays-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for a two-way replay A/B of array containers (page layout 11) against layout 10, re-encoding the dump on the box, with the array kernel tests and tnsef arrays."
+    },
+    "benchmarks/aws/devbox-r6r7-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for a four-way replay A/B of scorer and walk changes over page layout 9, re-encoding the dump on the box, with memory-stall counters."
+    },
+    "benchmarks/aws/devbox-tail-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for a three-way replay A/B (version-6 base, layout 8, a walk change over layout 8), re-encoding the dump on the box."
+    },
+    "benchmarks/aws/devbox-integrate-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for a two-way replay A/B of an integration branch against its base over page layout 9 with per-query metadata cost (--forget), re-encoding the dump on the box."
+    },
+    "benchmarks/aws/devbox-kernels-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for kernel changes over layout 9: tests at every level, tnsef, exactness and the replay A/B."
+    },
+    "benchmarks/aws/devbox-replay-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of two trees under perf stat."
+    },
+    "benchmarks/aws/devbox-simd-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for the weighing and scoring kernels' tests at every level and their replay A/B."
+    },
+    "benchmarks/aws/devbox-simd-ab2.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a short devbox command file for the replay of up to three trees under perf stat."
+    },
+    "benchmarks/aws/devbox-bolt-variants.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file measuring PGO, CPU-level and BOLT builds of the replay."
+    },
+    "script/bolt-build": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: optimizes a built ELF's code layout with LLVM BOLT from a training run."
     }
   }
 }

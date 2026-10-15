@@ -27,10 +27,10 @@ SKIP is a case without a recorded answer):
 
 | Status | TIN 1.0.3 | TIN 1.0.4 | Meaning |
 | --- | ---: | ---: | --- |
-| PASS | 184 | 218 | Every capture equals TIN's answer |
+| PASS | 185 | 219 | Every capture equals TIN's answer |
 | DIFF | 13 | 13 | Both raise an ERROR with the same SQLSTATE; the message wording differs |
 | IMPROVED | 5 | 5 | TIN refuses the query with an ERROR; Stannum answers it |
-| GAP | 7 | 11 | Stannum lacks what the case exercises, or answers it differently |
+| GAP | 6 | 10 | Stannum lacks what the case exercises, or answers it differently |
 | LIMITED | 3 | 2 | Stannum refuses with a limit ERROR where TIN answers |
 | NEWER | 4 | 4 | Stannum follows a later TIN change that Lead has copied |
 | SKIP | 42 | 5 | |
@@ -109,8 +109,7 @@ the last two possible.
 
 | Case | Difference |
 | --- | --- |
-| `catalog.S-07` | `stannum.promote()` folds a write buffer of any size, so after it a term in every row is elided by `score()`; TIN's `promote()` consumes only a sealed write segment and leaves a 20-row buffer mutable, where elision does not count it. |
-| `catalog.S-07b`–`S-07g` | The same difference on more shapes, and `segment_info()`'s layout: Stannum has no sealed write segment (inserts fold every 512 rows whatever the maintenance mode), writes one segment per fold whatever `extent_cap_bytes`, lists a `generation` column and reports `npostings` and `origin` as NULL. `promote()`'s signature and its refusal of a cap that is not positive match (`catalog.S-07h`). |
+| `catalog.S-07b`–`S-07g` | `segment_info()` lists Stannum's own root pages and page counts and a `generation` column; TIN's build writes 200 short rows as two segments where Stannum's writes one, and `promote(index, 1)` splits a sealed segment into as many as Stannum's directory has room for rather than TIN's 68. Sealing, `promote()`'s rows and elision match. |
 
 ## Other known differences
 
@@ -181,7 +180,7 @@ are accepted. Stannum's registration is in
 | `stemmer` | `ar`, `da`, `de`, `el`, `en`, `es`, `fi`, `fr`, `hu`, `it`, `nl`, `no`, `pt`, `ro`, `ru`, `sv`, `ta`, `tr`; unset | Snowball stemming of indexed and query terms | Same; persisted at build with the other tokenizer settings |
 | `initial_segment_count` | integer `1..4096` | Build partitions | Accepted and ignored, with a warning |
 | `target_segment_count` | integer `1..4096` | Maintenance target | Soft directory bound in place of `stannum.max_segments` |
-| `max_mutable_segment_size` | integer `>= 131072` bytes; `4194304` | Write buffer size before promotion | Fold size in place of `stannum.write_buffer_bytes`; `stannum.write_buffer_docs` still applies |
+| `max_mutable_segment_size` | integer `>= 131072` bytes; `4194304` | Write segment size before it is sealed and promoted | The size at which the write buffer is sealed, in place of `stannum.write_buffer_bytes` (also 4 MiB); `stannum.write_buffer_docs` (12,288) still applies |
 | `max_merged_segment_size` | integer `>= 100` MB; `2000` | Merge size ceiling | Most input megabytes one merge takes, within the 3 GiB a run can record |
 | `dead_percent_threshold` | real `0..1`; `0.5` | Dead fraction that triggers a rewrite | VACUUM rewrites a segment at this dead fraction |
 

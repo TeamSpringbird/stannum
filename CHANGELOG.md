@@ -13,24 +13,64 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Added
 
+- On x86-64, the word kernels of segments in TIN's shape (grid AND, OR and
+  AND NOT, popcount, AND-popcount, masked counts) run AVX-512 or AVX2 bodies
+  chosen once at runtime, as PostgreSQL's `pg_popcount` does, so baseline
+  x86-64 packages use the CPU's vectors; aarch64 keeps NEON.
+  `STANNUM_KERNELS` forces a level for tests and comparisons. With
+  AVX-512 VBMI and VBMI2 (Ice Lake, Sapphire Rapids, Zen 4 on), Elias-Fano
+  containers decode a highs word at a time (`vpcompressb`) and sixteen low
+  parts at a time (`vpermb`), and a grid's members become positions the
+  same way: 1.8-3.7% fewer cycles per query on Sapphire Rapids.
+- Queries read segments in TIN's shape in place from pinned shared buffers
+  rather than copying what they read into per-backend chunks: at 150M rows
+  the copies overflowed each backend's cache and every query copied some
+  15,000 pages again. `stannum.native_in_place` (on) switches back for
+  comparison; `EXPLAIN ANALYZE` reports native reads by kind (bytes copied,
+  pages pinned, bytes and reads stitched across page boundaries, and the
+  distinct pages read, as TIN's unique pages per area) and buffer accesses
+  by phase. Distinct pages are counted only under `EXPLAIN ANALYZE`: a set
+  insert per page read cost every query 0.5-1.1% of its instructions
+  (replay at 150 million rows, Apple M4). A segment's blob keeps its
+  stitch buffers for the next read, and its memos of parsed records and
+  decoded footers drop what was used longest ago rather than emptying
+  whole.
+
 - A PostgreSQL 17 and 18 index access method, `stannum`, with TINQL matching
   through `==>`, BM25 ranking (`stannum.score`, `full_score`, `max_score`,
   `score_inspect`), highlighting (`stannum.highlight`, `highlight_ansi`),
   segmented indexes and exact counts under concurrent writes.
-- Segment format `STN3`. A term's documents are stored once, as ordinals into
-  the segment's document table, with each member's term-frequency bucket
-  beside it and a score bound per 65,536-document chunk and per
-  1,024-document sub-block, so scoring never reads positions. Positions have
-  their own stream, read only by positional queries. The document table maps
-  ordinals to heap locations and back through a page table and a two-byte
-  offset per document, and a one-byte length class per document lets a
-  ranked walk bound a candidate before reading its length. Dead lists are
-  ordinal streams. On the 150 million row Stack Exchange corpus the index is
-  47 GB.
+- Segment format `TNS1`, in TIN's shape: a term's postings are a set of heap
+  ctids over a grid of 256-page groups in which each heap page is as wide as
+  its largest line pointer, so a page of `n` rows costs `n` slots, one per
+  document, as TIN sizes its page masks (Elias-Fano lists, grid bitmaps or
+  per-page containers, the smallest), with its score metadata per (term,
+  group) as TIN keeps it: each group's directory entry carries the group's
+  impact frontier (lengths rounded down to six significant bits) and its
+  buckets follow in a TF tail packed per group, so a ranked walk bounds a
+  group from its entry and decodes nothing of the groups before it; a rare
+  term kept as one list keeps a footer of per-block frontiers. Positions are
+  in their own stream, with a document set and a DL sidecar of exact
+  lengths; see [the TIN-shape guide](docs/architecture/tin-shape.md). Index
+  pages are layout version 9; an index written earlier must be rebuilt
+  (`REINDEX`).
+  Ranked scans (every style, tiebreak keys and filtered walks included),
+  bitmap and plain index scans, counts and `score()` of single rows read
+  segments natively, a 256-page group at a time, with VACUUM's dead list as
+  each segment's liveness; wildcards, regexes, ranges and fuzzy terms are
+  expanded against the segment's term map first. Only queries that still do
+  not lower (spans that do not need every word, position filters, `AT
+  LEAST` of more than one) read a segment's terms translated into ordinal
+  streams, as the write buffer's are. Merges keep the group containers of
+  groups only one input holds. Dead lists are ordinal streams of dead ranks.
 - Counts of Boolean term queries fold the ordinal streams a chunk at a time
   instead of visiting each match: the 302 published Wikipedia count queries
   sum to 39 ms instead of 3,767 ms in the replay harness.
   `stannum.count_fold = off` selects the page-mask and scalar strategies.
+  Where the query lowers to it (terms, `AND`, `OR`, `NOT`, phrases and spans
+  of plain terms) a segment is counted over its ctid sets instead, a
+  256-page group at a time, trusting the visibility map per heap page
+  (`stannum.count_native`).
 - Pruned ranked retrieval over the ordinal streams (block-max WAND with
   per-chunk and per-sub-block bounds), with the same rows, scores and tie
   order as exhaustive scoring. It covers flat conjunctions and disjunctions,
@@ -60,12 +100,20 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   `stannum.maintenance_status()` and `stannum.maintenance_jobs()` show the
   launcher, the worker and the queue. Hot standbys run no workers. See
   [maintenance workers](docs/architecture/maintenance-workers.md).
-- `stannum.promote(index, extent_cap_bytes)` folds the write buffer into a
-  segment now, and `stannum.merge(index, target_segment_count,
-  high_water_multiplier, max_fan_in, force)` merges toward a target; both
-  have TIN's signatures and need the `MAINTAIN` privilege.
-  `stannum.segment_info` adds TIN's `npostings`, `source_state`, `origin` and
-  `sequence` columns.
+- The write buffer is TIN's mutable write segment: at
+  `stannum.write_buffer_docs` (12,288) or `write_buffer_bytes` (4 MiB, the
+  index's `max_mutable_segment_size`) it is sealed in place, and a sealed
+  segment is promoted into an immutable one by a worker, by the inserting
+  session after publishing, or in manual mode by `promote()`, VACUUM or a
+  third seal. Searches read sealed segments; elision counts immutable
+  segments only, as TIN's does.
+- `stannum.promote(index, extent_cap_bytes)` promotes the sealed write
+  segments now (with a cap, into several segments each), and
+  `stannum.merge(index, target_segment_count, high_water_multiplier,
+  max_fan_in, force)` merges toward a target; both have TIN's signatures and
+  need the `MAINTAIN` privilege. `stannum.segment_info` has TIN's columns
+  (`npostings`, `source_state`, `origin`, `sequence` among them) in TIN's
+  order, lists sealed segments, and adds `generation`.
 - The TIN-named index options `target_segment_count`,
   `max_mutable_segment_size`, `max_merged_segment_size` and
   `dead_percent_threshold` shape maintenance for the index that sets them,
@@ -79,9 +127,9 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   PlanetScale TIN 1.0.3's recorded answers, and a runner that records one
   engine and checks another. Documented divergences report as `IMPROVED`
   (TIN refuses, Stannum answers) or `GAP` (Stannum lacks the feature), and a
-  declared divergence cannot hide a regression. Against TIN 1.0.3: 184 PASS,
-  13 DIFF (error wording), 5 IMPROVED, 7 GAP, 3 LIMITED, 4 NEWER, 0 FAIL;
-  against 1.0.4: 218 PASS, 13 DIFF, 5 IMPROVED, 11 GAP, 2 LIMITED, 4 NEWER,
+  declared divergence cannot hide a regression. Against TIN 1.0.3: 185 PASS,
+  13 DIFF (error wording), 5 IMPROVED, 6 GAP, 3 LIMITED, 4 NEWER, 0 FAIL;
+  against 1.0.4: 219 PASS, 13 DIFF, 5 IMPROVED, 10 GAP, 2 LIMITED, 4 NEWER,
   0 FAIL.
 - Limits on query size: 1,000 nesting levels, 10,000 terms and 2,000 levels
   of span nesting, each an ERROR naming the byte offset. Every recursive pass
@@ -109,6 +157,201 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- Segments in TIN's shape store a group's postings list of at most 64
+  members as its local slots in sorted `u16`s (page layout 11) rather than
+  Elias-Fano, which decodes them one at a time below 16 members at every
+  vector level: walks widen an array eight values a step, set it in a row
+  or gallop through it in place. At 150 million rows the index grows 1.7%;
+  on aarch64 queries take 2.7% (conjunction), 7.9% (phrase) and 5.2%
+  (disjunction) fewer cycles, 2.2% to 3.1% fewer under `full_score`; on
+  x86-64 3.5% and 1.3% fewer for conjunctions and disjunctions, phrases
+  within 2%; the same answers. An index of layout 10 must be rebuilt.
+- A ranked disjunction over `TNS1` reads its terms' grids where they lie on
+  their pages rather than copying each into a row, and copies a grid across
+  two pages straight into its row rather than stitching it first: at 150
+  million rows a query copies 12 MB instead of 44 MB (21 MB instead of 130
+  MB scoring every term), for 5% to 6% fewer instructions and 5% to 8%
+  fewer cycles on aarch64 and x86-64 alike.
+- A ranked disjunction over `TNS1` reads a candidate's buckets a term at a
+  time while it is left in reach, and bounds every term it holds at the
+  longest length its read buckets imply, an unread term by its footer
+  block's largest bucket there (TIN's shared length): a rare word's bucket
+  in a long document rules out the common words before their TF is read.
+  It weighs a word's members at their sub-range's bounds without first
+  weighing the word there. At 150 million rows `full_score` disjunctions
+  read 38% fewer TF pages (10% fewer pages in all) and take 5% fewer
+  cycles on aarch64 and x86-64 (7% on aarch64 with slow pins); `score`
+  ones 1% to 2% fewer, with the same answers.
+- Ranked walks over `TNS1` branch less where the branch follows the data,
+  for x86-64, whose predictors miss such branches far more often than the
+  Apple cores do. A conjunction or phrase intersects its candidates with
+  each required term's list through a bitmap of the list's members (a
+  bit set, tested and cleared per value, no step waiting on the one
+  before; 7% fewer cycles than a merge eight values at a time on Apple
+  cores), and keeps or drops each one (against a list, a grid or a
+  probed Elias-Fano container) without a branch on its fate.
+  Footer readers take a pair's one- or two-byte length without a branch.
+  A query also allocates less: a dictionary lookup reuses its term
+  buffers, and a walk sizes its vectors once (at 150 million rows, a
+  conjunction's 4,500 allocations or so became about 860).
+- Ranked walks over `TNS1` sum their bounds in `f32` in the scorer's order,
+  as the scores are summed, so a bound is at least the score bit for bit;
+  a bound that only ties the threshold prunes when its matches cannot win
+  on ctid. A candidate is bounded at the length all its terms imply (a
+  document has one length), and a phrase's candidates are scored best bound
+  first, 256 at a time. Counts of a phrase fold over `TNS1` (its words ANDed
+  a group at a time, positions read in place only for the documents left).
+  On TIN's probe corpus a dense term's top 10 reads 10 pages instead of 121
+  (0.06 ms instead of 10), a two-word top 10 reads 51 DL pages instead of
+  83, and a phrase count takes 16 to 20 ms instead of 36 to 45;
+  `tnsreplay --full` replays `full_score`.
+- Ranked walks over `TNS1` bound a candidate by its buckets, each at the
+  shortest length its footer block holds for that bucket or more, before
+  reading its length from the DL sidecar; a disjunction plans each group at
+  the group's own bounds first and reads nothing more of a group whose
+  essential terms' mask is empty. At 150 million rows queries pin 11%
+  (conjunction), 20% (disjunction) and 3 to 5% (phrase) fewer pages, with
+  the same answers. `bench`'s `tnsreplay` replays a dumped `TNS1` index as
+  the extension reads it in place; `script/dump-segments.py` reads page
+  layout version 6.
+- A ranked disjunction over `TNS1` weighs each member of a group's mask by
+  the bounds of the terms it holds (a word at a time first, at the group's
+  bounds, then at its 1,024-slot sub-range's) instead of planning and
+  sieving every sub-range bit-parallel. At 150 million rows its replay takes
+  a fifth less CPU (a quarter fewer instructions) for the same answers.
+- A ranked disjunction over `TNS1` decodes its terms' footers whole before
+  its first group (it bounds every block anyway) rather than a block at a
+  time between a group's reads, reads a candidate's buckets starting with
+  the term its block bounds highest (most candidates read no other TF, as
+  TIN reads a term's TF only for a candidate that still needs it), and
+  scores a group's candidates best bound first. At 150 million rows
+  disjunctions retire 12% (`score`) and 16.5% (`full_score`) fewer
+  instructions in the server (`benchmarks/local/vm_ab.py`; the mixed trace
+  9% and 12%), and `full_score` ones read 17% fewer buffers, with the same
+  answers. It bounds each footer block as it parses it and keeps the
+  entries' bytes instead of their pairs, reading a block's frontier again
+  only for a candidate in it (`full_score` disjunction replay at 150 million
+  rows: 2.5% less CPU).
+- A ranked disjunction over `TNS1` takes a grouped term's bound over a group
+  and its container from the directory entry its walk's seek found, rather
+  than finding that entry twice more, and keeps a frontier's best bound by a
+  compare and a select rather than `f32::max`, whose NaN ordering put three
+  more instructions on the fold's carried chain on x86-64. At 150 million
+  rows (replay) score disjunctions take 3.2-3.8% fewer cycles on Sapphire
+  Rapids and 3.9% fewer on Apple M4 (6-8% fewer instructions), `full_score`
+  ones 2.5% fewer on the M4, with the same answers.
+- A ranked disjunction over `TNS1` compares bounds with the bar as integers
+  without a branch on each verdict, sets up a candidate's terms once per
+  word of the group (each term's word of members, its posting index there,
+  and its buckets' place on their page once per group), and on x86-64 runs
+  its group and candidate code built with POPCNT and BMI where the CPU has
+  them (baseline x86-64 counts bits by shifts and masks). At 150 million
+  rows (replay) `full_score` disjunctions take 6.0% fewer cycles on
+  Sapphire Rapids (mean query -7.0%, p99 -10.4%), score ones 3.6% fewer
+  (mean -1.6%, median +4%), with the same answers. On Apple M4
+  `full_score` disjunctions take 4.2% fewer cycles (p99 -12%) and score
+  ones 5.0% fewer (median -4%), nearly all from setting a candidate's
+  terms up once per word.
+- A ranked disjunction over `TNS1` caps a candidate's unread terms' bounds
+  by one `minss` on x86-64 rather than `f32::min`, whose NaN ordering added
+  a compare and a blend (a plain compare and select became a branch on the
+  data). At 150 million rows (replay) `full_score` disjunctions take 1.0%
+  fewer cycles on Sapphire Rapids, score ones 0.3% fewer, with the same
+  answers; the M4 code is unchanged.
+- `score()` over a dense term (elided, scoring nothing) or an OR of elided
+  terms ranks the first k matches in ctid order, read from the candidate
+  stream, which folded every group of a `TNS1` segment before the first
+  row. That stream now folds the groups as it reaches them, the first
+  group holding a match first and then twice as many each time, so those
+  rows read the containers of the groups they are in, as TIN does: on TIN's
+  probe corpus the 28 single-term `score()` cases read 4 payload pages
+  instead of 244 (TIN 20; each read 15 or 16 at any k), `w2 OR t10` none
+  instead of 30 (TIN 3), and round 4's elided-fill probes 61 instead of 121
+  (TIN 118), with the same rows and scores. `EXPLAIN ANALYZE` reports the
+  groups folded (`Stream Groups Folded`).
+- Segments in TIN's shape set a non-grid container's members in a row
+  without reading back the word the last one stored: on aarch64 eight at a
+  time at byte grain (NEON), elsewhere with the word held in a register.
+  Disjunctions (array containers, a sparse term's members), conjunctions
+  (short lists marked for the candidates' filter), counts and matches
+  (Elias-Fano and array containers) take it. At 150 million rows (replay)
+  every style takes 0.2-1.0% fewer cycles on Sapphire Rapids, with the
+  same answers; on Apple M4 Elias-Fano lists set into rows take 14% less
+  time a member.
+- A ranked conjunction or phrase over `TNS1` scoring a common term (in at
+  least one document in ten of the segment, as `full_score` scores them)
+  beside a rarer one bounds the common term's groups by its record rather
+  than its footer blocks, sums the rarer terms' bounds first, and reads its
+  bucket after theirs, only for a candidate they leave in reach; its footer
+  is skimmed for TF offsets, a block's frontier read only when a window or
+  a bucket asks for it. At 150 million rows `full_score` conjunctions
+  retire 14% fewer instructions in the server (11% less backend CPU) and
+  phrases 4.6% fewer (`benchmarks/local/vm_ab.py`), with the same answers.
+- A ranked walk over `TNS1` that sieves a group's candidates by a term held
+  as a grid there drops those that term's bucket alone rules out a word at
+  a time: the buckets the candidates need become a pass bit per member (a
+  16-entry table lookup for 4-bit buckets, `tbl` on aarch64 and `pshufb` on
+  x86-64), laid onto each word's candidates by PDEP on x86-64 where BMI2
+  is fast (not AMD before Zen 3) and a branch-free byte expansion
+  elsewhere. At 150 million rows dense pairs ("is to", "to a") under
+  `full_score` take 17-23% less time on Sapphire Rapids and 9-12% less on
+  the M4, and the 99th percentile of `full_score` phrases drops 26% and of
+  conjunctions 12%, with the same answers.
+- Benchmark manifests' `source_sha256` covers every crate the extension
+  builds from (read from the manifests, so `engine/` too) and the PGO
+  profiles; builds that differed only in `engine/` shared a fingerprint.
+- Index pages are pinned through a table every backend shares of the buffer
+  each page was last pinned in (a named dynamic shared memory segment, 8
+  bytes per shared buffer; no `shared_preload_libraries` needed) rather than
+  each backend's own: at 150 million rows 96 to 99% of a query's pins skip
+  the buffer mapping table, against 38 to 78%. A pin through a hint raises
+  the buffer's usage count as `ReadBuffer`'s does.
+  `stannum.share_buffer_hints` (on) switches back for comparison. Term
+  directories and footers parse with less work per query (short varints
+  without a loop; a grouped record's directory, read in one window whose
+  length its header gives (page layout 10, 1.4 bytes a record), is copied
+  once when parsed, a page at a time, and its entries decoded as a walk
+  reaches them: a run of 16 from the skip point before it (page layout 11,
+  20 bytes per 16 entries, +0.3% of the index), the runs a walk seeks past
+  undecoded, eight runs at once for a walk that reads on,
+  or in one pass for a disjunction, which reaches them all, from a scan of
+  where its varints start, without a branch on their lengths: at 150M rows a
+  cheap conjunction decodes 33,000 entries where it decoded 119,000, and one
+  backend's median conjunction takes 1.20 times the layout 6 build's CPU
+  where it took 1.36), and
+  `EXPLAIN ANALYZE` counts records parsed, kept and forgotten and footers
+  decoded and kept. Together, at eight clients, backend CPU per query falls
+  17% (conjunction), 8% (disjunction) and 16% (phrase), for the same
+  answers.
+- A page found through its hint is pinned by one compare-and-swap of its
+  buffer header, as `PinBuffer` pins, then its tag checked, and released as
+  `UnpinBuffer` releases, one compare-and-swap while the header is not
+  locked (a plain decrement landing under another backend's header lock is
+  undone by the state that backend writes back at the unlock, which left
+  pins nobody held; `postgres/tests/own_pins.py` holds the lock across a
+  release), with its wake-up of a waiter for the sole pin, outside
+  PostgreSQL's per-pin bookkeeping: a walk holds tens of
+  pages at once, past the eight its private reference counts keep in an
+  array, so each of a query's thousands of pins cost two or three hash
+  lookups, the header spinlock and a second atomic for the usage count. A
+  span's own pins are remembered with the statement's resource owner as one
+  resource, released with the buffer pins should the statement end without
+  closing the span (a `FATAL` exit). `stannum.own_pins` (on) switches back
+  to `ReadRecentBuffer` for comparison. The pin counters are backend
+  statics rather than thread-locals, which a loaded module reaches through
+  a dynamic lookup per access. At 150 million rows and eight clients (VM
+  instructions per query, an identical-binary control within 0.7%): 6.1%
+  fewer instructions per conjunction, 3.9% per disjunction, 6.2% per
+  phrase, 4.0% on the mixed workload, and 4 to 7% less backend CPU, for
+  the same answers.
+- A ranked walk over `TNS1` releases the index pages of each group it is
+  past, but for those its terms' records still borrow and the 24 it read
+  last, rather than holding every page it read until the segment's read
+  ends: at 150 million rows a query held some 560 / 1,140 / 820 pages at
+  once (conjunction / disjunction / phrase, replay), which overflowed
+  PostgreSQL's per-backend array of private pin counts into a hash table of
+  as many entries, and now holds some 40 / 45 / 60. `EXPLAIN ANALYZE`'s
+  `Pages Held Peak` reports it.
 - TINQL query expressions are parsed by a recursive-descent parser; the pest
   expression grammar remains only as a test-only differential oracle, and
   phrase contents are still parsed with pest. AND and OR chains parse into
@@ -171,9 +414,45 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   catalog-dependent SQL functions are STABLE rather than IMMUTABLE.
 - `stannum.debug_seed_score` is superuser-only: a plain role could set it and
   make a ranked query return wrong or no rows.
+- Ranked conjunctions and phrases over `TNS1` segments do less work per
+  256-page group: the lead term's groups come from its directory and its
+  members are read only past the group's bound, the other required terms
+  are consulted rarest first only while candidates are left (long
+  Elias-Fano containers probed in place rather than decoded), a term's
+  group directory is shared rather than copied per query, positions skip
+  runs of single-position entries at once, and a phrase repeating a word
+  drops candidates whose bucket for it is too low. Answers are unchanged.
+- A ranked conjunction or phrase over `TNS1` reads fewer cold tables per
+  group: an array or Elias-Fano container takes its universe from the
+  group's slot count rather than its last page start (a table read for
+  nothing else), a scored candidate's ctid is looked up only once it would
+  be kept, a list's members are marked for the intersection a word at a
+  time in a register, and an Elias-Fano list's low width is found without
+  a division. At 150 million rows (replay) conjunctions take 5.0% fewer
+  cycles on Apple M4 and phrases 3.4% fewer, with the same answers. On
+  Sapphire Rapids it is neutral, the cycles within the boxes' noise: the
+  cold reads removed there overlapped with the group's other first
+  touches.
 
 ### Fixed
 
+- Scores over an index whose expression PostgreSQL folds when it loads it
+  (an `IN` list, `repeat()` of constants, a `BETWEEN` inside a `CASE`) are
+  computed: the search's document was compared with the folded expression
+  unfolded, so every `score()`, `full_score()` and ranked scan over such an
+  index failed with "cannot compute scores for this query". TIN 1.0.4
+  scores them (round 4's d6 probe).
+- A merge copies an input's group container only where the output's
+  options choose that kind: a grid into a group they force into one, a
+  list or paged container into one they do not. A merge under other
+  options than the inputs' (as `tnsreencode` weighs a grid threshold) had
+  copied grids into groups the new options no longer force, and written a
+  hybrid of the two thresholds.
+- A generic plan with LIMIT or OFFSET a parameter declared `int` or
+  `smallint` ranks only the top k: the parameter's cast to `bigint` kept the
+  bound from the scan, which scored every match (68 ms against 0.4 ms for
+  `w3 OR w17 OR t1` at 1M rows). TIN 1.0.4 scores every match there
+  (conformance case `prepared.generic_limit.1`).
 - A backend decodes a segment's dead list into a bitmap over its ordinals, at
   most a bit per document, instead of a set of heap locations plus a vector of
   ordinals, 16 to 24 bytes per dead document. After VACUUM published 45

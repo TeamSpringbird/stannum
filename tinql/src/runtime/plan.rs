@@ -261,6 +261,98 @@ pub fn matches<I: Index + ?Sized>(
     Ok((segment::set::collect(plan.cursor)?, plan.exact))
 }
 
+/// `query` with each wildcard, regex, range and fuzzy term replaced by the
+/// disjunction of the terms it expands to in `segment`, so that a reader of
+/// postings by term (segments in TIN's shape) can evaluate it; `None` when
+/// an expansion passes `limits.max_expansion`, which the planner answers
+/// with an inexact universe instead. Expansions in span slots are left as
+/// they are.
+pub fn expand_terms<I: Index + ?Sized>(
+    query: &Query,
+    segment: &I,
+    limits: &Limits,
+) -> Result<Option<Query>> {
+    crate::limits::check_stack();
+    let names = |window: Window<'_>, filter: &dyn Fn(&str) -> bool| -> Result<Option<Query>> {
+        Ok(
+            match segment.expand(window, filter, limits.max_expansion)? {
+                Expanded::Terms(terms) => Some(Query::Disjunction {
+                    min: 1,
+                    children: terms
+                        .into_iter()
+                        .map(|(name, _)| Query::Term(name))
+                        .collect(),
+                }),
+                Expanded::Overflow => None,
+            },
+        )
+    };
+    let children = |children: &[Query]| -> Result<Option<Vec<Query>>> {
+        let mut out = Vec::with_capacity(children.len());
+        for child in children {
+            match expand_terms(child, segment, limits)? {
+                Some(child) => out.push(child),
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(out))
+    };
+    let boxed = |query: &Query| -> Result<Option<Box<Query>>> {
+        Ok(expand_terms(query, segment, limits)?.map(Box::new))
+    };
+    Ok(match query {
+        Query::Regex(regex) => match regex.pure_prefix() {
+            Some(prefix) => names(Window::Prefix(&prefix), &|_| true)?,
+            None => names(Window::All, &|term| regex.is_match(term))?,
+        },
+        Query::Range { lower, upper } => {
+            fn bound(bound: &super::RangeBound) -> Option<&str> {
+                match bound {
+                    super::RangeBound::Open => None,
+                    super::RangeBound::Term(term) => Some(term.as_str()),
+                }
+            }
+            names(Window::Range(bound(lower), bound(upper)), &|_| true)?
+        }
+        Query::Fuzzy {
+            term,
+            prefix,
+            distance,
+        } => {
+            let matcher = FuzzyMatcher::new(term, *prefix, *distance);
+            let fixed: String = term.chars().take(*prefix as usize).collect();
+            names(Window::Prefix(&fixed), &|candidate| {
+                matcher.is_match(candidate)
+            })?
+        }
+        Query::And(a, b) => match (boxed(a)?, boxed(b)?) {
+            (Some(a), Some(b)) => Some(Query::And(a, b)),
+            _ => None,
+        },
+        Query::Or(a, b) => match (boxed(a)?, boxed(b)?) {
+            (Some(a), Some(b)) => Some(Query::Or(a, b)),
+            _ => None,
+        },
+        Query::Conjunction(c) => children(c)?.map(Query::Conjunction),
+        Query::Disjunction { min, children: c } => {
+            children(c)?.map(|children| Query::Disjunction {
+                min: *min,
+                children,
+            })
+        }
+        Query::AtLeast { min, children: c } => children(c)?.map(|children| Query::AtLeast {
+            min: *min,
+            children,
+        }),
+        Query::Not(inner) => boxed(inner)?.map(Query::Not),
+        Query::Boost { factor, inner } => boxed(inner)?.map(|inner| Query::Boost {
+            factor: *factor,
+            inner,
+        }),
+        other => Some(other.clone()),
+    })
+}
+
 struct Planner<'a, 'l, I: Index + ?Sized> {
     segment: &'a I,
     limits: &'l Limits,

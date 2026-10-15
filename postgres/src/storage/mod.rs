@@ -50,8 +50,8 @@ use std::rc::Rc;
 
 use layout::{
     BufferState, CHAIN_CAPACITY, FLAG_REMOVAL_HORIZONS, KIND_BUFFER, KIND_FREE, KIND_META,
-    KIND_RUN, MAX_PENDING, MAX_SEGMENTS, Meta, NONE, PAGE_SIZE, Pending, Run, SPECIAL_SIZE,
-    SegmentEntry,
+    KIND_RUN, MAX_PENDING, MAX_SEALED, MAX_SEGMENTS, Meta, NONE, Origin, PAGE_SIZE, Pending, Run,
+    SPECIAL_SIZE, SegmentEntry,
 };
 use pgrx::{
     FromDatum, GucContext, GucFlags, GucRegistry, GucSetting, PgLogLevel, PgRelation,
@@ -64,15 +64,15 @@ use segment::docs::{DocCursor, DocTable, PageCursor, PageTable, TidCursor};
 use segment::forward::ForwardRecord;
 use segment::index::{Expanded, Index, MutableIndex, Window};
 use segment::ordinals::Ordinals;
-use segment::segment::{Lengths, Reader, Term};
-use segment::segment::{Segment, SegmentBuilder};
+use segment::segment::{Lengths, SegmentBuilder, Term};
 use segment::set::{Cursor, Difference, Intersection};
+use segment::tinshape::index::Reader;
 use tinql::runtime::Query;
 use tinql::runtime::plan::{Limits, plan};
 use tokenizer::{CompiledTokenizerPipeline, Tokenizer};
 
 /// Encoded forward-record bytes buffered before folding.
-static WRITE_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(1024 * 1024);
+static WRITE_BUFFER_BYTES: GucSetting<i32> = GucSetting::<i32>::new(4 * 1024 * 1024);
 /// Total input documents ordinary insert-side merges may rewrite per fold.
 static MAX_MERGE_DOCS: GucSetting<i32> = GucSetting::<i32>::new(1024);
 /// Total input documents of the one merge an insert may run after a fold,
@@ -81,7 +81,7 @@ static DEFERRED_MERGE_DOCS: GucSetting<i32> = GucSetting::<i32>::new(262_144);
 const BITMAP_BATCH: usize = 1024;
 
 /// Documents the write buffer holds before folding into a segment.
-static WRITE_BUFFER_DOCS: GucSetting<i32> = GucSetting::<i32>::new(512);
+static WRITE_BUFFER_DOCS: GucSetting<i32> = GucSetting::<i32>::new(12_288);
 /// Documents an index build accumulates before writing a segment.
 static BUILD_SEGMENT_DOCS: GucSetting<i32> = GucSetting::<i32>::new(32_768);
 /// Soft bound on directory entries; the tiered policy normally stays well
@@ -89,15 +89,6 @@ static BUILD_SEGMENT_DOCS: GucSetting<i32> = GucSetting::<i32>::new(32_768);
 static MAX_SEGMENTS_GUC: GucSetting<i32> = GucSetting::<i32>::new(MAX_SEGMENTS as i32);
 /// Segments a size tier holds before they merge into one segment of the next tier.
 static MERGE_TIER_FACTOR: GucSetting<i32> = GucSetting::<i32>::new(8);
-/// Experimental comparison control; Auto has no density heuristic.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, pgrx::PostgresGucEnum)]
-enum VacuumMergeStrategy {
-    Auto,
-    Direct,
-    Reconstruct,
-}
-static VACUUM_MERGE_STRATEGY: GucSetting<VacuumMergeStrategy> =
-    GucSetting::<VacuumMergeStrategy>::new(VacuumMergeStrategy::Auto);
 
 /// Smallest `stannum.merge_tier_factor` value; below it every fold would merge.
 pub const MIN_MERGE_TIER_FACTOR: i32 = 2;
@@ -107,18 +98,10 @@ pub const MAX_MERGE_TIER_FACTOR: i32 = 64;
 /// Registers the tunables. Low values exist so tests can drive folds,
 /// merges and reclamation at small scale; the defaults are the intended ones.
 pub fn init() {
-    GucRegistry::define_enum_guc(
-        c"stannum.experimental_vacuum_merge_strategy",
-        c"Experimental strategy of the merges built without the metadata lock (VACUUM, deferred, build and full-directory merges), for controlled comparisons",
-        c"Auto currently selects direct. Reconstruct performs full validation. Oversized inputs retain the legacy fallback regardless of this setting.",
-        &VACUUM_MERGE_STRATEGY,
-        GucContext::Userset,
-        GucFlags::default(),
-    );
     GucRegistry::define_int_guc(
         c"stannum.write_buffer_bytes",
-        c"Encoded bytes buffered before folding into a Stannum segment",
-        c"A fold happens before either the byte or document cap is exceeded. A single oversized document is allowed.",
+        c"Encoded bytes the write segment holds before it is sealed",
+        c"The write segment is sealed before either the byte or the document cap is exceeded, and promoted into an immutable segment. A single oversized document is allowed. TIN's max_mutable_segment_size; an index's option of that name overrides it.",
         &WRITE_BUFFER_BYTES,
         1024,
         64 * 1024 * 1024,
@@ -147,8 +130,8 @@ pub fn init() {
     );
     GucRegistry::define_int_guc(
         c"stannum.write_buffer_docs",
-        c"Documents buffered before folding into a Stannum segment",
-        c"Lower values fold sooner, producing more and smaller segments.",
+        c"Documents the write segment holds before it is sealed",
+        c"Lower values seal and promote sooner, producing more and smaller segments. 12,288 is where TIN seals a write segment of short documents.",
         &WRITE_BUFFER_DOCS,
         1,
         1_000_000,
@@ -711,6 +694,14 @@ fn run_page<'a>(buffer: &'a Buffer, what: &str) -> Result<(u32, &'a [u8]), Strin
         .map_err(|message| format!("Stannum {what}: page {block}: {message}"))
 }
 
+/// Fails unless the page is a page a retired chain may hold: a run page,
+/// or a buffer page of a promoted write segment.
+fn expect_retired_page(buffer: &Buffer, what: &str) {
+    if buffer.kind() != KIND_BUFFER {
+        expect_run_page(buffer, what);
+    }
+}
+
 /// Fails unless the page is a run page of `what`.
 fn expect_run_page(buffer: &Buffer, what: &str) {
     let kind = buffer.kind();
@@ -857,16 +848,37 @@ pub struct RunSource {
     /// [`Source::held_slot`](segment::source::Source::held_slot) in the
     /// open span, at most [`HELD_SLOT_LIMIT`] in all.
     slots: RefCell<Vec<HeldSlot>>,
+    /// Pages pinned for the open span by
+    /// [`Source::pinned_page`](segment::source::Source::pinned_page), by
+    /// page, each until the span ends: at most [`PINNED_LIMIT`].
+    pinned: RefCell<FxHashMap<usize, HeldPage>>,
     /// The index, opened at the first page a span pins and closed when it
     /// ends, rather than looked up per page: a walk pins a page per chunk.
     relation: Cell<pg_sys::Relation>,
+    /// The open span's ledger of own pins (see [`SpanLedger`]), remembered
+    /// with `owner` as one resource (see [`RUN_PAGES`]); null outside a
+    /// span.
+    ledger: Cell<*mut SpanLedger>,
+    owner: Cell<pg_sys::ResourceOwner>,
 }
 
-thread_local! {
-    /// Outermost hold spans opened by the backend's run sources, numbering
-    /// each span uniquely across sources.
-    static HOLD_SPANS: Cell<u64> = const { Cell::new(0) };
+/// The buffers a span holds pinned by [`own_pin`], outside PostgreSQL's
+/// per-pin bookkeeping: what its resource owner releases should the span
+/// never close (a `FATAL` exit mid-walk, see [`release_run_pages`]). Boxed
+/// apart from the source, which an exiting backend drops after its owners
+/// are released: the owner frees the box then, else the span's close does.
+#[derive(Default)]
+struct SpanLedger {
+    owned: Vec<pg_sys::Buffer>,
 }
+
+/// Most pages a span of one run source keeps pinned for in-place reads
+/// (64 MiB of shared buffers); past it the reader copies what it reads.
+const PINNED_LIMIT: usize = 8192;
+
+/// Outermost hold spans opened by the backend's run sources, numbering
+/// each span uniquely across sources.
+static HOLD_SPANS: BackendCell<u64> = BackendCell::new(0);
 
 /// The pages one slot holds pinned.
 type HeldSlot = [Option<HeldPage>; segment::source::HELD_PIECES];
@@ -895,6 +907,9 @@ struct HeldPage {
     /// The page's run data, valid while pinned.
     data: *const u8,
     len: usize,
+    /// Pinned by [`own_pin`], outside PostgreSQL's per-pin bookkeeping (see
+    /// [`OWN_PINS`]); else by `ReadBuffer`, released by `ReleaseBuffer`.
+    owned: bool,
 }
 
 impl RunSource {
@@ -907,7 +922,10 @@ impl RunSource {
             holding: Cell::new(0),
             generation: Cell::new(0),
             slots: RefCell::new(vec![Default::default(); segment::source::HELD_SLOTS]),
+            pinned: RefCell::default(),
             relation: Cell::new(std::ptr::null_mut()),
+            ledger: Cell::new(std::ptr::null_mut()),
+            owner: Cell::new(std::ptr::null_mut()),
         }
     }
 
@@ -919,23 +937,92 @@ impl RunSource {
         for slot in slots.iter_mut() {
             for page in slot.iter_mut() {
                 if let Some(held) = page.take() {
-                    unpin(held);
+                    self.unpin(held);
                 }
             }
         }
         slots.truncate(segment::source::HELD_SLOTS);
+        for (_, held) in self.pinned.borrow_mut().drain() {
+            self.unpin(held);
+        }
         let relation = self.relation.replace(std::ptr::null_mut());
         if !relation.is_null() && !exiting() {
             // SAFETY: opened by `pin` within the span now ending.
             unsafe { pg_sys::RelationClose(relation) };
         }
+        let ledger = self.ledger.replace(std::ptr::null_mut());
+        let owner = self.owner.replace(std::ptr::null_mut());
+        if !ledger.is_null() && !exiting() {
+            // SAFETY: remembered by `remember_span` with this owner, which
+            // the statement keeps until it ends. In an exiting backend the
+            // owner has released the ledger already, or will: it is left
+            // to the owner (see `release_run_pages`).
+            unsafe {
+                if !owner.is_null() {
+                    pg_sys::ResourceOwnerForget(owner, ledger_datum(ledger), &RUN_PAGES.0);
+                }
+                drop(Box::from_raw(ledger));
+            }
+        }
+    }
+
+    /// Opens the span's ledger of own pins and remembers it with the
+    /// current resource owner as one resource: an error that ends the
+    /// statement without unwinding the walk (a `FATAL` exit) releases the
+    /// span's own pins through it (see [`release_run_pages`]). PostgreSQL's
+    /// own pins (`ReadBuffer`) are remembered by `ReadBuffer` itself.
+    fn remember_span(&self) {
+        let ledger = Box::into_raw(Box::<SpanLedger>::default());
+        self.ledger.set(ledger);
+        // SAFETY: called within a statement, whose resource owner outlives
+        // the span.
+        unsafe {
+            let owner = pg_sys::CurrentResourceOwner;
+            if owner.is_null() {
+                return;
+            }
+            pg_sys::ResourceOwnerEnlarge(owner);
+            pg_sys::ResourceOwnerRemember(owner, ledger_datum(ledger), &RUN_PAGES.0);
+            self.owner.set(owner);
+        }
+    }
+
+    /// Releases a page [`Self::pin`] pinned; in an exiting backend only
+    /// forgets it (see [`exiting`]).
+    fn unpin(&self, held: HeldPage) {
+        if !exiting() {
+            // SAFETY: the pin was taken by `pin` and is released once: the
+            // slot holding it was emptied before this call. An own pin is
+            // struck from the ledger it was entered in.
+            unsafe {
+                if held.owned {
+                    let ledger = self.ledger.get();
+                    if !ledger.is_null() {
+                        let owned = &mut (*ledger).owned;
+                        if let Some(at) = owned.iter().rposition(|&b| b == held.buffer) {
+                            owned.swap_remove(at);
+                        }
+                    }
+                }
+                release_pin(held.buffer, held.owned);
+            }
+        }
+        let (now, total, peak) = HELD_PAGES.get();
+        HELD_PAGES.set((now - 1, total, peak));
     }
 
     /// Pins page `page` of the run, checked as a run page, and releases
     /// its content lock.
     fn pin(&self, page: usize) -> segment::Result<HeldPage> {
+        crate::score::charging("run source", || self.pin_page(page, true))
+    }
+
+    /// [`Self::pin`], the page's storage read charged to a phase of its own
+    /// when `charge`: a read in place pins a page per page it touches, and
+    /// its caller charges the read as a whole ([`with_native`]).
+    fn pin_page(&self, page: usize, charge: bool) -> segment::Result<HeldPage> {
         let block = *self.table.get(page).ok_or(segment::Error::Truncated)?;
-        crate::score::charging("run source", || {
+        {
             // SAFETY: as in `read_into`; the relcache reference is held
             // until the span ends, within the statement, and the pin is
             // released by `release_held`.
@@ -951,7 +1038,15 @@ impl RunSource {
                 // Pinned only: a run page is never written while published
                 // (see `HeldPage`), so its content lock guards nothing, and
                 // a walk pins a page or two per chunk it loads.
-                let buffer = crate::score::charging("buffer read", || pin_block(index, block));
+                // An own pin needs the span's ledger (see `SpanLedger`):
+                // outside a span the page is pinned PostgreSQL's way.
+                let ledger = self.ledger.get();
+                let own = OWN_PINS.get() && !ledger.is_null();
+                let (buffer, owned) = if charge {
+                    crate::score::charging("buffer read", || pin_block(index, block, own))
+                } else {
+                    pin_block(index, block, own)
+                };
                 let contents = std::slice::from_raw_parts(page_of(buffer), PAGE_SIZE);
                 let checked = match layout::kind(contents) {
                     Ok(KIND_RUN) => layout::chain(contents)
@@ -963,7 +1058,7 @@ impl RunSource {
                 let data = match checked {
                     Ok(data) => data,
                     Err(message) => {
-                        pg_sys::ReleaseBuffer(buffer);
+                        release_pin(buffer, owned);
                         corrupt(format!("Stannum {}: page {block}: {message}", self.label))
                     }
                 };
@@ -972,27 +1067,59 @@ impl RunSource {
                     buffer,
                     data: data.as_ptr(),
                     len: data.len(),
+                    owned,
                 };
+                if owned {
+                    (*ledger).owned.push(buffer);
+                }
                 let (now, total, peak) = HELD_PAGES.get();
                 HELD_PAGES.set((now + 1, total + 1, peak.max(now + 1)));
                 SCAN_PINS.set(SCAN_PINS.get() + 1);
                 Ok(held)
             }
-        })
+        }
     }
 }
 
+/// A cell of the backend's, read and written on its one thread: the
+/// extension runs no thread of its own, and a backend is a process. Where
+/// a `thread_local!` would do, this spares the dynamic thread-local lookup
+/// a loaded module pays per access (`__tls_get_addr` or its descriptor,
+/// several per pin on the hot path).
+struct BackendCell<T>(Cell<T>);
+
+// SAFETY: see the type: only the backend's thread touches it.
+unsafe impl<T> Sync for BackendCell<T> {}
+
+impl<T: Copy> BackendCell<T> {
+    const fn new(value: T) -> Self {
+        Self(Cell::new(value))
+    }
+
+    fn get(&self) -> T {
+        self.0.get()
+    }
+
+    fn set(&self, value: T) {
+        self.0.set(value);
+    }
+}
+
+/// Run pages held pinned now, pinned so in all, and the most held at once
+/// since the peak was reset: a held page must never outlive the walk that
+/// pinned it.
+static HELD_PAGES: BackendCell<(i64, u64, i64)> = BackendCell::new((0, 0, 0));
+/// Run pages pinned to be held since the peak was reset, and of those the
+/// ones [`pin_block`] pinned through their recent buffer.
+static SCAN_PINS: BackendCell<i64> = BackendCell::new(0);
+static SCAN_RECENT: BackendCell<i64> = BackendCell::new(0);
+/// This backend's mapping of the shared hint table, once attached.
+static SHARED_HINTS: BackendCell<SharedHints> = BackendCell::new(SharedHints::Unknown);
+
 thread_local! {
-    /// Run pages held pinned now, pinned so in all, and the most held at
-    /// once since the peak was reset: a held page must never outlive the
-    /// walk that pinned it.
-    static HELD_PAGES: Cell<(i64, u64, i64)> = const { Cell::new((0, 0, 0)) };
-    /// Run pages pinned to be held since the peak was reset, and of those
-    /// the ones [`pin_block`] pinned through their recent buffer.
-    static SCAN_PINS: Cell<i64> = const { Cell::new(0) };
-    static SCAN_RECENT: Cell<i64> = const { Cell::new(0) };
     /// Per backend, the buffer a block was last pinned in (see
-    /// [`pin_block`]), direct-mapped by block and relation.
+    /// [`pin_block`]), direct-mapped by block and relation: used where the
+    /// shared table ([`shared_hints`]) is off or could not be had.
     static RECENT_BUFFERS: RefCell<Box<[RecentBuffer]>> =
         RefCell::new(vec![RecentBuffer::default(); RECENT_BUFFERS_LEN].into_boxed_slice());
 }
@@ -1011,43 +1138,487 @@ struct RecentBuffer {
     buffer: pg_sys::Buffer,
 }
 
+/// `stannum.share_buffer_hints`: whether [`pin_block`] finds the buffer a
+/// page was last pinned in through the table every backend shares
+/// ([`shared_hints`]); off, through a table of the backend's own.
+pub static SHARE_BUFFER_HINTS: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
+
+/// The shared hint table as this backend has it.
+#[derive(Clone, Copy)]
+enum SharedHints {
+    /// Not asked for yet.
+    Unknown,
+    /// Could not be had (no postmaster, a parallel worker, or no dynamic
+    /// shared memory to spare): the backend's own table serves.
+    Unavailable,
+    /// Mapped: `len` entries (a power of two) at `entries`.
+    Attached {
+        entries: *const std::sync::atomic::AtomicU64,
+        len: usize,
+    },
+}
+
+/// Name of the dynamic shared memory segment holding the hint table.
+const SHARED_HINTS_NAME: &std::ffi::CStr = c"stannum buffer hints";
+
+/// The table, shared by every backend of the server, of the buffer each
+/// index page was last pinned in: 8 bytes an entry, the block number above
+/// the buffer number, in buckets of two by block and relation, as many
+/// entries as shared buffers (rounded up to a power of two; 32 MB for 24 GB
+/// of shared buffers). A backend pins most pages of a query for the first
+/// time (at 150M rows only a third to a half of a query's pins found a
+/// buffer in the backend's own table), and other backends have pinned most
+/// of them. An entry is a hint: `ReadRecentBuffer` checks the buffer's tag,
+/// so a torn bucket, a buffer since given to another page or an entry of
+/// another relation with the same block number only costs the lookup the
+/// hint would have saved. Created on first use in a named dynamic shared
+/// memory segment (PostgreSQL 17's registry), so it needs no
+/// `shared_preload_libraries`; `None` where it cannot be had.
+///
+/// # Safety
+///
+/// Called inside a transaction, from a backend's main thread.
+unsafe fn shared_hints() -> Option<&'static [std::sync::atomic::AtomicU64]> {
+    match SHARED_HINTS.get() {
+        SharedHints::Attached { entries, len } => {
+            // SAFETY: the segment stays mapped for the backend's life
+            // (the registry pins the mapping) and holds `len` entries.
+            return Some(unsafe { std::slice::from_raw_parts(entries, len) });
+        }
+        SharedHints::Unavailable => return None,
+        SharedHints::Unknown => {}
+    }
+    // SAFETY: plain reads of the backend's globals; the attach runs in a
+    // subtransaction of its own, so an error creating the segment (no room
+    // in /dev/shm, no free slot) rolls back what it took, such as the
+    // registry's lock, and leaves the query to go on without the table.
+    unsafe {
+        // No subtransaction may start during a parallel operation: a
+        // leader asks again after it, a parallel worker keeps its own table.
+        if pg_sys::ParallelWorkerNumber < 0 && pg_sys::IsInParallelMode() {
+            return None;
+        }
+        // Asked once: a failure below must not be retried per pin.
+        SHARED_HINTS.set(SharedHints::Unavailable);
+        if !pg_sys::IsUnderPostmaster || pg_sys::ParallelWorkerNumber >= 0 {
+            return None;
+        }
+        let len = (pg_sys::NBuffers.max(1) as usize)
+            .next_power_of_two()
+            .max(1 << 14);
+        let memory = pg_sys::CurrentMemoryContext;
+        let owner = pg_sys::CurrentResourceOwner;
+        pg_sys::BeginInternalSubTransaction(std::ptr::null());
+        let attached = pgrx::PgTryBuilder::new(|| {
+            let mut found = false;
+            #[cfg(feature = "pg_test")]
+            let len = len + testing::HINTS_SIZE_SKEW.get();
+            let at = pg_sys::GetNamedDSMSegment(
+                SHARED_HINTS_NAME.as_ptr(),
+                len * 8,
+                Some(zero_hints),
+                &raw mut found,
+            );
+            pg_sys::ReleaseCurrentSubTransaction();
+            Some(at)
+        })
+        .catch_others(|_| {
+            pg_sys::RollbackAndReleaseCurrentSubTransaction();
+            None
+        })
+        .execute();
+        pg_sys::MemoryContextSwitchTo(memory);
+        pg_sys::CurrentResourceOwner = owner;
+        let at = attached.filter(|at| !at.is_null())?;
+        let entries = at.cast::<std::sync::atomic::AtomicU64>().cast_const();
+        SHARED_HINTS.set(SharedHints::Attached { entries, len });
+        Some(std::slice::from_raw_parts(entries, len))
+    }
+}
+
+/// Zeroes a new hint table (no entry names a buffer).
+unsafe extern "C-unwind" fn zero_hints(at: *mut std::ffi::c_void) {
+    // SAFETY: the registry passes the new segment, sized as requested; its
+    // size is recomputed as `shared_hints` computed it (NBuffers is fixed
+    // for the server's life).
+    unsafe {
+        let len = (pg_sys::NBuffers.max(1) as usize)
+            .next_power_of_two()
+            .max(1 << 14);
+        std::ptr::write_bytes(at.cast::<u8>(), 0, len * 8);
+    }
+}
+
+/// Where block `block` of the relation numbered `relation` is hinted: an
+/// entry of the backend's table, or the first of a bucket of the shared one.
+#[inline]
+fn hint_slot(relation: u32, block: pg_sys::BlockNumber) -> usize {
+    block as usize ^ (relation as usize).wrapping_mul(0x9e37_79b9)
+}
+
+/// Raises the usage count of shared buffer `buffer`, pinned by this
+/// backend, as `ReadBuffer` does on every pin and `ReadRecentBuffer` does
+/// not: the clock sweep evicts the buffers whose count has fallen to zero,
+/// and an index whose pages are pinned through hints would otherwise look
+/// unused next to the heap pages read by `ReadBuffer`. Skipped while the
+/// buffer header is locked (someone is changing it; the count is advisory).
+///
+/// # Safety
+///
+/// `buffer` is a shared buffer this backend holds pinned.
+#[inline]
+unsafe fn count_use(buffer: pg_sys::Buffer) {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    // SAFETY: a pinned shared buffer's descriptor lies at its index in the
+    // descriptor array; its state is a 32-bit atomic that PostgreSQL
+    // updates by compare-and-swap whenever the header is not locked, as
+    // `PinBuffer` does to raise the count.
+    unsafe {
+        let desc = pg_sys::BufferDescriptors.add(buffer as usize - 1);
+        let state = &*std::ptr::addr_of!((*desc).bufferdesc.state.value).cast::<AtomicU32>();
+        let mut old = state.load(Ordering::Relaxed);
+        while old & pg_sys::BM_LOCKED == 0
+            && (old & pg_sys::BUF_USAGECOUNT_MASK) >> pg_sys::BUF_USAGECOUNT_SHIFT
+                < pg_sys::BM_MAX_USAGE_COUNT
+        {
+            match state.compare_exchange_weak(
+                old,
+                old + pg_sys::BUF_USAGECOUNT_ONE,
+                Ordering::AcqRel,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(now) => old = now,
+            }
+        }
+    }
+}
+
 /// Pins block `block` of `index`: through the buffer it was last pinned
-/// in while that buffer still holds it, which skips the buffer mapping
-/// table's partition lock and hash lookup, else through `ReadBuffer`. A
-/// walk pins a page per chunk it loads, most of them pinned by an earlier
-/// query of the backend.
+/// in (by any backend, see [`shared_hints`]) while that buffer still holds
+/// it, which skips the buffer mapping table's partition lock and hash
+/// lookup, else through `ReadBuffer`. A walk pins a page per chunk it
+/// loads, most of them pinned by an earlier query.
 ///
 /// # Safety
 ///
 /// `index` is a live index relation held open by the caller.
-unsafe fn pin_block(index: pg_sys::Relation, block: pg_sys::BlockNumber) -> pg_sys::Buffer {
+unsafe fn pin_block(
+    index: pg_sys::Relation,
+    block: pg_sys::BlockNumber,
+    own: bool,
+) -> (pg_sys::Buffer, bool) {
+    use std::sync::atomic::Ordering;
     // SAFETY: per the contract. `ReadRecentBuffer` checks the buffer's tag
     // under its header lock before pinning it, so a remembered buffer since
-    // given to another page is refused rather than pinned.
+    // given to another page is refused rather than pinned; `own_pin` checks
+    // it once pinned.
     unsafe {
         let locator = (*index).rd_locator;
-        let at = (block as usize ^ (locator.relNumber.to_u32() as usize).wrapping_mul(0x9e37_79b9))
-            & (RECENT_BUFFERS_LEN - 1);
-        let recent = RECENT_BUFFERS.with_borrow(|recent| recent[at]);
-        if recent.buffer > 0
-            && recent.block == block
-            && pg_sys::ReadRecentBuffer(
-                locator,
-                pg_sys::ForkNumber::MAIN_FORKNUM,
-                block,
-                recent.buffer,
-            )
+        let slot = hint_slot(locator.relNumber.to_u32(), block);
+        // Pins `buffer` if it still holds the block: owned, else through
+        // `ReadRecentBuffer`.
+        let recent = |buffer: pg_sys::Buffer| {
+            // A shared buffer's number; a hint names one, but the tables
+            // are read without a lock and the descriptor is indexed by it.
+            if buffer <= 0 || buffer > pg_sys::NBuffers {
+                return false;
+            }
+            if own {
+                return own_pin(buffer, &locator, block);
+            }
+            if pg_sys::ReadRecentBuffer(locator, pg_sys::ForkNumber::MAIN_FORKNUM, block, buffer) {
+                count_use(buffer);
+                return true;
+            }
+            false
+        };
+        if SHARE_BUFFER_HINTS.get()
+            && let Some(table) = shared_hints()
         {
+            let bucket = slot & (table.len() - 1) & !1;
+            let first = table[bucket].load(Ordering::Relaxed);
+            let second = table[bucket + 1].load(Ordering::Relaxed);
+            for entry in [first, second] {
+                if (entry >> 32) as u32 == block {
+                    let buffer = entry as u32 as pg_sys::Buffer;
+                    if recent(buffer) {
+                        SCAN_RECENT.set(SCAN_RECENT.get() + 1);
+                        return (buffer, own);
+                    }
+                    break;
+                }
+            }
+            let buffer = pg_sys::ReadBuffer(index, block);
+            // Local buffers (a temporary index) are left to `ReadBuffer`.
+            if buffer > 0 {
+                // Newest first; the entry it displaces moves second, unless
+                // it was this block's (a stale hint).
+                if first != 0 && (first >> 32) as u32 != block {
+                    table[bucket + 1].store(first, Ordering::Relaxed);
+                }
+                table[bucket].store(
+                    (u64::from(block) << 32) | u64::from(buffer as u32),
+                    Ordering::Relaxed,
+                );
+            }
+            return (buffer, false);
+        }
+        let at = slot & (RECENT_BUFFERS_LEN - 1);
+        let hint = RECENT_BUFFERS.with_borrow(|recent| recent[at]);
+        if hint.block == block && recent(hint.buffer) {
             SCAN_RECENT.set(SCAN_RECENT.get() + 1);
-            return recent.buffer;
+            return (hint.buffer, own);
         }
         let buffer = pg_sys::ReadBuffer(index, block);
-        // Local buffers (a temporary index) are left to `ReadBuffer`.
         if buffer > 0 {
             RECENT_BUFFERS.with_borrow_mut(|recent| recent[at] = RecentBuffer { block, buffer });
         }
-        buffer
+        (buffer, false)
     }
+}
+
+/// `stannum.own_pins`: whether a run page found through its hint is pinned
+/// by [`own_pin`], outside PostgreSQL's per-pin bookkeeping, or through
+/// `ReadRecentBuffer`.
+///
+/// A walk pins thousands of pages a query and holds tens at once, past the
+/// eight PostgreSQL's private reference counts keep in an array: every pin
+/// and release then looks a hash up two or three times (the private count,
+/// the resource owner), takes the buffer header's spinlock and raises its
+/// usage count in a second atomic operation, a tenth of a conjunction's
+/// backend CPU at 150M rows. An own pin is what `PinBuffer` does, one
+/// compare-and-swap of the header's state (reference and usage counts
+/// together), then the tag check `ReadRecentBuffer` makes; an own release
+/// is `UnpinBuffer`'s atomic decrement and, for a buffer with a waiter for
+/// its sole pin (a vacuum's cleanup lock), the waiter's wake-up under the
+/// header lock. The span's pins are remembered with the resource owner as
+/// one resource ([`RUN_PAGES`]), so an abort or exit that does not unwind
+/// the walk releases them as it would the rest.
+pub static OWN_PINS: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
+
+/// The buffer descriptor of shared buffer `buffer`.
+///
+/// # Safety
+///
+/// `buffer` is a shared buffer (positive).
+#[inline]
+unsafe fn descriptor(buffer: pg_sys::Buffer) -> *mut pg_sys::BufferDesc {
+    // SAFETY: a shared buffer's descriptor lies at its index in the array.
+    unsafe {
+        std::ptr::addr_of_mut!((*pg_sys::BufferDescriptors.add(buffer as usize - 1)).bufferdesc)
+    }
+}
+
+/// The descriptor's state word, an atomic PostgreSQL updates by
+/// compare-and-swap whenever the header is not locked.
+///
+/// # Safety
+///
+/// `desc` is a shared buffer's descriptor.
+#[inline]
+unsafe fn state_of<'a>(desc: *mut pg_sys::BufferDesc) -> &'a std::sync::atomic::AtomicU32 {
+    // SAFETY: `pg_atomic_uint32` is a 32-bit word PostgreSQL accesses with
+    // the platform's atomics.
+    unsafe { &*std::ptr::addr_of!((*desc).state.value).cast::<std::sync::atomic::AtomicU32>() }
+}
+
+/// Waits for the buffer header whose state is `state` to be unlocked, as
+/// `WaitBufHdrUnlocked` does (PostgreSQL's spin delay: a few spins, then
+/// sleeps that lengthen, so a holder descheduled while holding the lock
+/// gets to run), and returns the state read unlocked.
+///
+/// # Safety
+///
+/// `state` is a shared buffer descriptor's state word.
+#[cold]
+unsafe fn wait_header_unlocked(state: &std::sync::atomic::AtomicU32) -> u32 {
+    use std::sync::atomic::Ordering;
+    // SAFETY: the delay status is this call's own, initialized as
+    // `init_local_spin_delay` does, and named for the stuck-spinlock report.
+    unsafe {
+        let mut delay = pg_sys::SpinDelayStatus {
+            file: c"stannum/storage".as_ptr(),
+            func: c"wait_header_unlocked".as_ptr(),
+            ..Default::default()
+        };
+        let mut now = state.load(Ordering::Relaxed);
+        while now & pg_sys::BM_LOCKED != 0 {
+            pg_sys::perform_spin_delay(&raw mut delay);
+            now = state.load(Ordering::Relaxed);
+        }
+        pg_sys::finish_spin_delay(&raw mut delay);
+        now
+    }
+}
+
+/// Pins shared buffer `buffer` as `PinBuffer` does, one compare-and-swap of
+/// its state (a reference and, up to the most, a use), and keeps the pin if
+/// the buffer holds `block` of the relation at `locator`; otherwise
+/// releases it again and returns false. The tag is read once pinned: a
+/// pinned valid buffer cannot be given to another page.
+///
+/// Only a valid buffer is pinned: the compare-and-swap takes the pin only
+/// if the state it read, `BM_VALID` set, is still the state. A buffer
+/// without `BM_VALID` may be a victim between its eviction and its new
+/// tag, pinned once by the backend replacing it, which asserts that single
+/// pin (`BufferAlloc`, `GetVictimBuffer`, `ExtendBufferedRelShared`): a
+/// stale hint names such a buffer, and a pin on it, however brief, trips
+/// the assertion in a cassert build and makes the replacement start over
+/// in any build. `ReadRecentBuffer` checks under the header lock before
+/// pinning for the same reason.
+///
+/// # Safety
+///
+/// `buffer` is a shared buffer number this backend may pin (positive and
+/// within `NBuffers`, as a hint read from the tables is).
+unsafe fn own_pin(buffer: pg_sys::Buffer, locator: &pg_sys::RelFileLocator, block: u32) -> bool {
+    use std::sync::atomic::Ordering;
+    // SAFETY: per the contract; the descriptor's fields are read as
+    // PostgreSQL reads them.
+    unsafe {
+        let desc = descriptor(buffer);
+        let state = state_of(desc);
+        let mut old = state.load(Ordering::Relaxed);
+        let now = loop {
+            if old & pg_sys::BM_LOCKED != 0 {
+                // Someone changes the header: wait for it as `PinBuffer`
+                // does, a header lock is held for a few instructions.
+                old = wait_header_unlocked(state);
+                continue;
+            }
+            if old & pg_sys::BM_VALID == 0 {
+                return false;
+            }
+            let mut new = old + pg_sys::BUF_REFCOUNT_ONE;
+            if (old & pg_sys::BUF_USAGECOUNT_MASK) >> pg_sys::BUF_USAGECOUNT_SHIFT
+                < pg_sys::BM_MAX_USAGE_COUNT
+            {
+                new += pg_sys::BUF_USAGECOUNT_ONE;
+            }
+            match state.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break new,
+                Err(current) => old = current,
+            }
+        };
+        let tag = std::ptr::read(std::ptr::addr_of!((*desc).tag));
+        if now & pg_sys::BM_VALID != 0
+            && tag.blockNum == block
+            && tag.forkNum == pg_sys::ForkNumber::MAIN_FORKNUM
+            && tag.relNumber == locator.relNumber
+            && tag.dbOid == locator.dbOid
+            && tag.spcOid == locator.spcOid
+        {
+            (*std::ptr::addr_of_mut!(pg_sys::pgBufferUsage)).shared_blks_hit += 1;
+            return true;
+        }
+        own_unpin(buffer);
+        false
+    }
+}
+
+/// Releases a pin [`own_pin`] took, as `UnpinBuffer` does: one
+/// compare-and-swap of the state while the header is not locked; then, if
+/// a backend waits for the buffer's sole pin, under the header lock, the
+/// wait is ended and the waiter signalled.
+///
+/// Not an atomic decrement: whoever holds the header lock (the bgwriter's
+/// and a checkpoint's scans, the clock sweep, `pg_buffercache`) writes the
+/// state it read back at the unlock, a plain store, so a decrement that
+/// lands under the lock is undone, and the pin outlives everyone (the
+/// buffer is never evicted; dropping the relation spins in
+/// `InvalidateBuffer`). `UnpinBuffer` waits for the lock for this reason.
+///
+/// # Safety
+///
+/// `buffer` is pinned by [`own_pin`] and released once.
+unsafe fn own_unpin(buffer: pg_sys::Buffer) {
+    use std::sync::atomic::Ordering;
+    // SAFETY: per the contract; `LockBufHdr` and `ProcSendSignal` are
+    // PostgreSQL's own, and the unlock is `UnlockBufHdr`'s release store.
+    unsafe {
+        let desc = descriptor(buffer);
+        let state = state_of(desc);
+        let mut old = state.load(Ordering::Relaxed);
+        let now = loop {
+            if old & pg_sys::BM_LOCKED != 0 {
+                old = wait_header_unlocked(state);
+                continue;
+            }
+            let new = old - pg_sys::BUF_REFCOUNT_ONE;
+            match state.compare_exchange_weak(old, new, Ordering::AcqRel, Ordering::Relaxed) {
+                Ok(_) => break new,
+                Err(current) => old = current,
+            }
+        };
+        if now & pg_sys::BM_PIN_COUNT_WAITER != 0 {
+            let locked = pg_sys::LockBufHdr(desc);
+            if locked & pg_sys::BM_PIN_COUNT_WAITER != 0 && locked & pg_sys::BUF_REFCOUNT_MASK == 1
+            {
+                let waiter = (*desc).wait_backend_pgprocno;
+                state.store(
+                    locked & !pg_sys::BM_PIN_COUNT_WAITER & !pg_sys::BM_LOCKED,
+                    Ordering::Release,
+                );
+                pg_sys::ProcSendSignal(waiter);
+            } else {
+                state.store(locked & !pg_sys::BM_LOCKED, Ordering::Release);
+            }
+        }
+    }
+}
+
+/// Releases a pin [`pin_block`] took: an own one, or PostgreSQL's.
+///
+/// # Safety
+///
+/// `buffer` was returned by [`pin_block`] with `owned`, and is released once.
+#[inline]
+unsafe fn release_pin(buffer: pg_sys::Buffer, owned: bool) {
+    // SAFETY: per the contract.
+    unsafe {
+        if owned {
+            own_unpin(buffer);
+        } else {
+            pg_sys::ReleaseBuffer(buffer);
+        }
+    }
+}
+
+/// A `ResourceOwnerDesc`, shared across the backend's spans.
+struct ResourceKind(pg_sys::ResourceOwnerDesc);
+
+// SAFETY: a constant: PostgreSQL reads it and never writes it.
+unsafe impl Sync for ResourceKind {}
+
+/// The resource kind a span's pages are remembered as, one resource per
+/// span (see [`RunSource::remember_span`]), released with the buffer pins.
+static RUN_PAGES: ResourceKind = ResourceKind(pg_sys::ResourceOwnerDesc {
+    name: c"Stannum run pages".as_ptr(),
+    release_phase: pg_sys::ResourceReleasePhase::RESOURCE_RELEASE_BEFORE_LOCKS,
+    release_priority: pg_sys::RELEASE_PRIO_BUFFER_PINS,
+    ReleaseResource: Some(release_run_pages),
+    DebugPrint: None,
+});
+
+/// Releases a span's own pins for its resource owner (see [`RUN_PAGES`]):
+/// an owner is released with the span still open when a `FATAL` error
+/// exits the backend mid-walk. The owner then releases PostgreSQL's own
+/// pins and the relation reference itself, and this the ledger's.
+unsafe extern "C-unwind" fn release_run_pages(datum: pg_sys::Datum) {
+    // SAFETY: the datum is a ledger's address, remembered by
+    // `remember_span`; a span that closes forgets it first, so the ledger
+    // is the owner's to free (see `SpanLedger`).
+    unsafe {
+        let ledger = Box::from_raw(datum.value() as *mut SpanLedger);
+        for buffer in ledger.owned {
+            own_unpin(buffer);
+        }
+    }
+}
+
+fn ledger_datum(ledger: *mut SpanLedger) -> pg_sys::Datum {
+    pg_sys::Datum::from(ledger as usize)
 }
 
 /// The page of pinned buffer `buffer`: for a shared buffer computed as
@@ -1099,18 +1670,6 @@ pub(crate) fn reset_held_peak() {
     SCAN_RECENT.set(0);
 }
 
-/// Releases a page `RunSource::pin` pinned; in an exiting backend only
-/// forgets it (see [`exiting`]).
-fn unpin(held: HeldPage) {
-    if !exiting() {
-        // SAFETY: the pin was taken by `pin` and is released once: the slot
-        // holding it was emptied before this call.
-        unsafe { pg_sys::ReleaseBuffer(held.buffer) };
-    }
-    let (now, total, peak) = HELD_PAGES.get();
-    HELD_PAGES.set((now - 1, total, peak));
-}
-
 /// Whether the backend is exiting, from `proc_exit` on: a FATAL error
 /// (`pg_terminate_backend`, a shutdown, postmaster death) exits without
 /// unwinding the walk it interrupts, so a hold span stays open, and
@@ -1139,10 +1698,11 @@ impl Drop for RunSource {
 }
 
 /// Holds page 0 of the first segment of `index_oid` pinned in a hold span
-/// of a source of its own, then drops the source, open span and all, as a
-/// reader dropped at exit is, with `proc_exit_inprogress` set to
-/// `exiting`. Returns the buffer and relation reference the span held; the
-/// caller releases them if the drop did not.
+/// of a source of its own, in a slot and for an in-place read, then drops
+/// the source, open span and all, as a reader dropped at exit is, with
+/// `proc_exit_inprogress` set to `exiting`. Returns the buffers and
+/// relation reference the span held; the caller releases them if the drop
+/// did not.
 ///
 /// # Safety
 ///
@@ -1151,7 +1711,7 @@ impl Drop for RunSource {
 pub(crate) unsafe fn drop_holding_source(
     index_oid: pg_sys::Oid,
     exiting: bool,
-) -> (pg_sys::Buffer, pg_sys::Relation) {
+) -> ([(pg_sys::Buffer, bool); 2], pg_sys::Relation) {
     use segment::source::Source as _;
     // SAFETY: per the contract; the flag is set only while the source
     // drops.
@@ -1168,14 +1728,37 @@ pub(crate) unsafe fn drop_holding_source(
             .held_span(0, 0)
             .expect("a held span")
             .expect("a pinned page");
-        let buffer = source.slots.borrow()[0][0].expect("the pinned page").buffer;
+        assert!(
+            source
+                .pinned_page(0)
+                .expect("a pinned page")
+                .expect("pinned")
+                .pinned
+        );
+        let slot = source.slots.borrow()[0][0].expect("the pinned page");
+        let in_place = source.pinned.borrow()[&0];
         let held = source.relation.get();
         assert!(!held.is_null());
         pg_sys::proc_exit_inprogress = exiting;
         drop(source);
         pg_sys::proc_exit_inprogress = false;
-        (buffer, held)
+        (
+            [(slot.buffer, slot.owned), (in_place.buffer, in_place.owned)],
+            held,
+        )
     }
+}
+
+/// Releases the own pins of every span the current resource owner
+/// remembers, as its release at exit would (see [`release_run_pages`]).
+///
+/// # Safety
+///
+/// Within a transaction.
+#[cfg(any(test, feature = "pg_test"))]
+pub(crate) unsafe fn release_spans_of_owner() {
+    // SAFETY: per the contract.
+    unsafe { pg_sys::ResourceOwnerReleaseAllOfKind(pg_sys::CurrentResourceOwner, &RUN_PAGES.0) };
 }
 
 impl segment::source::Source for RunSource {
@@ -1226,6 +1809,7 @@ impl segment::source::Source for RunSource {
                 let generation = HOLD_SPANS.get() + 1;
                 HOLD_SPANS.set(generation);
                 self.generation.set(generation);
+                self.remember_span();
             }
             self.holding.set(self.holding.get() + 1);
         } else {
@@ -1245,22 +1829,33 @@ impl segment::source::Source for RunSource {
         if self.holding.get() == 0 {
             return None;
         }
-        let mut slots = self.slots.borrow_mut();
-        let pages = slots.get_mut(slot)?;
         let page = (offset / CHAIN_CAPACITY as u64) as usize;
-        let (held, pinned) = match pages.iter().flatten().find(|held| held.page == page) {
-            Some(held) => (*held, false),
-            None => {
-                for previous in pages.iter_mut() {
-                    if let Some(previous) = previous.take() {
-                        unpin(previous);
+        // The slot's pages are released and forgotten before the pin, which
+        // calls into PostgreSQL: no map stays borrowed across that call
+        // (see `release_for_owner`).
+        let found = {
+            let mut slots = self.slots.borrow_mut();
+            let pages = slots.get_mut(slot)?;
+            match pages.iter().flatten().find(|held| held.page == page) {
+                Some(held) => Some(*held),
+                None => {
+                    for previous in pages.iter_mut() {
+                        if let Some(previous) = previous.take() {
+                            self.unpin(previous);
+                        }
                     }
+                    None
                 }
+            }
+        };
+        let (held, pinned) = match found {
+            Some(held) => (held, false),
+            None => {
                 let held = match self.pin(page) {
                     Ok(held) => held,
                     Err(error) => return Some(Err(error)),
                 };
-                pages[0] = Some(held);
+                self.slots.borrow_mut()[slot][0] = Some(held);
                 (held, true)
             }
         };
@@ -1274,6 +1869,63 @@ impl segment::source::Source for RunSource {
 
     fn hold_generation(&self) -> u64 {
         self.generation.get()
+    }
+
+    fn holding(&self) -> bool {
+        self.holding.get() > 0
+    }
+
+    fn page_len(&self) -> usize {
+        CHAIN_CAPACITY
+    }
+
+    fn pinned_page(&self, offset: u64) -> Option<segment::Result<segment::source::HeldSpan>> {
+        if self.holding.get() == 0 {
+            return None;
+        }
+        if offset >= u64::from(self.run.bytes) {
+            return Some(Err(segment::Error::Truncated));
+        }
+        let page = (offset / CHAIN_CAPACITY as u64) as usize;
+        // The map is not borrowed across the pin, a call into PostgreSQL
+        // (see `release_for_owner`).
+        let found = {
+            let pinned = self.pinned.borrow();
+            match pinned.get(&page) {
+                Some(held) => Some(*held),
+                None if pinned.len() >= PINNED_LIMIT => return None,
+                None => None,
+            }
+        };
+        let (held, fresh) = match found {
+            Some(held) => (held, false),
+            None => {
+                let held = match self.pin_page(page, false) {
+                    Ok(held) => held,
+                    Err(error) => return Some(Err(error)),
+                };
+                self.pinned.borrow_mut().insert(page, held);
+                (held, true)
+            }
+        };
+        Some(Ok(segment::source::HeldSpan {
+            start: page as u64 * CHAIN_CAPACITY as u64,
+            data: held.data,
+            len: held.len,
+            pinned: fresh,
+        }))
+    }
+
+    /// A walk releases a group's pages once it is past them (see
+    /// `LazyBlob::release_since`), so it holds tens of pages rather than
+    /// the thousands a query touches: PostgreSQL counts a backend's first
+    /// eight pins in an array and the rest in a hash table, and its
+    /// resource owner remembers 32 in an array and the rest in a hash.
+    fn release_page(&self, offset: u64) {
+        let page = (offset / CHAIN_CAPACITY as u64) as usize;
+        if let Some(held) = self.pinned.borrow_mut().remove(&page) {
+            self.unpin(held);
+        }
     }
 
     fn held_slot(&self) -> Option<usize> {
@@ -1317,7 +1969,7 @@ impl segment::source::Source for RunSource {
         // follows its last one in the stream, often on the same page.
         for page in pages.iter_mut() {
             if page.is_some_and(|held| held.page < first || held.page > last) {
-                unpin(page.take().expect("checked above"));
+                self.unpin(page.take().expect("checked above"));
             }
         }
         let mut range = segment::source::HeldRange::default();
@@ -1429,6 +2081,8 @@ struct CachedSegment {
     /// `dead` decoded once per dead run, for the walks and counts over
     /// ordinals and for scorers that test membership.
     dead_set: DeadSet,
+    /// The bytes and liveness the ctid-native paths read.
+    native: Rc<Native>,
 }
 
 /// An immutable segment as a query source: the shared reader plus the
@@ -1456,13 +2110,14 @@ impl Index for MemoizedSegment {
         if let Some(entry) = self.terms.borrow().get(term) {
             return entry.map(|entry| self.reader.resolve(entry)).transpose();
         }
-        let found = self.reader.term(term)?;
+        let found = self.reader.term_entry(term)?;
         let mut memo = self.terms.borrow_mut();
         if memo.len() >= TERM_MEMO_LIMIT {
             memo.clear();
         }
-        memo.insert(term.to_owned(), found.map(|found| found.entry));
-        Ok(found)
+        memo.insert(term.to_owned(), found);
+        drop(memo);
+        found.map(|entry| self.reader.resolve(entry)).transpose()
     }
 
     fn expand(
@@ -1511,7 +2166,14 @@ type SegmentReaders = HashMap<(u64, u32), CachedSegment>;
 /// Sized so a directory of a few dozen segments over a hundred million
 /// rows stays resident: at 160 MB eighteen readers' page tables and
 /// dictionary samples overflowed it, so every query reloaded all of them.
+/// The ctid-native paths' loaded chunks count against it too, and keep at
+/// most a quarter of it across queries (see `NATIVE_SHARE`).
 pub static READER_CACHE_MB: pgrx::GucSetting<i32> = pgrx::GucSetting::<i32>::new(384);
+
+/// `stannum.native_in_place`: the ctid-native paths read a segment's
+/// structures in place from pinned shared buffers (see [`native_segment`]);
+/// off, they copy what they read into chunks each backend keeps.
+pub static NATIVE_IN_PLACE: pgrx::GucSetting<bool> = pgrx::GucSetting::<bool>::new(true);
 
 /// `stannum.read_cache_mb`: the budget of [`segment::cache`], the least
 /// recently used ranges cursors sweep, applied whenever a view is captured.
@@ -1534,7 +2196,7 @@ unsafe fn cached_segment(
     index_oid: pg_sys::Oid,
     identity: u64,
     entry: &SegmentEntry,
-) -> (MemoizedSegment, Option<Rc<Vec<u8>>>, DeadSet) {
+) -> (MemoizedSegment, Option<Rc<Vec<u8>>>, DeadSet, Rc<Native>) {
     let key = (identity, entry.generation);
     let found = SEGMENT_READERS.with_borrow(|readers| {
         readers.get(&key).map(|cached| {
@@ -1543,14 +2205,17 @@ unsafe fn cached_segment(
                     reader: cached.reader.clone(),
                     terms: cached.terms.clone(),
                 },
+                cached.native.clone(),
                 (cached.dead_run == (entry.dead, entry.dead_stamp))
                     .then(|| (cached.dead.clone(), cached.dead_set.clone())),
             )
         })
     });
-    let (segment, dead) = match found {
-        Some((segment, Some((dead, dead_set)))) => return (segment, dead, dead_set),
-        Some((segment, None)) => (segment, None),
+    let (segment, native, dead) = match found {
+        Some((segment, native, Some((dead, dead_set)))) => {
+            return (segment, dead, dead_set, native);
+        }
+        Some((segment, native, None)) => (segment, native, None),
         None => {
             let label = generation_label(entry.generation);
             let source: Box<dyn segment::source::Source> = Box::new(RunSource::new(
@@ -1563,7 +2228,7 @@ unsafe fn cached_segment(
                 reader: Rc::new(codec_in(Reader::new(source), &label)),
                 terms: Rc::default(),
             };
-            (segment, None)
+            (segment, Rc::default(), None)
         }
     };
     let dead = dead.unwrap_or_else(|| {
@@ -1593,10 +2258,11 @@ unsafe fn cached_segment(
                 dead_run: (entry.dead, entry.dead_stamp),
                 dead: dead.clone(),
                 dead_set: dead_set.clone(),
+                native: native.clone(),
             },
         );
     });
-    (segment, dead, dead_set)
+    (segment, dead, dead_set, native)
 }
 
 /// `stannum.reader_cache_mb` in bytes.
@@ -1634,15 +2300,104 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
         readers.retain(|key, _| live(*key));
         bytes += readers
             .values()
-            .map(|c| c.reader.cached_bytes() + dead_bytes(c))
+            .map(|c| c.reader.cached_bytes() + dead_bytes(c) + c.native.bytes())
             .sum::<usize>();
-        if bytes > reader_cache_budget() {
+        let budget = reader_cache_budget();
+        if unsafe { pg_sys::message_level_is_interesting(pg_sys::DEBUG1 as _) } {
+            report_reader_cache(readers, bytes, budget);
+        }
+        // What the native paths loaded is a copy of index pages that shared
+        // buffers hold too, and a query reloads it a chunk at a time, where
+        // the readers' page tables and dictionaries reload whole: it keeps
+        // at most a share of the budget and goes first, the most first.
+        let held = |readers: &SegmentReaders| -> Vec<(usize, (u64, u32))> {
+            readers
+                .iter()
+                .map(|(key, c)| (c.native.bytes(), *key))
+                .filter(|(held, _)| *held > 0)
+                .collect()
+        };
+        let mut natives = held(readers);
+        let mut native: usize = natives.iter().map(|(held, _)| held).sum();
+        if bytes > budget || native > budget / NATIVE_SHARE {
+            // First the parsed records and footers used longest ago, the
+            // largest segments' first: dropping a segment's native state
+            // whole dropped its common words' with it, which nearly every
+            // query parses again.
+            natives.sort_unstable_by(|a, b| b.cmp(a));
+            for (was, key) in &natives {
+                if bytes <= budget && native <= budget / NATIVE_SHARE {
+                    break;
+                }
+                if let Some(cached) = readers.get(key) {
+                    cached.native.shed();
+                    let freed = was.saturating_sub(cached.native.bytes());
+                    bytes -= freed;
+                    native -= freed;
+                }
+            }
+            natives = held(readers);
+            natives.sort_unstable_by(|a, b| b.cmp(a));
+            for (held, key) in natives {
+                if bytes <= budget && native <= budget / NATIVE_SHARE {
+                    break;
+                }
+                if let Some(cached) = readers.get_mut(&key) {
+                    cached.native = Rc::default();
+                    bytes -= held;
+                    native -= held;
+                    #[cfg(feature = "pg_test")]
+                    testing::NATIVE_DROPS.set(testing::NATIVE_DROPS.get() + 1);
+                }
+            }
+        }
+        if bytes > budget {
             readers.clear();
             PAGE_TABLES.with_borrow_mut(HashMap::clear);
             #[cfg(feature = "pg_test")]
             testing::READER_CACHE_CLEARS.set(testing::READER_CACHE_CLEARS.get() + 1);
         }
     });
+}
+
+/// The part of `stannum.reader_cache_mb` the ctid-native paths' loaded
+/// chunks may keep across queries: one in this many bytes. At 150M rows the
+/// readers' page tables, term-map indexes and document sets take about 130
+/// MB of the default 384, and a backend running the mixed workload peaked
+/// near its budget plus a query's reads; eight such backends beside 24 GB
+/// of shared buffers left a 32 GB container too little room.
+const NATIVE_SHARE: usize = 4;
+
+/// Logs at DEBUG1 what the backend's reader cache holds, by part, as a view
+/// is captured: `SET client_min_messages = debug1` to see it.
+fn report_reader_cache(readers: &SegmentReaders, bytes: usize, budget: usize) {
+    let mut reader = [0usize; 4];
+    let (mut dead, mut native) = (0usize, 0usize);
+    for cached in readers.values() {
+        for (sum, part) in reader.iter_mut().zip(cached.reader.cached_parts()) {
+            *sum += part;
+        }
+        dead += dead_bytes(cached);
+        native += cached.native.bytes();
+    }
+    let tables = PAGE_TABLES.with_borrow(|t| t.values().map(|t| t.len() * 4).sum::<usize>());
+    let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
+    pgrx::debug1!(
+        "stannum reader cache: {:.1} of {:.1} MB in {} readers: page tables {:.1}, arenas {:.1}, \
+         ordinal tables {:.1}, document sets {:.1}, translated streams {:.1}, dead lists {:.1}, \
+         native {:.1}; read cache {:.1} MB",
+        mb(bytes),
+        mb(budget),
+        readers.len(),
+        mb(tables),
+        mb(reader[0]),
+        mb(reader[1]),
+        mb(reader[2]),
+        mb(reader[3]),
+        mb(dead),
+        mb(native),
+        mb(segment::cache::bytes()),
+    );
 }
 
 /// Queues a run for reclamation once no scan can still hold it.
@@ -1707,7 +2462,7 @@ unsafe fn release(index: pg_sys::Relation, meta: &mut Meta, run: Run) {
 unsafe fn expect_chain_end(index: pg_sys::Relation, run: Run) {
     let what = format!("released run at page {}", run.first);
     let last = unsafe { Buffer::read(index, run.last, false) };
-    expect_run_page(&last, &what);
+    expect_retired_page(&last, &what);
     if last.chain().0 != NONE {
         corrupt(format!(
             "Stannum {what}: page {} is not the chain's last page",
@@ -1725,9 +2480,10 @@ unsafe fn expect_chain_end(index: pg_sys::Relation, run: Run) {
 unsafe fn link_chain(index: pg_sys::Relation, last: u32, next: u32) {
     unsafe {
         let buffer = Buffer::read(index, last, true);
-        expect_run_page(&buffer, &format!("released run ending at page {last}"));
+        expect_retired_page(&buffer, &format!("released run ending at page {last}"));
+        let kind = buffer.kind();
         let payload = layout::chain_payload(next, buffer.chain().1);
-        write_page(index, &buffer, false, KIND_RUN, &payload);
+        write_page(index, &buffer, false, kind, &payload);
     }
 }
 
@@ -1789,7 +2545,7 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
                 index,
                 pending.run.first,
                 pending.run.blocks.min(budget),
-                KIND_RUN,
+                verify::RETIRED,
             );
             let freed = pages.len() as u32;
             budget -= freed;
@@ -1812,6 +2568,9 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
             }
         }
         meta.pending = still_pending;
+        AFTER_PUBLICATION.with_borrow(|after| {
+            forget_retired(meta, after.frees.iter().flat_map(|(_, pages)| pages));
+        });
     }
 }
 
@@ -1832,6 +2591,50 @@ struct BufferIndex {
 
 thread_local! {
     static BUFFER_INDEX: RefCell<Option<BufferIndex>> = const { RefCell::new(None) };
+    /// Sealed write segments as in-memory indexes, by index identity and
+    /// stamp; a sealed segment never changes, so an index is built once.
+    static SEALED_INDEXES: RefCell<Vec<(u64, u32, Rc<MutableIndex>)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Sealed segments' indexes a backend keeps: two per index, for a few.
+const SEALED_INDEXES_KEPT: usize = 8;
+
+/// A sealed write segment as an in-memory index, built on first use. `None`
+/// when a page read is stale against `published` (see [`read_buffer_range`]).
+///
+/// # Safety
+/// The caller holds the meta page of `index`, which lists `state` sealed.
+unsafe fn sealed_index(
+    index: pg_sys::Relation,
+    identity: u64,
+    state: &BufferState,
+    published: Option<u64>,
+) -> Option<Rc<MutableIndex>> {
+    let found = SEALED_INDEXES.with_borrow(|cached| {
+        cached
+            .iter()
+            .find(|(id, stamp, _)| *id == identity && *stamp == state.epoch)
+            .map(|(_, _, index)| index.clone())
+    });
+    if found.is_some() {
+        return found;
+    }
+    let mut pages = vec![state.head];
+    let stream =
+        unsafe { read_buffer_range(index, &mut pages, 0, state.bytes as usize, published) }?;
+    let built = Rc::new(MutableIndex::default());
+    let mut at = 0;
+    while at < stream.len() {
+        at += codec_in(built.add_encoded(&stream[at..]), "sealed write segment");
+    }
+    SEALED_INDEXES.with_borrow_mut(|cached| {
+        if cached.len() >= SEALED_INDEXES_KEPT {
+            cached.remove(0);
+        }
+        cached.push((identity, state.epoch, built.clone()));
+    });
+    Some(built)
 }
 
 /// Reads buffer bytes `[from, to)` using and extending the page map.
@@ -1980,17 +2783,6 @@ pub fn cache_probe() -> CacheProbe {
     }
 }
 
-/// The dead list of `segment`, an ordinal stream, as the locations it names.
-fn dead_tids(segment: &dyn Index, dead: &[u8]) -> segment::Result<BTreeSet<Tid>> {
-    let docs = segment.doc_table()?;
-    let mut resolver = docs.resolver();
-    let mut out = BTreeSet::new();
-    for ordinal in Ordinals::parse(dead)?.to_vec()? {
-        out.insert(resolver.tid_at(ordinal)?);
-    }
-    Ok(out)
-}
-
 /// A source's dead list as a cursor over its locations, in heap order.
 pub(crate) fn dead_cursor<'a>(
     source: &'a dyn Index,
@@ -2005,30 +2797,6 @@ pub(crate) fn dead_pages<'a>(
     dead: &'a [u8],
 ) -> segment::Result<PageCursor<'a>> {
     PageCursor::new(Ordinals::parse(dead)?.cursor()?, source.doc_table()?)
-}
-
-/// Documents of the parsed `segment` dead in `entry`'s dead list.
-unsafe fn dead_set(
-    index: pg_sys::Relation,
-    entry: &SegmentEntry,
-    segment: &Segment<'_>,
-) -> BTreeSet<Tid> {
-    unsafe { try_dead_set(index, entry, segment) }.unwrap_or_else(|message| corrupt(message))
-}
-
-/// The dead list of an entry, read like [`try_read_run`]: without the meta
-/// lock, a failure may be a race rather than corruption.
-unsafe fn try_dead_set(
-    index: pg_sys::Relation,
-    entry: &SegmentEntry,
-    segment: &Segment<'_>,
-) -> Result<BTreeSet<Tid>, String> {
-    if entry.dead.is_empty() {
-        return Ok(BTreeSet::new());
-    }
-    let what = format!("{} dead list", generation_label(entry.generation));
-    let bytes = unsafe { try_read_run(index, entry.dead, &what) }?;
-    dead_tids(segment, &bytes).map_err(|error| format!("Stannum {what}: {error}"))
 }
 
 // --- Write buffer -------------------------------------------------------------
@@ -2130,6 +2898,50 @@ fn expect_buffer_page(buffer: &Buffer) {
     }
 }
 
+/// Writes `data`, holding `docs` documents, to a chain of fresh buffer
+/// pages: a sealed write segment's contents under stamp `epoch`. Nothing
+/// published references the pages until the caller's [`write_meta`];
+/// should that never happen, they are orphans for VACUUM's orphan pass.
+///
+/// # Safety
+/// The caller holds the meta page of `index` exclusively.
+unsafe fn write_chain(index: pg_sys::Relation, data: &[u8], docs: u32, epoch: u32) -> BufferState {
+    unsafe {
+        let chunks: Vec<&[u8]> = if data.is_empty() {
+            vec![&[][..]]
+        } else {
+            data.chunks(CHAIN_CAPACITY).collect()
+        };
+        // Last page first, so each links to one already written.
+        let mut next = NONE;
+        let mut tail = NONE;
+        for (i, chunk) in chunks.iter().enumerate().rev() {
+            pgrx::check_for_interrupts!();
+            let buffer = Buffer::allocate(index);
+            write_page(
+                index,
+                &buffer,
+                true,
+                KIND_BUFFER,
+                &layout::chain_payload(next, chunk),
+            );
+            next = buffer.block();
+            if i + 1 == chunks.len() {
+                tail = next;
+            }
+        }
+        BufferState {
+            version: 0,
+            epoch,
+            head: next,
+            tail,
+            tail_used: chunks.last().expect("one chunk at least").len() as u32,
+            bytes: data.len() as u32,
+            docs,
+        }
+    }
+}
+
 /// Replaces the write buffer's contents with `data`, holding `docs`
 /// documents, without changing a byte the published buffer reads.
 ///
@@ -2162,7 +2974,7 @@ unsafe fn replace_buffer(index: pg_sys::Relation, state: &mut BufferState, data:
             (next, data.to_vec())
         };
         let (stale, rest) =
-            verify::chain_pages(index, after_tail, chunks.len() as u32, KIND_BUFFER);
+            verify::chain_pages(index, after_tail, chunks.len() as u32, &[KIND_BUFFER]);
         if stale.len() < chunks.len() && rest != NONE {
             corrupt(format!(
                 "Stannum write buffer: page {rest} past the tail is not a buffer page"
@@ -2212,16 +3024,54 @@ unsafe fn replace_buffer(index: pg_sys::Relation, state: &mut BufferState, data:
 
 // --- Segments -----------------------------------------------------------------
 
-fn finish_builder(builder: SegmentBuilder) -> (Vec<u8>, u32, u64) {
-    let docs = builder.document_count() as u32;
-    let blob = builder.finish();
-    let total_length = codec(Segment::parse(&blob)).total_length();
-    (blob, docs, total_length)
+/// A segment written in TIN's shape (`TNS1`) and what it holds.
+pub(crate) type Built = segment::tinshape::merge::Merged;
+
+/// The options every segment is encoded with.
+fn encoding() -> segment::tinshape::postings::Options {
+    segment::tinshape::postings::Options::default()
+}
+
+/// The builder's documents as a segment; `None` when it recorded none (only
+/// documents without a token were added).
+fn finish_builder(builder: SegmentBuilder) -> Option<Built> {
+    codec(builder.finish_tns(encoding()))
+}
+
+/// The dead list of `entry` by rank, read like [`try_read_run`]: without
+/// the meta lock, a failure may be a race rather than corruption.
+unsafe fn try_dead_docs(
+    index: pg_sys::Relation,
+    entry: &SegmentEntry,
+) -> Result<segment::dead::DeadDocs, String> {
+    if entry.dead.is_empty() {
+        return Ok(segment::dead::DeadDocs::default());
+    }
+    let what = format!("{} dead list", generation_label(entry.generation));
+    let bytes = unsafe { try_read_run(index, entry.dead, &what) }?;
+    segment::dead::DeadDocs::decode(&bytes, entry.docs)
+        .map_err(|error| format!("Stannum {what}: {error}"))
+}
+
+/// Merges segment blobs without their dead documents. An input that fails
+/// to decode is reported through `corrupt` by the caller.
+fn merge_blobs(
+    inputs: &[(Vec<u8>, segment::dead::DeadDocs)],
+    mut checkpoint: impl FnMut(),
+) -> segment::Result<Option<Built>> {
+    let inputs = inputs
+        .iter()
+        .map(|(bytes, dead)| segment::tinshape::merge::Input { bytes, dead })
+        .collect::<Vec<_>>();
+    segment::tinshape::merge::merge(&inputs, encoding(), || {
+        checkpoint();
+        Ok(())
+    })
 }
 
 /// A directory entry for a freshly written segment run, with the next
 /// generation number. Generations never repeat within an index identity.
-fn new_entry(meta: &mut Meta, run: Run, map: Run, docs: u32, total_length: u64) -> SegmentEntry {
+fn new_entry(meta: &mut Meta, run: Run, map: Run, built: &Built, origin: Origin) -> SegmentEntry {
     let generation = meta.next_generation;
     meta.next_generation = meta
         .next_generation
@@ -2232,9 +3082,10 @@ fn new_entry(meta: &mut Meta, run: Run, map: Run, docs: u32, total_length: u64) 
         map,
         dead: Run::EMPTY,
         dead_stamp: 0,
-        docs,
-        total_length,
+        docs: built.documents,
+        total_length: built.total_length,
         generation,
+        origin,
     }
 }
 
@@ -2261,40 +3112,43 @@ fn attach_dead_list(meta: &mut Meta, i: usize, run: Run) -> Run {
     std::mem::replace(&mut entry.dead, run)
 }
 
+/// Lists a retired source for `segment_info()`, forgetting the oldest
+/// should the list be full.
+fn note_retired(meta: &mut Meta, retired: layout::Retired) {
+    if meta.retired.len() >= layout::MAX_RETIRED {
+        meta.retired.remove(0);
+    }
+    meta.retired.push(retired);
+}
+
+/// Forgets the retired sources whose first page is among `freed`.
+fn forget_retired<'a>(meta: &mut Meta, freed: impl Iterator<Item = &'a u32>) {
+    if meta.retired.is_empty() {
+        return;
+    }
+    let freed: HashSet<u32> = freed.copied().collect();
+    meta.retired
+        .retain(|retired| !freed.contains(&retired.first));
+}
+
 /// Queues every run of a retired directory entry for reclamation.
 ///
 /// # Safety
 /// The caller holds the meta page of `index` exclusively.
 unsafe fn release_entry(index: pg_sys::Relation, meta: &mut Meta, entry: SegmentEntry) {
+    note_retired(
+        meta,
+        layout::Retired {
+            first: entry.run.first,
+            pages: entry.run.blocks + entry.dead.blocks,
+            docs: entry.docs,
+            total_length: entry.total_length,
+        },
+    );
     unsafe {
         release(index, meta, entry.run);
         release(index, meta, entry.map);
         release(index, meta, entry.dead);
-    }
-}
-
-/// Publishes a built segment: writes its run, appends a directory entry and
-/// then spends the caller's merge budget.
-///
-/// # Safety
-/// The caller holds the meta page of `index` exclusively, and the directory
-/// has room for the entry (see [`make_room`]).
-unsafe fn add_segment(
-    index: pg_sys::Relation,
-    meta: &mut Meta,
-    blob: Vec<u8>,
-    docs: u32,
-    total_length: u64,
-    budget: u64,
-) {
-    unsafe {
-        let (run, map) = write_segment_run(index, &blob);
-        // Maintenance reads published segments into owned buffers. Release the
-        // caller's encoded copy before that read and any subsequent merge.
-        drop(blob);
-        let entry = new_entry(meta, run, map, docs, total_length);
-        meta.segments.push(entry);
-        maintain(index, meta, budget);
     }
 }
 
@@ -2530,16 +3384,11 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
             old.push(meta.segments.remove(position));
         }
         old.reverse();
-        let (blob, docs, total_length) = match direct_merge_limits(&old) {
-            Some(limits) => merge_segments_direct(index, &old, limits),
-            // Aggregate input can exceed one run's u32 byte/document limit
-            // while dropping dead tuples still produces a representable run.
-            // Preserve the old per-input reconstruction path in that case.
-            None => merge_segments_reconstructed(index, &old),
-        };
-        let (run, map) = write_segment_run(index, &blob);
-        let entry = new_entry(meta, run, map, docs, total_length);
-        meta.segments.push(entry);
+        if let Some(built) = merge_segments(index, &old) {
+            let (run, map) = write_segment_run(index, &built.blob);
+            let entry = new_entry(meta, run, map, &built, Origin::Merge);
+            meta.segments.push(entry);
+        }
         for entry in old {
             release_entry(index, meta, entry);
         }
@@ -2549,30 +3398,10 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
     }
 }
 
-/// Admission is based on existing directory metadata, before retaining blobs.
-/// These are format bounds, not a peak-memory budget.
-fn direct_merge_limits(entries: &[SegmentEntry]) -> Option<segment::merge::MergeLimits> {
-    let bytes = entries
-        .iter()
-        .try_fold(0u32, |n, entry| n.checked_add(entry.run.bytes))?;
-    let docs = entries
-        .iter()
-        .try_fold(0u32, |n, entry| n.checked_add(entry.docs))?;
-    Some(segment::merge::MergeLimits {
-        max_inputs: MAX_SEGMENTS,
-        max_input_bytes: bytes as usize,
-        max_documents: docs as usize,
-        max_output_bytes: u32::MAX as usize,
-    })
-}
-
-/// The caller retains exclusive metadata access through construction/publication.
-unsafe fn merge_segments_direct(
-    index: pg_sys::Relation,
-    entries: &[SegmentEntry],
-    limits: segment::merge::MergeLimits,
-) -> (Vec<u8>, u32, u64) {
-    use segment::merge::{MergeError, MergeInput};
+/// Merges `entries`, which the caller has taken out of the directory under
+/// the exclusive metadata lock it holds through publication; `None` when
+/// every document was dead.
+unsafe fn merge_segments(index: pg_sys::Relation, entries: &[SegmentEntry]) -> Option<Built> {
     // Owned input bytes are released when this function returns, before WAL
     // output allocation. The merger never borrows a PostgreSQL buffer page.
     let mut owned = Vec::with_capacity(entries.len());
@@ -2580,89 +3409,256 @@ unsafe fn merge_segments_direct(
         pgrx::check_for_interrupts!();
         let label = generation_label(entry.generation);
         let bytes = unsafe { read_run(index, entry.run, &label) };
-        let dead = unsafe { dead_set(index, entry, &codec_in(Segment::parse(&bytes), &label)) };
+        let dead =
+            unsafe { try_dead_docs(index, entry) }.unwrap_or_else(|message| corrupt(message));
         owned.push((bytes, dead));
     }
-    let inputs = owned
-        .iter()
-        .map(|(bytes, dead)| MergeInput { bytes, dead })
-        .collect::<Vec<_>>();
-    let blob = segment::merge::merge(&inputs, limits, || {
+    let built = merge_blobs(&owned, || {
         // PostgreSQL defers interrupts while the metadata LWLock is held.
         // Do not bypass that protection; insert checks again after release.
         race_point("merge:checkpoint");
         pgrx::check_for_interrupts!();
-        Ok(())
     })
-    .unwrap_or_else(|error| match error {
-        MergeError::Codec(_) | MergeError::InvalidInput { .. } => {
-            let generations = entries
-                .iter()
-                .map(|entry| entry.generation)
-                .collect::<Vec<_>>();
-            corrupt(format!(
-                "merge of segment generations {generations:?}: {error}"
-            ))
-        }
-        _ => pgrx::error!("Stannum segment merge failed: {error}"),
+    .unwrap_or_else(|error| {
+        let generations = entries
+            .iter()
+            .map(|entry| entry.generation)
+            .collect::<Vec<_>>();
+        corrupt(format!(
+            "merge of segment generations {generations:?}: {error}"
+        ))
     });
-    let segment = codec(Segment::parse(&blob));
-    let docs = segment.document_count();
-    let total_length = segment.total_length();
     race_point("merge:built");
-    (blob, docs, total_length)
+    built
 }
 
-/// Compatibility fallback for aggregate input beyond the direct API's limits.
-unsafe fn merge_segments_reconstructed(
-    index: pg_sys::Relation,
-    entries: &[SegmentEntry],
-) -> (Vec<u8>, u32, u64) {
-    let mut builder = SegmentBuilder::default();
-    for entry in entries {
-        pgrx::check_for_interrupts!();
-        let label = generation_label(entry.generation);
-        let bytes = unsafe { read_run(index, entry.run, &label) };
-        let segment = codec_in(Segment::parse(&bytes), &label);
-        let dead = unsafe { dead_set(index, entry, &segment) };
-        for record in codec_in(segment.records(|tid| dead.contains(&tid)), &label) {
-            pgrx::check_for_interrupts!();
-            codec_in(builder.add_record(&record), &label);
-        }
-    }
-    finish_builder(builder)
-}
+// --- Sealing and promotion ------------------------------------------------------
+//
+// The write buffer is TIN's mutable write segment. When it is full it is
+// sealed in place: its chain stops taking documents and joins the sealed
+// list, and a fresh chain takes the next insert. Sealing writes one page.
+// Promotion turns a sealed write segment into an immutable segment: it is
+// built from the sealed chain without the meta lock and published as one
+// directory change that adds the segment and retires the chain. Until then
+// readers see the sealed documents through the sealed chain, as a mutable
+// source: its documents count towards BM25's statistics but not towards
+// elision, which counts immutable segments only (TIN's rule).
 
-/// The write buffer's documents as one segment blob, with its document
-/// count and total length.
-///
-/// # Safety
-/// The caller holds the meta page of `index`; `buffer` is what it records.
-unsafe fn buffer_segment(index: pg_sys::Relation, buffer: &BufferState) -> (Vec<u8>, u32, u64) {
-    let stream = unsafe { read_buffer_stream(index, buffer) };
-    let mut builder = SegmentBuilder::default();
-    for record in segment::forward::records(&stream) {
-        codec_in(
-            builder.add_record(&codec_in(record, "write buffer")),
-            "write buffer",
-        );
-    }
-    finish_builder(builder)
-}
-
-/// Folds the write buffer into a new segment, spends up to `budget` input
-/// documents on merges under the lock, and starts the buffer over with the
-/// encoded documents `records` (see [`replace_buffer`]).
+/// Seals the write buffer and starts an empty one. Writes one page, the new
+/// buffer's head; the sealed chain is left as it is.
 ///
 /// # Safety
 /// The caller holds the meta page of `index` exclusively; `meta` is what it
-/// records, the buffer holds a document, and the directory has room.
-unsafe fn fold(index: pg_sys::Relation, meta: &mut Meta, records: &[u8], docs: u32, budget: u64) {
+/// records, the buffer holds a document and the sealed list has room.
+unsafe fn seal(index: pg_sys::Relation, meta: &mut Meta) {
     unsafe {
-        let (blob, folded, total_length) = buffer_segment(index, &meta.buffer);
-        add_segment(index, meta, blob, folded, total_length, budget);
-        replace_buffer(index, &mut meta.buffer, records, docs);
+        let head = Buffer::allocate(index);
+        write_page(
+            index,
+            &head,
+            true,
+            KIND_BUFFER,
+            &layout::chain_payload(NONE, &[]),
+        );
+        let stamp = meta.next_generation;
+        meta.next_generation = meta.next_generation.checked_add(1).unwrap_or_else(|| {
+            pgrx::error!("Stannum segment generations exhausted; REINDEX required")
+        });
+        let old = meta.buffer;
+        meta.sealed.push(BufferState {
+            epoch: stamp,
+            ..old
+        });
+        meta.buffer = BufferState {
+            version: old.version.wrapping_add(1),
+            epoch: old.epoch.wrapping_add(1),
+            head: head.block(),
+            tail: head.block(),
+            tail_used: 0,
+            bytes: 0,
+            docs: 0,
+        };
     }
+}
+
+/// Splits encoded forward records into consecutive pieces of at most `cap`
+/// bytes each (a record larger than `cap` alone), and into at most `pieces`
+/// pieces whatever the cap.
+fn split_records(stream: &[u8], cap: Option<u64>, pieces: usize) -> Vec<Vec<ForwardRecord>> {
+    let mut records: Vec<(ForwardRecord, u64)> = Vec::new();
+    let mut at = 0usize;
+    while at < stream.len() {
+        let (record, len) = codec_in(ForwardRecord::decode(&stream[at..]), "sealed write segment");
+        records.push((record, len as u64));
+        at += len;
+    }
+    let pieces = pieces.max(1);
+    let total: u64 = records.iter().map(|(_, len)| *len).sum();
+    let floor = total.div_ceil(pieces as u64);
+    let cap = cap.map_or(u64::MAX, |cap| cap.max(floor));
+    let mut out: Vec<Vec<(ForwardRecord, u64)>> = vec![Vec::new()];
+    let mut used = 0u64;
+    for (record, len) in records {
+        if !out.last().expect("a piece").is_empty() && used + len > cap {
+            out.push(Vec::new());
+            used = 0;
+        }
+        used += len;
+        out.last_mut().expect("a piece").push((record, len));
+    }
+    if out.len() > pieces {
+        // Records of uneven sizes packed under the floor can need more
+        // pieces than the bound: split by count instead.
+        let records: Vec<_> = out.into_iter().flatten().collect();
+        let per = records.len().div_ceil(pieces);
+        let mut even = Vec::with_capacity(pieces);
+        let mut records = records.into_iter().peekable();
+        while records.peek().is_some() {
+            even.push(records.by_ref().take(per).collect::<Vec<_>>());
+        }
+        out = even;
+    }
+    out.into_iter()
+        .map(|piece| piece.into_iter().map(|(record, _)| record).collect())
+        .collect()
+}
+
+/// What promoting one sealed write segment built.
+struct Promoted {
+    built: Vec<Built>,
+    /// Distinct terms over every piece.
+    terms: u64,
+}
+
+/// Builds the segments a sealed write segment promotes into: one, or with
+/// `cap` pieces of about `cap` encoded bytes, at most `pieces`.
+fn promoted_segments(stream: &[u8], cap: Option<u64>, pieces: usize) -> Promoted {
+    let split = split_records(stream, cap, pieces);
+    let several = split.len() > 1;
+    let mut terms = rustc_hash::FxHashSet::<String>::default();
+    let mut built = Vec::with_capacity(split.len());
+    for piece in split {
+        let mut builder = SegmentBuilder::default();
+        for record in &piece {
+            pgrx::check_for_interrupts!();
+            if several {
+                terms.extend(record.terms.iter().map(|term| term.term.clone()));
+            }
+            codec_in(builder.add_record(record), "sealed write segment");
+        }
+        built.extend(finish_builder(builder));
+    }
+    let terms = if several {
+        terms.len() as u64
+    } else {
+        built.first().map_or(0, |built| built.terms)
+    };
+    Promoted { built, terms }
+}
+
+/// Promotes up to `limit` sealed write segments, oldest first, each into an
+/// immutable segment of origin promotion (with `cap`, several of about `cap`
+/// encoded bytes), spending up to `budget` input documents on merges under
+/// the lock as each is published. Each is built without the meta lock,
+/// under the maintenance lock, so that neither another promotion nor
+/// VACUUM's orphan pass touches what it writes before publication, and is
+/// published only if the sealed segment is still listed unchanged: the
+/// segments join the directory and the sealed chain is retired in one meta
+/// page write.
+///
+/// # Safety
+/// `index` is a live LDP2 index the caller may write; no buffer is locked.
+pub unsafe fn promote_sealed(
+    index: pg_sys::Relation,
+    limit: usize,
+    cap: Option<u64>,
+    budget: u64,
+) -> FoldReport {
+    let mut report = FoldReport::default();
+    unsafe { lock_maintenance(index) };
+    let mut attempts = 0;
+    while (report.consumed as usize) < limit && attempts < 2 * MAX_SEALED + 2 * limit {
+        attempts += 1;
+        pgrx::check_for_interrupts!();
+        let meta = unsafe { read_meta(index, false) }.1;
+        let Some(state) = meta.sealed.first().copied() else {
+            break;
+        };
+        let identity = meta.identity;
+        let room = MAX_SEGMENTS.saturating_sub(meta.segments.len());
+        if room == 0 {
+            unsafe { make_room(index, identity) };
+            continue;
+        }
+        let stream = unsafe { read_buffer_stream(index, &state) };
+        let (chain, ended) =
+            unsafe { verify::chain_pages(index, state.head, u32::MAX, &[KIND_BUFFER]) };
+        if ended != NONE || chain.is_empty() {
+            // Rewritten by VACUUM meanwhile: look again.
+            continue;
+        }
+        let promoted = promoted_segments(&stream, cap, room);
+        drop(stream);
+        race_point("promote:built");
+        let mut runs = Vec::with_capacity(promoted.built.len());
+        for built in &promoted.built {
+            runs.push(unsafe { write_segment_run(index, &built.blob) });
+        }
+        race_point("promote:written");
+        let (guard, mut meta) = unsafe { read_meta(index, true) };
+        if meta.identity != identity
+            || meta.sealed.first() != Some(&state)
+            || meta.segments.len() + runs.len() > MAX_SEGMENTS
+        {
+            drop(guard);
+            for (run, map) in runs {
+                unsafe {
+                    discard_run(index, run);
+                    discard_run(index, map);
+                }
+            }
+            continue;
+        }
+        meta.sealed.remove(0);
+        for ((run, map), built) in runs.into_iter().zip(&promoted.built) {
+            let entry = new_entry(&mut meta, run, map, built, Origin::Promotion);
+            meta.segments.push(entry);
+        }
+        let retired = Run {
+            first: state.head,
+            blocks: chain.len() as u32,
+            bytes: state.bytes,
+            last: *chain.last().expect("a chain has a head"),
+        };
+        let lengths: u64 = promoted.built.iter().map(|built| built.total_length).sum();
+        note_retired(
+            &mut meta,
+            layout::Retired {
+                first: state.head,
+                pages: chain.len() as u32,
+                docs: state.docs,
+                total_length: lengths,
+            },
+        );
+        unsafe {
+            release(index, &mut meta, retired);
+            maintain(index, &mut meta, budget);
+        }
+        race_point("promote:released");
+        unsafe { write_meta(index, &guard, &meta) };
+        drop(guard);
+        pgrx::check_for_interrupts!();
+        report.consumed += 1;
+        report.segments += promoted.built.len() as u32;
+        report.docs += promoted
+            .built
+            .iter()
+            .map(|built| u64::from(built.documents))
+            .sum::<u64>();
+        report.terms += promoted.terms;
+    }
+    unsafe { unlock_maintenance(index) };
+    report
 }
 
 // --- Build --------------------------------------------------------------------
@@ -2719,6 +3715,8 @@ unsafe fn empty_meta(index: pg_sys::Relation) -> Meta {
             next_generation: 1,
             segments: Vec::new(),
             pending: Vec::new(),
+            sealed: Vec::new(),
+            retired: Vec::new(),
         }
     }
 }
@@ -2826,15 +3824,17 @@ impl Builder {
             return;
         }
         let builder = std::mem::take(&mut self.segment);
-        let (blob, docs, total_length) = finish_builder(builder);
+        let Some(built) = finish_builder(builder) else {
+            return;
+        };
         unsafe {
             lock_maintenance(index);
             let identity = read_meta(index, false).1.identity;
             make_room(index, identity);
-            let (run, map) = write_segment_run(index, &blob);
-            drop(blob);
+            let (run, map) = write_segment_run(index, &built.blob);
             let (meta_buffer, mut meta) = read_meta(index, true);
-            let entry = new_entry(&mut meta, run, map, docs, total_length);
+            let entry = new_entry(&mut meta, run, map, &built, Origin::Build);
+            drop(built);
             meta.segments.push(entry);
             write_meta(index, &meta_buffer, &meta);
             drop(meta_buffer);
@@ -2864,13 +3864,18 @@ impl Builder {
                 // than a bounded slice per later insert; a built relation is
                 // its live segments and nothing else.
                 let pending = std::mem::take(&mut meta.pending);
+                meta.retired.clear();
                 write_meta(index, &meta_buffer, &meta);
                 drop(meta_buffer);
                 for retired in pending {
                     pgrx::check_for_interrupts!();
                     wal::log_reclaim(index, retired.xid);
-                    let (pages, _) =
-                        verify::chain_pages(index, retired.run.first, retired.run.blocks, KIND_RUN);
+                    let (pages, _) = verify::chain_pages(
+                        index,
+                        retired.run.first,
+                        retired.run.blocks,
+                        verify::RETIRED,
+                    );
                     free_pages(index, &pages, retired.xid);
                 }
                 pack(index);
@@ -2926,7 +3931,7 @@ unsafe fn pack(index: pg_sys::Relation) {
             }
             let (map, _) = write_run_into(index, &table, &mut free);
             for old in [entry.run, entry.map] {
-                let (pages, _) = verify::chain_pages(index, old.first, old.blocks, KIND_RUN);
+                let (pages, _) = verify::chain_pages(index, old.first, old.blocks, &[KIND_RUN]);
                 free_pages(index, &pages, stamp);
                 free.extend(pages);
             }
@@ -3053,9 +4058,9 @@ unsafe fn compact(index: pg_sys::Relation) {
 
 // --- Insert -------------------------------------------------------------------
 
-/// Whether appending a record of `bytes` to `buffer` folds it first: the
+/// Whether appending a record of `bytes` to `buffer` seals it first: the
 /// buffer holds a document and the record would pass either cap.
-unsafe fn folds(index: pg_sys::Relation, buffer: &BufferState, bytes: usize) -> bool {
+unsafe fn seals(index: pg_sys::Relation, buffer: &BufferState, bytes: usize) -> bool {
     buffer.docs > 0
         && (buffer.bytes as usize + bytes > unsafe { write_buffer_bytes(index) }
             || buffer.docs >= WRITE_BUFFER_DOCS.get().max(1) as u32)
@@ -3103,19 +4108,16 @@ pub unsafe fn insert(
                     drop(guard);
                     break None;
                 }
-                if current.segments.len() < MAX_SEGMENTS
-                    || !folds(index, &current.buffer, bytes.len())
+                if current.sealed.len() < MAX_SEALED || !seals(index, &current.buffer, bytes.len())
                 {
                     break Some((guard, current));
                 }
-                // The fold would overflow the on-disk directory. Merging to
-                // make room under this lock would hold off cancellation and
-                // every reader for as long as the merge takes, whatever its
-                // size, so it runs unlocked and this insert looks again.
+                // A third sealed write segment: the oldest is promoted first,
+                // without this lock, which would hold off cancellation and
+                // every reader for as long as the build takes, and this insert
+                // looks again.
                 drop(guard);
-                lock_maintenance(index);
-                make_room(index, identity);
-                unlock_maintenance(index);
+                promote_sealed(index, 1, None, 0);
             };
             if let Some((guard, current)) = locked {
                 // Use the latest buffer/directory. Appends, folds and VACUUM
@@ -3126,39 +4128,40 @@ pub unsafe fn insert(
             // validate the persisted tokenizer nevertheless, never publishing
             // bytes encoded for a different index identity or pipeline.
         };
-        let folded = folds(index, &meta.buffer, bytes.len());
-        // Who runs the merges this fold leaves behind (see
-        // crate::maintenance): a worker, this session, or nobody. When
-        // nobody here does, the fold spends no merge budget under the lock.
-        let plan = if folded {
+        let sealed = seals(index, &meta.buffer, bytes.len());
+        // Who promotes the write segment this seal leaves behind and runs
+        // the merges after it (see crate::maintenance): a worker, this
+        // session after publishing, or nobody until promote(), VACUUM or a
+        // third seal.
+        let plan = if sealed {
             crate::maintenance::plan(index)
         } else {
             crate::maintenance::Plan::Skip
         };
-        if folded {
-            let budget = match plan {
-                crate::maintenance::Plan::Inline => MAX_MERGE_DOCS.get().max(0) as u64,
-                crate::maintenance::Plan::Defer | crate::maintenance::Plan::Skip => 0,
-            };
-            fold(index, &mut meta, &bytes, 1, budget);
-        } else {
-            append_to_buffer(index, &mut meta.buffer, &bytes);
-            meta.buffer.docs += 1;
+        if sealed {
+            seal(index, &mut meta);
+            race_point("insert:sealed");
         }
+        append_to_buffer(index, &mut meta.buffer, &bytes);
+        meta.buffer.docs += 1;
         race_point("insert:buffered");
         write_meta(index, &meta_buffer, &meta);
         drop(meta_buffer);
         // Buffer content locks defer PostgreSQL cancel/die interrupts.
         // Publication is complete; deliver any pending cancel now.
         pgrx::check_for_interrupts!();
+        let inline = || {
+            promote_sealed(index, MAX_SEALED, None, MAX_MERGE_DOCS.get().max(0) as u64);
+            merge_deferred(index);
+        };
         match plan {
             crate::maintenance::Plan::Defer => {
-                if !crate::maintenance::request(index, crate::maintenance::queue::kind::AFTER_FOLD)
+                if !crate::maintenance::request(index, crate::maintenance::queue::kind::AFTER_SEAL)
                 {
-                    merge_deferred(index);
+                    inline();
                 }
             }
-            crate::maintenance::Plan::Inline => merge_deferred(index),
+            crate::maintenance::Plan::Inline => inline(),
             crate::maintenance::Plan::Skip => {}
         }
     }
@@ -3243,45 +4246,6 @@ unsafe fn merge_deferred(index: pg_sys::Relation) {
 
 use crate::maintenance::ops::{FoldReport, MergeReport, MergeRequest, PassReport, PassRequest};
 
-/// Folds the write buffer into a segment now, whatever its size, and
-/// leaves it empty; merges nothing. An empty buffer is left alone. A
-/// directory at its on-disk bound first makes room, as an insert does.
-///
-/// # Safety
-/// `index` is a live LDP2 index the caller may write; no buffer is locked.
-pub unsafe fn fold_buffer(index: pg_sys::Relation) -> FoldReport {
-    unsafe {
-        loop {
-            pgrx::check_for_interrupts!();
-            let (guard, mut meta) = read_meta(index, true);
-            if meta.buffer.docs == 0 {
-                return FoldReport::default();
-            }
-            if meta.segments.len() >= MAX_SEGMENTS {
-                let identity = meta.identity;
-                drop(guard);
-                lock_maintenance(index);
-                make_room(index, identity);
-                unlock_maintenance(index);
-                continue;
-            }
-            let (blob, docs, total_length) = buffer_segment(index, &meta.buffer);
-            let terms = codec(codec(Segment::parse(&blob)).dictionary()).len() as u64;
-            add_segment(index, &mut meta, blob, docs, total_length, 0);
-            replace_buffer(index, &mut meta.buffer, &[], 0);
-            race_point("promote:folded");
-            write_meta(index, &guard, &meta);
-            drop(guard);
-            pgrx::check_for_interrupts!();
-            return FoldReport {
-                docs: u64::from(docs),
-                terms,
-                segments: 1,
-            };
-        }
-    }
-}
-
 /// Merges the smallest segments, at most `max_fan_in` at a time and within
 /// the merge input cap, until the directory holds `target` segments. Each
 /// merge is built without the meta lock under the maintenance lock and
@@ -3360,11 +4324,369 @@ pub unsafe fn merge_toward(index: pg_sys::Relation, request: MergeRequest) -> Me
 /// `index` is a live LDP2 index the caller may write; no buffer is locked.
 pub unsafe fn maintenance_pass(index: pg_sys::Relation, request: PassRequest) -> PassReport {
     unsafe {
+        if request.promote {
+            promote_sealed(index, MAX_SEALED, None, 0);
+        }
         if request.reclaim {
             reclaim_pending(index);
         }
         let (merges, rewrites) = maintain_directory(index, request.merge, request.rewrite, true);
         PassReport { merges, rewrites }
+    }
+}
+
+// --- Ctid-native reads ------------------------------------------------------------
+//
+// The engine's ctid-native paths (`engine::tinshape`) read a segment as one
+// blob. A backend keeps a blob per segment that loads what its queries read
+// (`segment::tinshape::blob::LazyBlob`), a chunk at a time: a term's
+// postings record when a query names it, the entries of a common word's
+// positions a phrase checks and the DL sidecar's blocks the scored
+// documents fall in, not whole areas. The document set is the reader's,
+// decoded once from a transient read. What a backend keeps counts against
+// `stannum.reader_cache_mb` (see [`trim_reader_cache`]).
+
+use segment::tinshape::blob::LazyBlob;
+
+/// An empty term map's index: the native paths find their terms through
+/// the paged reader and seed the segment's memo with them, so the
+/// assembled segment never walks its own term map.
+const NO_TERMS: &[u8] = &[0, 0, 0];
+
+/// A segment's liveness in slot space, with the dead run it was decoded
+/// from.
+type PublishedLiveness = ((Run, u32), Rc<segment::tinshape::docs::Liveness>);
+
+/// Scoring terms opened for rows scored one at a time, by name.
+type RowTerms = (Vec<String>, Vec<Option<engine::tinshape::TermSet<'static>>>);
+
+/// A segment's reader as the source its lazy blob loads from.
+struct ReaderSource(SharedReader);
+
+impl segment::source::Source for ReaderSource {
+    fn len(&self) -> u64 {
+        self.0.source().len()
+    }
+
+    fn read(&self, offset: u64, len: usize) -> segment::Result<Vec<u8>> {
+        self.0.source().read(offset, len)
+    }
+
+    fn hold(&self, open: bool) {
+        self.0.source().hold(open);
+    }
+
+    fn holding(&self) -> bool {
+        self.0.source().holding()
+    }
+
+    fn page_len(&self) -> usize {
+        self.0.source().page_len()
+    }
+
+    fn pinned_page(&self, offset: u64) -> Option<segment::Result<segment::source::HeldSpan>> {
+        self.0.source().pinned_page(offset)
+    }
+
+    fn release_page(&self, offset: u64) {
+        self.0.source().release_page(offset);
+    }
+}
+
+/// What the ctid-native paths keep of a segment in this backend.
+#[derive(Default)]
+pub(crate) struct Native {
+    /// The terms rows were last scored by, opened over `segment` and kept
+    /// with it ([`with_native_rows`]). Declared before `segment` and
+    /// `blob`, whose bytes they borrow, so they are dropped first.
+    rows: RefCell<Option<RowTerms>>,
+    /// The segment assembled over `blob`, kept while the liveness stays, so
+    /// the records it parsed are parsed once (a row scored alone asks for
+    /// the same terms per row). Declared before `blob`: it borrows its bytes.
+    segment: RefCell<Option<segment::tinshape::segment::Segment<'static>>>,
+    /// The blob, loading what queries read. Boxed, so its address is
+    /// stable while `segment` borrows it.
+    blob: std::cell::OnceCell<Box<LazyBlob>>,
+    /// The published liveness in slot space, with the dead run it is of.
+    liveness: RefCell<Option<PublishedLiveness>>,
+    /// The bytes the liveness holds, counted once when it is decoded: a
+    /// view counts every segment's bytes per query, and counting them
+    /// walks the liveness's groups (tens of thousands a segment at 150M).
+    liveness_bytes: Cell<usize>,
+    /// Footers the ranked walks decoded, kept across the segments
+    /// [`with_native`] assembles.
+    footers: Rc<RefCell<segment::tinshape::segment::FooterCache>>,
+    /// Term-map lookups made so far: a row scored alone asks for the same
+    /// terms once per row.
+    terms: RefCell<FxHashMap<String, Option<TermEntry>>>,
+    /// Set while a walk runs over the segment.
+    busy: Cell<bool>,
+}
+
+impl Native {
+    /// Halves the larger of the segment's parsed-record and footer memos,
+    /// least recently used first.
+    fn shed(&self) {
+        if let Ok(segment) = self.segment.try_borrow()
+            && let Some(segment) = segment.as_ref()
+        {
+            let held = segment.memo_bytes().max(self.footers.borrow().bytes());
+            segment.shed(held / 2);
+        }
+    }
+
+    /// Bytes the native paths keep for the segment in this backend.
+    fn bytes(&self) -> usize {
+        let blob = self
+            .blob
+            .get()
+            .map_or(0, |blob| blob.loaded() + blob.overhead());
+        let liveness = self.liveness_bytes.get();
+        let parsed = self.segment.borrow().as_ref().map_or(0, |s| s.memo_bytes());
+        let terms = self.terms.borrow().len() * 64;
+        blob + liveness + parsed + terms + self.footers.borrow().bytes()
+    }
+}
+
+/// A view's immutable source `i` as a ctid-addressed segment, for the
+/// engine's ctid-native paths: `f` runs over the segment with `names`'
+/// term-map entries memoized and the liveness VACUUM published; whatever
+/// `f` reads loads on demand. `None` when the source has no native reader.
+pub(crate) fn with_native<R>(
+    view: &View,
+    i: usize,
+    names: &[String],
+    f: impl FnOnce(&segment::tinshape::segment::Segment<'_>) -> segment::Result<R>,
+) -> Option<segment::Result<R>> {
+    crate::score::charging("native read", || {
+        native_segment(view, i, names, NATIVE_IN_PLACE.get(), |_, segment| {
+            f(segment)
+        })
+    })
+}
+
+/// [`with_native`] for rows scored one at a time by the terms `names`:
+/// `f` gets the terms opened over the segment, kept between calls (and
+/// dropped with the segment), so a row in the group of the last reads no
+/// container again.
+pub(crate) fn with_native_rows<R>(
+    view: &View,
+    i: usize,
+    names: &[String],
+    f: impl for<'a> FnOnce(
+        &segment::tinshape::segment::Segment<'a>,
+        &mut [Option<engine::tinshape::TermSet<'a>>],
+    ) -> segment::Result<R>,
+) -> Option<segment::Result<R>> {
+    // Outside a span: the terms are kept between rows, so what they read
+    // must outlive the call, and is copied into the blob.
+    crate::score::charging("native row read", || {
+        native_segment(view, i, names, false, |native, segment| {
+            let mut rows = native.rows.borrow_mut();
+            if rows
+                .as_ref()
+                .is_none_or(|(held, _)| held.as_slice() != names)
+            {
+                *rows = None;
+                let mut sets = Vec::with_capacity(names.len());
+                for name in names {
+                    sets.push(engine::tinshape::TermSet::open(
+                        segment,
+                        name,
+                        &mut engine::tinshape::NoTouch,
+                    )?);
+                }
+                *rows = Some((names.to_vec(), sets));
+            }
+            let (_, sets) = rows.as_mut().expect("opened above");
+            f(segment, sets)
+        })
+    })
+}
+
+/// Whether source `i` of `view`, a segment in TIN's shape, lists `tid`
+/// (live or dead); `None` when the source has no native reader. A row
+/// scored alone is looked for in each source in turn, and finding the one
+/// holding it from the segment's document set costs a lookup, where
+/// assembling each segment for the row's terms cost a term lookup per term
+/// per segment per row.
+pub(crate) fn native_holds(view: &View, i: usize, tid: segment::Tid) -> Option<bool> {
+    let (reader, _) = view.natives.get(i)?.as_ref()?;
+    let docs = reader.docs().ok()?;
+    Some(
+        docs.geometry
+            .slot_of(tid)
+            .is_some_and(|slot| docs.rank(slot).is_some()),
+    )
+}
+
+/// Clears [`Native::busy`] when a walk ends, unwinding or not.
+struct NotBusy<'a>(&'a Cell<bool>);
+
+impl Drop for NotBusy<'_> {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
+/// Closes a native read's span (see [`native_segment`]) when the read
+/// ends, unwinding or not: forgets the parsed records that borrow the
+/// span's pages, then releases them.
+struct Span<'a> {
+    native: &'a Native,
+    blob: &'a LazyBlob,
+}
+
+impl Drop for Span<'_> {
+    fn drop(&mut self) {
+        if let Ok(segment) = self.native.segment.try_borrow()
+            && let Some(segment) = segment.as_ref()
+        {
+            segment.forget_borrowed();
+        }
+        // SAFETY: the walk that read within the span has returned or
+        // unwound, and `f`'s result cannot borrow the segment; the records
+        // the segment keeps past the span borrow nothing (above), and the
+        // rows' terms are read outside spans.
+        unsafe { self.blob.close_span() };
+    }
+}
+
+/// [`with_native`] with the segment kept in `Native` (`'static`: it
+/// borrows the boxed blob `Native` keeps and drops after it).
+///
+/// With `in_place`, `f` reads within a span of the blob: what it reads is
+/// read in place from pinned shared buffers (or stitched, across a page
+/// boundary) and nothing of it is kept, rather than copied into the blob
+/// for later queries. At 150 million rows the copies overflowed the
+/// backend's budget and every query made them again.
+fn native_segment<R>(
+    view: &View,
+    i: usize,
+    names: &[String],
+    in_place: bool,
+    f: impl FnOnce(&Native, &segment::tinshape::segment::Segment<'static>) -> segment::Result<R>,
+) -> Option<segment::Result<R>> {
+    let (reader, native) = view.natives.get(i)?.as_ref()?;
+    // A query run inside another's walk over the same segment (a filter's
+    // subquery) reads it the ordinal way: the outer walk holds its terms.
+    if native.busy.replace(true) {
+        return None;
+    }
+    let _busy = NotBusy(&native.busy);
+    Some((|| {
+        let header = *reader.header();
+        let mut entries = Vec::with_capacity(names.len());
+        for name in names {
+            let known = native.terms.borrow().get(name.as_str()).copied();
+            let entry = match known {
+                Some(entry) => entry,
+                None => {
+                    let entry = reader.term_entry(name)?;
+                    let mut terms = native.terms.borrow_mut();
+                    if terms.len() >= TERM_MEMO_LIMIT {
+                        terms.clear();
+                    }
+                    terms.insert(name.clone(), entry);
+                    entry
+                }
+            };
+            entries.push(entry);
+        }
+        let blob = native
+            .blob
+            .get_or_init(|| Box::new(LazyBlob::new(Box::new(ReaderSource(reader.clone())))));
+        let _span = in_place.then(|| {
+            blob.open_span();
+            Span { native, blob }
+        });
+        // The reader's, decoded once from a transient read (and counted in
+        // its cached bytes): the blob keeps no copy of the set's bytes.
+        let docs = reader.docs()?;
+        let dead = view.dead_runs[i];
+        let mut liveness = native.liveness.borrow_mut();
+        if liveness.as_ref().is_none_or(|(run, _)| *run != dead) {
+            let set = &view.dead_sets[i];
+            let ranks: Vec<u32> = if set.is_empty() {
+                Vec::new()
+            } else {
+                (0..header.documents)
+                    .filter(|rank| set.contains(*rank))
+                    .collect()
+            };
+            let found = segment::tinshape::docs::Liveness::decode(
+                &segment::tinshape::docs::encode_liveness(header.documents, &ranks),
+                &docs,
+            )?;
+            native.liveness_bytes.set(found.heap_bytes());
+            *liveness = Some((dead, Rc::new(found)));
+        }
+        let live = liveness.as_ref().expect("decoded above").1.clone();
+        drop(liveness);
+        let mut cached = native.segment.borrow_mut();
+        if cached
+            .as_ref()
+            .is_some_and(|segment| !Rc::ptr_eq(&segment.liveness, &live))
+        {
+            native.rows.borrow_mut().take();
+            *cached = None;
+        }
+        if cached.is_none() {
+            // SAFETY: the blob is boxed, so its address never moves, and
+            // `native` drops it after `segment` and `rows`, which borrow it;
+            // nothing else replaces it while `native` lives.
+            let blob: &'static LazyBlob = unsafe { &*std::ptr::from_ref::<LazyBlob>(blob) };
+            let mut segment = segment::tinshape::segment::Segment::assemble(
+                blob.bytes(),
+                segment::dictionary::DictionaryIndex::parse(NO_TERMS)?,
+                docs,
+                live,
+            )?;
+            segment.share_footers(native.footers.clone());
+            *cached = Some(segment);
+        }
+        drop(cached);
+        let cached = native.segment.borrow();
+        let segment = cached.as_ref().expect("assembled above");
+        for (name, entry) in names.iter().zip(&entries) {
+            segment.remember(name, *entry);
+        }
+        let result = f(native, segment);
+        #[cfg(feature = "pg_test")]
+        if testing::NATIVE_READ_FAULT.get() {
+            pgrx::error!("Stannum test: a fault injected at the end of a native read");
+        }
+        result
+    })())
+}
+
+/// A view's immutable source as the engine's ranked walk reads it in TIN's
+/// shape (see [`with_native`]).
+pub(crate) struct NativeSource<'v> {
+    view: &'v View,
+    i: usize,
+}
+
+/// Per source of `view`, its native reader if it has one.
+pub(crate) fn natives(view: &View) -> Vec<Option<NativeSource<'_>>> {
+    (0..view.sources.len())
+        .map(|i| {
+            view.natives
+                .get(i)
+                .is_some_and(Option::is_some)
+                .then_some(NativeSource { view, i })
+        })
+        .collect()
+}
+
+impl engine::walk::NativeSegment for NativeSource<'_> {
+    fn walk(
+        &self,
+        names: &[String],
+        _positions: bool,
+        walk: &mut dyn FnMut(&segment::tinshape::segment::Segment<'_>) -> segment::Result<()>,
+    ) -> Option<segment::Result<()>> {
+        with_native(self.view, self.i, names, |segment| walk(segment))
     }
 }
 
@@ -3379,7 +4701,8 @@ pub type Source = (Box<dyn Index>, Option<Rc<Vec<u8>>>);
 /// Segment pages are fetched on demand through the readers; the view keeps
 /// the index relation open for as long as it lives.
 pub struct View {
-    /// Immutable segments first, then the write buffer as in-memory segments.
+    /// Immutable segments first, then the sealed write segments and the
+    /// write buffer as in-memory segments.
     pub sources: Vec<Source>,
     /// How many leading entries of `sources` are immutable segments.
     pub immutable_sources: usize,
@@ -3396,6 +4719,12 @@ pub struct View {
     /// The write buffer's epoch: VACUUM starts a new one when it rewrites
     /// the buffer without the documents it removed.
     buffer_epoch: u32,
+    /// The sealed write segments' stamps: VACUUM gives a sealed segment it
+    /// rewrites without the documents it removed a new one.
+    sealed_stamps: Vec<u32>,
+    /// Per immutable source, its reader and what the ctid-native paths keep
+    /// (see [`with_native`]).
+    natives: Vec<Option<(SharedReader, Rc<Native>)>>,
 }
 
 /// Whether the directory still lists exactly `view`'s segments with the dead
@@ -3412,6 +4741,11 @@ pub unsafe fn view_is_current(index_oid: pg_sys::Oid, view: &View) -> bool {
         let relation = PgRelation::with_lock(index_oid, pg_sys::AccessShareLock as _);
         let (_buffer, meta) = read_meta(relation.as_ptr(), false);
         meta.buffer.epoch == view.buffer_epoch
+            && meta
+                .sealed
+                .iter()
+                .map(|state| state.epoch)
+                .eq(view.sealed_stamps.iter().copied())
             && meta.segments.len() == view.keys.len()
             && meta
                 .segments
@@ -3456,8 +4790,15 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 );
             }
             let published = recovery.then(|| meta_buffer.lsn());
+            let sealed: Option<Vec<Rc<MutableIndex>>> = meta
+                .sealed
+                .iter()
+                .map(|state| sealed_index(index, meta.identity, state, published))
+                .collect();
             let buffer = if meta.buffer.docs > 0 {
-                match buffer_index(index, meta.identity, &meta.buffer, published) {
+                match buffer_index(index, meta.identity, &meta.buffer, published)
+                    .filter(|_| sealed.is_some())
+                {
                     Some(buffer) => Some(buffer),
                     None => {
                         // Replay changed a buffer page after the meta page we
@@ -3478,6 +4819,12 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 }
             } else {
                 None
+            };
+            let Some(sealed) = sealed else {
+                drop(meta_buffer);
+                stale_reads += 1;
+                pg_sys::pg_usleep(1000);
+                continue;
             };
             // The meta page is released before the segment readers load:
             // segment runs are freed only past every snapshot that could
@@ -3500,22 +4847,30 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 .map(|entry| (entry.dead, entry.dead_stamp))
                 .collect();
             trim_reader_cache(meta.identity, &meta);
+            let mut natives = Vec::with_capacity(meta.segments.len());
             for entry in &meta.segments {
                 pgrx::check_for_interrupts!();
-                let (segment, dead, dead_set) =
+                let (segment, dead, dead_set, native) =
                     cached_segment(index, index_oid, meta.identity, entry);
+                natives.push(Some((segment.reader.clone(), native)));
                 sources.push((Box::new(segment), dead));
                 labels.push(generation_label(entry.generation));
                 dead_sets.push(dead_set);
             }
             let immutable_sources = sources.len();
+            for sealed in sealed {
+                sources.push((Box::new(sealed), None));
+                labels.push("sealed write segment".to_owned());
+                dead_sets.push(Rc::default());
+            }
             if let Some(buffer) = buffer {
                 sources.push((Box::new(buffer), None));
                 labels.push("write buffer".to_owned());
                 dead_sets.push(Rc::default());
             }
-            // Segments are immutable; the buffer index was extended under the
-            // shared meta lock, so a fold cannot rewrite pages underneath it.
+            // Segments are immutable; the buffer index was extended and the
+            // sealed ones built under the shared meta lock, so neither a seal
+            // nor VACUUM rewrote pages underneath them.
             drop(relation);
             return View {
                 sources,
@@ -3525,6 +4880,8 @@ unsafe fn view_inner(index_oid: pg_sys::Oid) -> View {
                 keys,
                 dead_runs,
                 buffer_epoch: meta.buffer.epoch,
+                sealed_stamps: meta.sealed.iter().map(|state| state.epoch).collect(),
+                natives,
             };
         }
     }
@@ -3564,8 +4921,26 @@ pub unsafe fn scan(
             }
         };
 
-        for ((segment, dead_bytes), label) in view.sources.iter().zip(&view.labels) {
+        // Segments in TIN's shape fold the query over their ctid sets; the
+        // write buffer, sealed segments and queries that do not lower are
+        // planned over ordinal streams.
+        let lowering = crate::native::Lowering::new(queries);
+        for (i, ((segment, dead_bytes), label)) in view.sources.iter().zip(&view.labels).enumerate()
+        {
             pgrx::check_for_interrupts!();
+            if let Some(lowered) = lowering.get(&view, i)
+                && crate::native::visit_matches(&view, i, &lowered, &mut |tid| {
+                    pending.push(pointer_of(tid));
+                    added += 1;
+                    if pending.len() == BITMAP_BATCH {
+                        pgrx::check_for_interrupts!();
+                        flush(&mut pending, false);
+                    }
+                })
+            {
+                flush(&mut pending, false);
+                continue;
+            }
             let mut exact = true;
             let mut cursors: Vec<Box<dyn Cursor>> = Vec::with_capacity(queries.len());
             for query in queries {
@@ -3710,7 +5085,7 @@ unsafe fn discard_run(index: pg_sys::Relation, run: Run) {
     if run.is_empty() {
         return;
     }
-    let (pages, _) = unsafe { verify::chain_pages(index, run.first, run.blocks, KIND_RUN) };
+    let (pages, _) = unsafe { verify::chain_pages(index, run.first, run.blocks, &[KIND_RUN]) };
     let stamp = unsafe { pg_sys::ReadNextTransactionId() }.into_inner();
     unsafe { free_pages(index, &pages, stamp) };
 }
@@ -3727,38 +5102,48 @@ unsafe fn scan_dead(
 ) -> Result<DeadScan, String> {
     pgrx::check_for_interrupts!();
     let label = generation_label(entry.generation);
-    let bytes = unsafe { try_read_run(index, entry.run, &label) }?;
-    let segment = Segment::parse(&bytes).map_err(|error| format!("Stannum {label}: {error}"))?;
-    let mut dead = unsafe { try_dead_set(index, entry, &segment) }?;
-    let before = dead.len();
+    let documents = unsafe { try_read_documents(index, entry, &label) }?;
+    let known = unsafe { try_dead_docs(index, entry) }?;
+    let mut dead = BTreeSet::new();
     let (mut live, mut removed) = (0u64, 0u64);
-    let mut ordinals = Vec::with_capacity(dead.len());
-    let mut documents = segment
-        .documents()
-        .map_err(|error| format!("Stannum {label}: {error}"))?;
-    while let Some(tid) = documents.current() {
-        if dead.contains(&tid) {
+    let mut ordinals = Vec::with_capacity(known.len() as usize);
+    for (rank, tid) in documents.into_iter().enumerate() {
+        let rank = rank as u32;
+        if rank.is_multiple_of(4096) {
+            pgrx::check_for_interrupts!();
+        }
+        if known.contains(rank) {
             // Already dead: nothing to report.
-            ordinals.push(documents.ordinal());
+            dead.insert(tid);
+            ordinals.push(rank);
         } else if is_dead(tid) {
             dead.insert(tid);
-            ordinals.push(documents.ordinal());
+            ordinals.push(rank);
             removed += 1;
         } else {
             live += 1;
         }
-        documents
-            .advance()
-            .map_err(|error| format!("Stannum {label}: {error}"))?;
     }
-    let grew = dead.len() != before;
     Ok((
         dead,
-        grew,
+        removed > 0,
         live,
         removed,
         segment::ordinals::encode(&ordinals),
     ))
+}
+
+/// The ctids of `entry`'s documents in rank order, read without the meta
+/// lock (see [`try_read_run`]).
+unsafe fn try_read_documents(
+    index: pg_sys::Relation,
+    entry: &SegmentEntry,
+    label: &str,
+) -> Result<Vec<Tid>, String> {
+    let bytes = unsafe { try_read_run(index, entry.run, label) }?;
+    segment::tinshape::segment::Segment::parse(&bytes)
+        .map(|segment| segment.docs.tids())
+        .map_err(|error| format!("Stannum {label}: {error}"))
 }
 
 /// Records dead tuples: per segment as a dead list, and by rewriting the write
@@ -3843,6 +5228,54 @@ pub unsafe fn bulk_delete(
                 live += scanned_live;
                 removed += scanned_removed;
             }
+            // Sealed write segments are rewritten without their dead
+            // documents into fresh chains, the old ones retired; at most two
+            // of them, each bounded by the buffer's caps.
+            let mut position = 0;
+            while position < meta.sealed.len() {
+                let state = meta.sealed[position];
+                let stream = unsafe { read_buffer_stream(index, &state) };
+                let mut kept = Vec::with_capacity(stream.len());
+                let mut kept_docs = 0u32;
+                let mut dropped = false;
+                for record in segment::forward::records(&stream) {
+                    let record = codec_in(record, "sealed write segment");
+                    if is_dead(record.tid) {
+                        removed += 1;
+                        dropped = true;
+                    } else {
+                        live += 1;
+                        kept_docs += 1;
+                        codec(record.encode(&mut kept));
+                    }
+                }
+                if !dropped {
+                    position += 1;
+                    continue;
+                }
+                changed = true;
+                let (chain, _) =
+                    unsafe { verify::chain_pages(index, state.head, u32::MAX, &[KIND_BUFFER]) };
+                let retired = Run {
+                    first: state.head,
+                    blocks: chain.len() as u32,
+                    bytes: state.bytes,
+                    last: *chain.last().expect("a chain has a head"),
+                };
+                if kept_docs == 0 {
+                    meta.sealed.remove(position);
+                } else {
+                    let stamp = meta.next_generation;
+                    meta.next_generation =
+                        meta.next_generation.checked_add(1).unwrap_or_else(|| {
+                            pgrx::error!("Stannum segment generations exhausted; REINDEX required")
+                        });
+                    meta.sealed[position] = unsafe { write_chain(index, &kept, kept_docs, stamp) };
+                    position += 1;
+                }
+                unsafe { release(index, &mut meta, retired) };
+                race_point("bulk_delete:sealed");
+            }
             if meta.buffer.docs > 0 {
                 let stream = unsafe { read_buffer_stream(index, &meta.buffer) };
                 let mut kept = Vec::with_capacity(stream.len());
@@ -3888,6 +5321,11 @@ pub unsafe fn bulk_delete(
 /// `index` is a live LDP2 index locked for VACUUM.
 pub unsafe fn cleanup(index: pg_sys::Relation) {
     unsafe {
+        // Sealed write segments wait for promote() or a third seal in
+        // manual mode, as in TIN; otherwise VACUUM promotes what is left.
+        if !crate::maintenance::manual() {
+            promote_sealed(index, MAX_SEALED, None, 0);
+        }
         maintain_segments(index);
         reclaim_pending(index);
         reclaim_orphans(index);
@@ -3993,39 +5431,18 @@ unsafe fn mostly_dead(
 
 /// Unlocked sources can be retired/reused while being read. A merge failure
 /// is corruption only when the complete captured input set still applies.
-unsafe fn maintenance_merge_blob(
+/// `None` when an input changed; `Some(None)` when every document was dead.
+unsafe fn maintenance_merge(
     index: pg_sys::Relation,
     identity: u64,
     inputs: &[SegmentEntry],
-) -> Option<Vec<u8>> {
-    use segment::merge_strategy::{Facts, Policy, Strategy};
-    let facts = Facts {
-        input_bytes: inputs.iter().map(|entry| u64::from(entry.run.bytes)).sum(),
-        documents: inputs.iter().map(|entry| u64::from(entry.docs)).sum(),
-    };
-    let policy = match VACUUM_MERGE_STRATEGY.get() {
-        VacuumMergeStrategy::Auto => Policy::Auto,
-        VacuumMergeStrategy::Direct => Policy::ForceDirect,
-        VacuumMergeStrategy::Reconstruct => Policy::ForceReconstruct,
-    };
-    let plan = segment::merge_strategy::choose(facts, policy);
-    pgrx::debug1!(
-        "Stannum unlocked merge: {:?}: {}",
-        plan.strategy,
-        plan.reason
-    );
-    if plan.strategy == Strategy::LegacyOversized {
-        return unsafe { maintenance_reconstruct_blob(index, identity, inputs) };
-    }
-    let limits = direct_merge_limits(inputs).expect("planner admitted aggregate format limits");
+) -> Option<Option<Built>> {
     let mut owned = Vec::with_capacity(inputs.len());
     for entry in inputs {
         pgrx::check_for_interrupts!();
         let label = generation_label(entry.generation);
         let read = unsafe { try_read_run(index, entry.run, &label) }.and_then(|bytes| {
-            let segment =
-                Segment::parse(&bytes).map_err(|error| format!("Stannum {label}: {error}"))?;
-            let dead = unsafe { try_dead_set(index, entry, &segment) }?;
+            let dead = unsafe { try_dead_docs(index, entry) }?;
             Ok((bytes, dead))
         });
         owned.push(unsafe { unlocked(index, identity, entry, read) }?);
@@ -4035,17 +5452,13 @@ unsafe fn maintenance_merge_blob(
     if testing::CORRUPT_MAINTENANCE_INPUT.with(|flag| flag.replace(false)) {
         owned[0].0[0] ^= 0xff;
     }
-    let sources = owned
-        .iter()
-        .map(|(bytes, dead)| segment::merge::MergeInput { bytes, dead })
-        .collect::<Vec<_>>();
-    let result = segment::merge_strategy::execute(plan.strategy, &sources, limits, || {
+    let result = merge_blobs(&owned, || {
         race_point("maintenance:checkpoint");
         pgrx::check_for_interrupts!();
-        Ok(())
     });
+    drop(owned);
     match result {
-        Ok(blob) => Some(blob),
+        Ok(built) => Some(built),
         Err(error) => {
             let (guard, meta) = unsafe { read_meta(index, false) };
             let applies = meta.identity == identity
@@ -4054,45 +5467,9 @@ unsafe fn maintenance_merge_blob(
             if !applies {
                 return None;
             }
-            match error {
-                segment::merge::MergeError::Codec(_)
-                | segment::merge::MergeError::InvalidInput { .. } => {
-                    corrupt(format!("unlocked segment merge: {error}"));
-                }
-                _ => pgrx::error!("Stannum unlocked segment merge failed: {error}"),
-            }
+            corrupt(format!("unlocked segment merge: {error}"));
         }
     }
-}
-
-/// Preserve the previous per-source path for oversized aggregate inputs.
-unsafe fn maintenance_reconstruct_blob(
-    index: pg_sys::Relation,
-    identity: u64,
-    inputs: &[SegmentEntry],
-) -> Option<Vec<u8>> {
-    let mut builder = SegmentBuilder::default();
-    for entry in inputs {
-        pgrx::check_for_interrupts!();
-        let label = generation_label(entry.generation);
-        let result = unsafe { try_read_run(index, entry.run, &label) }.and_then(|bytes| {
-            let segment =
-                Segment::parse(&bytes).map_err(|error| format!("Stannum {label}: {error}"))?;
-            let dead = unsafe { try_dead_set(index, entry, &segment) }?;
-            let records = segment
-                .records(|tid| dead.contains(&tid))
-                .map_err(|error| format!("Stannum {label}: {error}"))?;
-            for record in records {
-                pgrx::check_for_interrupts!();
-                builder
-                    .add_record(&record)
-                    .map_err(|error| format!("Stannum {label}: {error}"))?;
-            }
-            Ok(())
-        });
-        unsafe { unlocked(index, identity, entry, result) }?;
-    }
-    Some(finish_builder(builder).0)
 }
 
 /// What [`replace_entries`] published: the segment's documents (zero: the
@@ -4107,8 +5484,8 @@ struct Published {
 /// Rewrites `inputs` into one segment of their live documents, unlocked,
 /// and publishes it only if every input is still in the directory, entry
 /// for entry including the dead-list run. Returns what it published, or
-/// `None` when it did not publish. `count_postings` walks the merged
-/// segment's dictionary in memory to count its postings. A single input
+/// `None` when it did not publish; its postings only when `count_postings`
+/// asks. A single input
 /// keeps its position; several merge to the end.
 unsafe fn replace_entries(
     index: pg_sys::Relation,
@@ -4116,29 +5493,23 @@ unsafe fn replace_entries(
     inputs: &[SegmentEntry],
     count_postings: bool,
 ) -> Option<Published> {
-    let blob = unsafe { maintenance_merge_blob(index, identity, inputs) }?;
-    let segment = codec(Segment::parse(&blob));
-    let docs = segment.document_count();
-    let total_length = segment.total_length();
+    let built = unsafe { maintenance_merge(index, identity, inputs) }?;
+    let docs = built.as_ref().map_or(0, |built| built.documents);
     let postings = if count_postings {
-        let dictionary = codec(segment.dictionary());
-        let mut postings = 0u64;
-        for term in dictionary.iter_from("") {
-            postings += u64::from(codec(term).1.df);
-        }
-        postings
+        built.as_ref().map_or(0, |built| built.postings)
     } else {
         0
     };
-    let output = (docs > 0).then(|| {
-        let (run, map) = unsafe { write_segment_run(index, &blob) };
-        (run, map, docs, total_length)
+    let output = built.map(|mut built| {
+        let (run, map) = unsafe { write_segment_run(index, &built.blob) };
+        built.blob = Vec::new();
+        (run, map, built)
     });
     race_point("maintenance:built");
     let (guard, mut meta) = unsafe { read_meta(index, true) };
     if meta.identity != identity || !inputs.iter().all(|entry| meta.segments.contains(entry)) {
         drop(guard);
-        if let Some((run, map, _, _)) = output {
+        if let Some((run, map, _)) = output {
             unsafe {
                 discard_run(index, run);
                 discard_run(index, map);
@@ -4152,8 +5523,8 @@ unsafe fn replace_entries(
         .position(|entry| *entry == inputs[0])
         .expect("every input is present");
     meta.segments.retain(|entry| !inputs.contains(entry));
-    if let Some((run, map, docs, total_length)) = output {
-        let entry = new_entry(&mut meta, run, map, docs, total_length);
+    if let Some((run, map, built)) = output {
+        let entry = new_entry(&mut meta, run, map, &built, Origin::Merge);
         if inputs.len() == 1 {
             meta.segments.insert(position, entry);
         } else {
@@ -4194,7 +5565,7 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
         // held up the insert that triggered the fold for minutes.
         let limit = pending.run.blocks.min(left as u32);
         let (pages, next) =
-            unsafe { verify::chain_pages(index, pending.run.first, limit, KIND_RUN) };
+            unsafe { verify::chain_pages(index, pending.run.first, limit, verify::RETIRED) };
         left -= pages.len().min(left);
         removable.push((*pending, pages, next));
     }
@@ -4235,6 +5606,7 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
     if freeing.is_empty() {
         return;
     }
+    forget_retired(&mut meta, freeing.iter().flat_map(|(_, pages)| pages));
     unsafe { write_meta(index, &guard, &meta) };
     drop(guard);
     for (xid, pages) in freeing {
@@ -4385,6 +5757,25 @@ pub mod testing {
         pub static READER_CACHE_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
         /// Times the reader cache was emptied for exceeding its budget.
         pub static READER_CACHE_CLEARS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// Times a segment's native bytes were dropped to fit the budget.
+        pub static NATIVE_DROPS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+        /// Raise an error at the end of every native read, with what it
+        /// read still pinned.
+        pub static NATIVE_READ_FAULT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+        /// Entries added to the shared hint table's size when attaching: a
+        /// size other than the existing segment's makes the attach fail.
+        pub static HINTS_SIZE_SKEW: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    /// Bytes the cached segments' blobs copied in and keep.
+    pub fn native_loaded() -> usize {
+        SEGMENT_READERS.with_borrow(|readers| {
+            readers
+                .values()
+                .filter_map(|c| c.native.blob.get())
+                .map(|blob| blob.loaded())
+                .sum()
+        })
     }
 
     /// What a backend's per-segment caches hold for one index.
@@ -4422,6 +5813,140 @@ pub mod testing {
         }
     }
 
+    /// Has this backend attach the shared hint table again on its next
+    /// pin; whether it is attached now.
+    pub fn reattach_shared_hints() -> bool {
+        let attached = matches!(SHARED_HINTS.get(), SharedHints::Attached { .. });
+        SHARED_HINTS.set(SharedHints::Unknown);
+        attached
+    }
+
+    /// Forgets the buffers this backend pinned pages in, in its own hint
+    /// table, as a backend that never pinned them knows nothing of them.
+    pub fn forget_recent_buffers() {
+        RECENT_BUFFERS.with_borrow_mut(|recent| recent.fill(RecentBuffer::default()));
+    }
+
+    /// Pins a block of index `oid` whose buffer's usage count is below the
+    /// most, then pins it `pins` more times through its hint; the usage
+    /// count after the first pin and after the last.
+    ///
+    /// # Safety
+    /// `oid` is a Stannum index.
+    pub unsafe fn usage_through_hints(oid: pg_sys::Oid, pins: usize) -> (u32, u32) {
+        unsafe {
+            let index = pg_sys::index_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            let usage = |buffer: pg_sys::Buffer| {
+                let desc = pg_sys::BufferDescriptors.add(buffer as usize - 1);
+                let state =
+                    std::ptr::read_volatile(std::ptr::addr_of!((*desc).bufferdesc.state.value));
+                (state & pg_sys::BUF_USAGECOUNT_MASK) >> pg_sys::BUF_USAGECOUNT_SHIFT
+            };
+            let blocks =
+                pg_sys::RelationGetNumberOfBlocksInFork(index, pg_sys::ForkNumber::MAIN_FORKNUM);
+            let mut found = (pg_sys::BM_MAX_USAGE_COUNT, pg_sys::BM_MAX_USAGE_COUNT);
+            // Outside a span, with no ledger, an own pin is released within
+            // the call, as here.
+            let own = OWN_PINS.get();
+            for block in 1..blocks {
+                let (buffer, owned) = pin_block(index, block, own);
+                let before = usage(buffer);
+                release_pin(buffer, owned);
+                if before >= pg_sys::BM_MAX_USAGE_COUNT {
+                    continue;
+                }
+                let mut last = buffer;
+                for _ in 0..pins {
+                    let (buffer, owned) = pin_block(index, block, own);
+                    last = buffer;
+                    release_pin(buffer, owned);
+                }
+                found = (before, usage(last));
+                break;
+            }
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            found
+        }
+    }
+
+    /// The shared buffer holding `block` of index `oid`, read in if need be
+    /// and left unpinned, with its index relation open.
+    ///
+    /// # Safety
+    /// `oid` is an index.
+    unsafe fn buffer_of(oid: pg_sys::Oid, block: u32) -> (pg_sys::Relation, pg_sys::Buffer) {
+        unsafe {
+            let index = pg_sys::index_open(oid, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            let buffer = pg_sys::ReadBuffer(index, block);
+            pg_sys::ReleaseBuffer(buffer);
+            (index, buffer)
+        }
+    }
+
+    /// The shared reference count of the buffer holding `block` of index
+    /// `oid`: every backend's pins, PostgreSQL's and own.
+    ///
+    /// # Safety
+    /// `oid` is an index.
+    pub unsafe fn shared_refcount(oid: pg_sys::Oid, block: u32) -> u32 {
+        unsafe {
+            let (index, buffer) = buffer_of(oid, block);
+            let count = state_of(descriptor(buffer)).load(std::sync::atomic::Ordering::Acquire)
+                & pg_sys::BUF_REFCOUNT_MASK;
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            count
+        }
+    }
+
+    /// Pins `block` of index `oid` as [`own_pin`] does, holds the pin for
+    /// `hold_ms`, releases it as [`own_unpin`] does, and returns the
+    /// buffer's shared reference count right after the release. Another
+    /// session locking the buffer's header meanwhile (see
+    /// [`header_locked`]) is what the bgwriter, a checkpoint, a clock sweep
+    /// or `pg_buffercache` do under a running query.
+    ///
+    /// # Safety
+    /// `oid` is an index with a page `block`.
+    pub unsafe fn own_pin_held(oid: pg_sys::Oid, block: u32, hold_ms: u64) -> u32 {
+        unsafe {
+            let (index, buffer) = buffer_of(oid, block);
+            let locator = (*index).rd_locator;
+            assert!(
+                own_pin(buffer, &locator, block),
+                "the page's buffer was replaced"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+            own_unpin(buffer);
+            let count = state_of(descriptor(buffer)).load(std::sync::atomic::Ordering::Acquire)
+                & pg_sys::BUF_REFCOUNT_MASK;
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            count
+        }
+    }
+
+    /// Locks the header of the buffer holding `block` of index `oid` for
+    /// `hold_ms`, then unlocks it as `UnlockBufHdr` does, writing back the
+    /// state read under the lock; returns the reference count read. A pin
+    /// released by a plain atomic decrement meanwhile is undone by the
+    /// write-back: PostgreSQL's `UnpinBuffer` waits for the lock instead.
+    ///
+    /// # Safety
+    /// `oid` is an index with a page `block`.
+    pub unsafe fn header_locked(oid: pg_sys::Oid, block: u32, hold_ms: u64) -> u32 {
+        unsafe {
+            let (index, buffer) = buffer_of(oid, block);
+            let desc = descriptor(buffer);
+            let locked = pg_sys::LockBufHdr(desc);
+            std::thread::sleep(std::time::Duration::from_millis(hold_ms));
+            state_of(desc).store(
+                locked & !pg_sys::BM_LOCKED,
+                std::sync::atomic::Ordering::Release,
+            );
+            pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
+            locked & pg_sys::BUF_REFCOUNT_MASK
+        }
+    }
+
     /// Empties this backend's segment readers with their dead lists, and
     /// its page tables, as exceeding `stannum.reader_cache_mb` does.
     pub fn clear_reader_caches() {
@@ -4433,6 +5958,11 @@ pub mod testing {
     /// reader cache budget counts them.
     pub fn dead_list_bytes() -> usize {
         SEGMENT_READERS.with_borrow(|readers| readers.values().map(dead_bytes).sum())
+    }
+
+    /// Bytes the ctid-native paths keep, across every index.
+    pub fn native_bytes() -> usize {
+        SEGMENT_READERS.with_borrow(|readers| readers.values().map(|c| c.native.bytes()).sum())
     }
 
     /// Bytes the cached readers' arenas hold, across every index.
@@ -4496,17 +6026,16 @@ pub mod testing {
             let (guard, mut meta) = read_meta(index, true);
             let entry = meta.segments[i];
             let label = generation_label(entry.generation);
-            let bytes = read_run(index, entry.run, &label);
-            let segment = codec_in(Segment::parse(&bytes), &label);
-            let docs = codec_in(segment.doc_table(), &label);
+            let documents = try_read_documents(index, &entry, &label)
+                .unwrap_or_else(|message| corrupt(message));
             let ordinals: Vec<u32> = dead
                 .iter()
-                .filter_map(|tid| codec_in(docs.ordinal_of(*tid), &label))
+                .filter_map(|tid| documents.binary_search(tid).ok().map(|rank| rank as u32))
                 .collect();
             let run = write_run(index, &segment::ordinals::encode(&ordinals));
             let old = attach_dead_list(&mut meta, i, run);
             if !old.is_empty() {
-                let (pages, _) = verify::chain_pages(index, old.first, old.blocks, KIND_RUN);
+                let (pages, _) = verify::chain_pages(index, old.first, old.blocks, &[KIND_RUN]);
                 let stamp = pg_sys::ReadNextTransactionId().into_inner();
                 free_pages(index, &pages, stamp);
                 // Searches read the map's upper levels, which only a vacuum
@@ -4529,7 +6058,7 @@ pub mod testing {
                 .iter()
                 .map(|entry| {
                     let chain =
-                        |run: Run| verify::chain_pages(index, run.first, run.blocks, KIND_RUN).0;
+                        |run: Run| verify::chain_pages(index, run.first, run.blocks, &[KIND_RUN]).0;
                     (chain(entry.run), chain(entry.map))
                 })
                 .collect()
@@ -4642,11 +6171,41 @@ pub struct SegmentRow {
     pub sum_doc_lengths: i64,
     pub total_pages: i64,
     pub generation: i64,
-    /// TIN's `npostings`, one per term and document: STN3 does not record it,
-    /// and counting it reads every dictionary, so `None`.
+    /// TIN's `npostings`, one per term and document; `None` for the write
+    /// buffer, as TIN's is for its mutable segment.
     pub npostings: Option<i64>,
-    /// TIN's `sequence`: the segment's generation; `None` for the buffer.
+    /// How the segment was made (TIN's `origin`); `None` for the buffer.
+    pub origin: Option<&'static str>,
+    /// TIN's `sequence`: the segment's place among the immutable segments,
+    /// from 0; `None` for the buffer.
     pub sequence: Option<i64>,
+    /// A retired source (TIN's `source_state` `retired`).
+    pub retired: bool,
+}
+
+/// A segment's postings, one per term and document: the sum of its terms'
+/// document frequencies, read from its term map.
+///
+/// # Safety
+/// `index` is a live LDP2 index listing `entry`.
+unsafe fn segment_postings(index: pg_sys::Relation, entry: &SegmentEntry) -> u64 {
+    let label = generation_label(entry.generation);
+    let source = RunSource::new(
+        unsafe { (*index).rd_id },
+        entry.run,
+        unsafe { page_table(index, read_meta(index, false).1.identity, entry) },
+        label.clone(),
+    );
+    let reader = codec_in(Reader::new(source), &label);
+    let dictionary = codec_in(reader.dictionary(), &label);
+    let mut postings = 0u64;
+    for (i, item) in dictionary.iter().enumerate() {
+        if i.is_multiple_of(4096) {
+            pgrx::check_for_interrupts!();
+        }
+        postings += u64::from(codec_in(item, &label).1.df);
+    }
+    postings
 }
 
 /// The directory as rows: immutable segments first, then the write buffer.
@@ -4665,6 +6224,7 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 let bytes = read_run(index, entry.dead, &what);
                 i64::from(codec_in(Ordinals::parse(&bytes), &what).count())
             };
+            let npostings = segment_postings(index, entry);
             rows.push(SegmentRow {
                 ordinal: ordinal as i64,
                 kind: "immutable".to_owned(),
@@ -4674,8 +6234,10 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 sum_doc_lengths: entry.total_length as i64,
                 total_pages: i64::from(entry.run.blocks + entry.dead.blocks),
                 generation: i64::from(entry.generation),
-                npostings: None,
-                sequence: Some(i64::from(entry.generation)),
+                npostings: Some(npostings as i64),
+                origin: Some(entry.origin.name()),
+                sequence: Some(ordinal as i64),
+                retired: false,
             });
         }
         if meta.buffer.docs > 0 {
@@ -4693,7 +6255,46 @@ pub unsafe fn segment_rows(index: pg_sys::Relation) -> Vec<SegmentRow> {
                 total_pages: i64::from(meta.buffer.bytes.div_ceil(CHAIN_CAPACITY as u32).max(1)),
                 generation: i64::from(meta.buffer.version),
                 npostings: None,
+                origin: None,
                 sequence: None,
+                retired: false,
+            });
+        }
+        for (i, state) in meta.sealed.iter().enumerate() {
+            let stream = read_buffer_stream(index, state);
+            let lengths: u64 = segment::forward::records(&stream)
+                .map(|record| u64::from(codec_in(record, "sealed write segment").doc_len))
+                .sum();
+            let (pages, _) = verify::chain_pages(index, state.head, u32::MAX, &[KIND_BUFFER]);
+            rows.push(SegmentRow {
+                ordinal: (meta.segments.len() + usize::from(meta.buffer.docs > 0) + i) as i64,
+                kind: "sealed".to_owned(),
+                root_block: i64::from(state.head),
+                docs: i64::from(state.docs),
+                dead_docs: 0,
+                sum_doc_lengths: lengths as i64,
+                total_pages: pages.len() as i64,
+                generation: i64::from(state.epoch),
+                npostings: None,
+                origin: None,
+                sequence: None,
+                retired: false,
+            });
+        }
+        for retired in &meta.retired {
+            rows.push(SegmentRow {
+                ordinal: rows.len() as i64,
+                kind: "retired".to_owned(),
+                root_block: i64::from(retired.first),
+                docs: i64::from(retired.docs),
+                dead_docs: 0,
+                sum_doc_lengths: retired.total_length as i64,
+                total_pages: i64::from(retired.pages),
+                generation: 0,
+                npostings: None,
+                origin: None,
+                sequence: None,
+                retired: true,
             });
         }
         rows
@@ -4742,23 +6343,16 @@ pub unsafe fn document_count(index: pg_sys::Relation) -> u64 {
         .iter()
         .map(|entry| u64::from(entry.docs))
         .sum::<u64>()
+        + meta
+            .sealed
+            .iter()
+            .map(|state| u64::from(state.docs))
+            .sum::<u64>()
         + u64::from(meta.buffer.docs)
 }
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn direct_merge_admission_preserves_oversized_aggregate_fallback() {
-        let mut entry = super::SegmentEntry::default();
-        entry.run.bytes = u32::MAX;
-        entry.docs = 1;
-        assert!(super::direct_merge_limits(&[entry]).is_some());
-        assert!(super::direct_merge_limits(&[entry, entry]).is_none());
-        entry.run.bytes = 1;
-        entry.docs = u32::MAX;
-        assert!(super::direct_merge_limits(&[entry, entry]).is_none());
-    }
-
     use super::{
         MAX_SEGMENTS, SEGMENT_BYTES_CAP, bounded_merge_candidates, merge_candidates,
         room_candidates, tier, within_run,

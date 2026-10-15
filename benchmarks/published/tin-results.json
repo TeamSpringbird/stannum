@@ -1,0 +1,157 @@
+{
+  "version": 1,
+  "recorded": "2026-10-09",
+  "units": {
+    "qps": "queries per second, all clients",
+    "p99_ms": "99th-percentile latency, milliseconds",
+    "mb_per_query": "the benchmarker's PER QUERY: (idx_blks_read + idx_blks_hit) x block size / completed queries, shown with pg_size_pretty (1024-based, so MiB)"
+  },
+  "datasets": [
+    {
+      "id": "tin-1.0.6-x86",
+      "publisher": "PlanetScale",
+      "source": "https://planetscale.com/blog/tin-v106",
+      "kind": "first-party",
+      "platform": "x86",
+      "hardware": "EC2 i7i.8xlarge (5th-gen Xeon); target container 8 vCPUs, 64 GB, CPU pinning; benchmarker on the same host",
+      "setup": "benchmarker defaults except max_parallel_workers=8, shared_buffers=24GB, maintenance_work_mem=24GB; Stack Exchange 150M docs; 1,254 queries x conjunction/disjunction/phrase; top 10 by BM25; static table, one-shot build, clean VACUUM",
+      "engines": {
+        "TIN": "TIN 1.0.6, tin.score(ctid): terms in more than 10% of documents elided from scoring",
+        "TIN_FULL": "TIN 1.0.6, tin.full_score(ctid)",
+        "ParadeDB": "ParadeDB 0.26.0 (final), |||, &&&, ### operators",
+        "TIN 1.0.2": "TIN 1.0.2, tin.score(ctid)",
+        "TIN_FULL 1.0.2": "TIN 1.0.2, tin.full_score(ctid)"
+      },
+      "results": {
+        "conjunction": {
+          "TIN": {"qps": 842, "p99_ms": 57, "mb_per_query": 21},
+          "TIN_FULL": {"qps": 501, "p99_ms": 117, "mb_per_query": 34},
+          "ParadeDB": {"qps": 169, "p99_ms": 253, "mb_per_query": 44}
+        },
+        "disjunction": {
+          "TIN": {"qps": 236, "p99_ms": 132, "mb_per_query": 31},
+          "TIN_FULL": {"qps": 85, "p99_ms": 331, "mb_per_query": 106},
+          "ParadeDB": {"qps": 65, "p99_ms": 532, "mb_per_query": 128}
+        },
+        "phrase": {
+          "TIN": {"qps": 514, "p99_ms": 120, "mb_per_query": 28},
+          "TIN_FULL": {"qps": 386, "p99_ms": 157, "mb_per_query": 37},
+          "ParadeDB": {"qps": 166, "p99_ms": 327, "mb_per_query": 73}
+        },
+        "mixed": {
+          "TIN": {"qps": 413, "p99_ms": 119, "mb_per_query": 27},
+          "TIN_FULL": {"qps": 180, "p99_ms": 275, "mb_per_query": 59},
+          "ParadeDB": {"qps": 98, "p99_ms": 442, "mb_per_query": 81},
+          "TIN 1.0.2": {"qps": 110, "p99_ms": 643, "mb_per_query": 64},
+          "TIN_FULL 1.0.2": {"qps": 36, "p99_ms": 2150, "mb_per_query": 128}
+        }
+      }
+    },
+    {
+      "id": "tin-1.0.6-arm",
+      "publisher": "PlanetScale",
+      "source": "https://planetscale.com/blog/tin-v106",
+      "kind": "first-party",
+      "platform": "arm",
+      "hardware": "EC2 i8g (Graviton4), size not stated; target container 8 vCPUs, 64 GB, CPU pinning; benchmarker on the same host",
+      "setup": "as tin-1.0.6-x86",
+      "engines": {
+        "TIN": "TIN 1.0.6, tin.score(ctid)",
+        "TIN_FULL": "TIN 1.0.6, tin.full_score(ctid)",
+        "ParadeDB": "ParadeDB 0.26.0 (final), |||, &&&, ### operators",
+        "TIN 1.0.2": "TIN 1.0.2, tin.score(ctid)",
+        "TIN_FULL 1.0.2": "TIN 1.0.2, tin.full_score(ctid)"
+      },
+      "results": {
+        "conjunction": {
+          "TIN": {"qps": 594, "p99_ms": 94, "mb_per_query": 21},
+          "TIN_FULL": {"qps": 336, "p99_ms": 195, "mb_per_query": 34},
+          "ParadeDB": {"qps": 142, "p99_ms": 278, "mb_per_query": 43}
+        },
+        "disjunction": {
+          "TIN": {"qps": 143, "p99_ms": 243, "mb_per_query": 31},
+          "TIN_FULL": {"qps": 58, "p99_ms": 548, "mb_per_query": 106},
+          "ParadeDB": {"qps": 45, "p99_ms": 684, "mb_per_query": 126}
+        },
+        "phrase": {
+          "TIN": {"qps": 381, "p99_ms": 202, "mb_per_query": 28},
+          "TIN_FULL": {"qps": 284, "p99_ms": 246, "mb_per_query": 37},
+          "ParadeDB": {"qps": 122, "p99_ms": 415, "mb_per_query": 72}
+        },
+        "mixed": {
+          "TIN": {"qps": 265, "p99_ms": 218, "mb_per_query": 27},
+          "TIN_FULL": {"qps": 125, "p99_ms": 444, "mb_per_query": 59},
+          "ParadeDB": {"qps": 79, "p99_ms": 548, "mb_per_query": 80},
+          "TIN 1.0.2": {"qps": 135, "p99_ms": 435, "mb_per_query": 63},
+          "TIN_FULL 1.0.2": {"qps": 44, "p99_ms": 1743, "mb_per_query": 130}
+        }
+      }
+    },
+    {
+      "id": "tin-launch-x86",
+      "publisher": "PlanetScale",
+      "source": "https://planetscale.com/blog/introducing-tin",
+      "kind": "first-party",
+      "platform": "x86",
+      "hardware": "EC2 i7i.8xlarge; PostgreSQL 18.6 container capped at 8 vCPU and 32 GB (no pinning stated); client on the same host",
+      "setup": "shared_buffers 24GB, maintenance_work_mem 24GB, max_parallel_workers 8; Stack Exchange 150M docs; 3,762 forms (1,254 queries x 3); top 10",
+      "engines": {
+        "TIN": "TIN 1.0.2, tin.score(ctid)",
+        "ParadeDB": "ParadeDB 0.25.2, @@@ pdb.parse / pdb.match (the benchmarker's forms)",
+        "GIN": "PostgreSQL GIN, ts_rank_cd",
+        "pg_textsearch": "pg_textsearch"
+      },
+      "results": {
+        "mixed": {
+          "TIN": {"qps": 199, "p99_ms": 256, "mb_per_query": 65},
+          "ParadeDB": {"qps": 7.9, "p99_ms": 6765, "mb_per_query": 582}
+        },
+        "mixed-updates-1000": {
+          "TIN": {"qps": 172, "p99_ms": 284, "mb_per_query": 88, "updates": 271398},
+          "ParadeDB": {"qps": 6.0, "p99_ms": 7990, "mb_per_query": 591, "updates": 193487}
+        },
+        "conjunction-phrase": {
+          "TIN": {"qps": 242, "p99_ms": 212, "mb_per_query": 73},
+          "ParadeDB": {"qps": 24, "p99_ms": 1279, "mb_per_query": 668},
+          "GIN": {"qps": 0.4, "p99_ms": 288000, "mb_per_query": 595}
+        },
+        "disjunction": {
+          "TIN": {"qps": 148, "p99_ms": 324, "mb_per_query": 48},
+          "ParadeDB": {"qps": 17, "p99_ms": 2385, "mb_per_query": 303},
+          "pg_textsearch": {"qps": 3.5, "p99_ms": 8646, "mb_per_query": 11639}
+        },
+        "disjunction-updates": {
+          "TIN": {"qps": 125, "p99_ms": 354, "mb_per_query": 77, "updates": 270279},
+          "ParadeDB": {"qps": 2.2, "p99_ms": 12634, "mb_per_query": 394, "updates": 185584}
+        },
+        "mixed-count": {
+          "TIN": {"qps": 179, "p99_ms": 438, "mb_per_query": 97},
+          "ParadeDB": {"qps": 10, "p99_ms": 2704, "mb_per_query": 544}
+        }
+      }
+    },
+    {
+      "id": "paradedb-opening-a-closed-tin",
+      "publisher": "ParadeDB",
+      "source": "https://www.paradedb.com/blog/opening-a-closed-tin",
+      "kind": "third-party",
+      "platform": "x86",
+      "hardware": "TIN on PlanetScale cloud, 8 CPU / 32 GB / NVMe; ParadeDB in Docker on a similar EC2 instance of the same family",
+      "setup": "PlanetScale's fork of the benchmarker; Stack Exchange mixed top-k, 8 clients. Values read from the post's charts, as recorded in stannum-lab/tin-research/public-sources.md; not exact",
+      "engines": {
+        "TIN": "TIN on PlanetScale cloud, dense_ratio 0.1 (default elision)",
+        "TIN_FULL": "TIN on PlanetScale cloud, dense_ratio 2 (no elision)",
+        "ParadeDB": "ParadeDB 0.26.0-rc.2",
+        "ParadeDB stopwords": "ParadeDB 0.26.0-rc.2 with stopwords"
+      },
+      "results": {
+        "mixed": {
+          "TIN": {"qps": 114.4},
+          "TIN_FULL": {"qps": 35.5},
+          "ParadeDB": {"qps": 81.9},
+          "ParadeDB stopwords": {"qps": 161.9}
+        }
+      }
+    }
+  ]
+}

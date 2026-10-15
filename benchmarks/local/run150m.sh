@@ -7,6 +7,6 @@
 #
 #   run150m.sh IMAGE LABEL STYLE UPDATES [SECONDS]
 #
-# Same as `workload.sh 150m ...`; see workload.sh for the environment.
+# Same as `workload.sh 150m ...` (benchmarks v2); see workload.sh for the environment.
 set -euo pipefail
 exec bash "$(dirname "${BASH_SOURCE[0]}")/workload.sh" 150m "$@"

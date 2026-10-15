@@ -146,14 +146,6 @@ def ranked_accounting(log, completed, require_stable=True):
     return dict(stable_checked=stable, invalidated=invalidated, completed=completed)
 
 
-def verify_strategy(sql, expected):
-    # Each sql() invocation opens a fresh backend. GUC registration is local to
-    # that backend, so LOAD and pg_settings inspection must share one session.
-    observed = sql("LOAD 'stannum'; SELECT setting FROM pg_settings WHERE name='stannum.experimental_vacuum_merge_strategy'")
-    if observed.casefold() != expected.casefold():
-        raise ValueError(f'VACUUM strategy is not registered as {expected!r}: {observed!r}')
-
-
 def require_selective_matches(expected):
     if expected <= 0:
         raise ValueError('selective fixture has no live w7 matches; adjust vocabulary, distribution, deletion density, or document count')
@@ -226,9 +218,16 @@ def sample_rss(pid, stop, ready, samples, errors):
         errors.append(str(error))
 
 
-def validate_cleanup(segments, remaining):
+def live_segments(rows):
+    """segment_info's rows minus the retired sources it lists for display
+    until their pages are reclaimed; they hold no documents queries read."""
+    return [s for s in rows if s.get('kind') != 'retired']
+
+
+def validate_cleanup(rows, remaining):
     """Validate the quiescent cleanup accounting."""
-    assert len(segments) == (1 if remaining else 0), segments
+    segments = live_segments(rows)
+    assert len(segments) == (1 if remaining else 0), rows
     assert all(0 <= s['dead_docs'] <= s['docs'] for s in segments), segments
     assert sum(s['docs'] - s['dead_docs'] for s in segments) == remaining, segments
 
@@ -238,7 +237,6 @@ def main():
     parser.add_argument('--docs', type=positive, default=32768)
     parser.add_argument('--repeat', type=positive, default=200)
     parser.add_argument('--scenario', choices=['merge', 'rewrite', 'mixed'], default='merge')
-    parser.add_argument('--vacuum-strategy', choices=['auto', 'direct', 'reconstruct'])
     parser.add_argument('--artifact', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     add_workload_arguments(parser)
@@ -257,8 +255,6 @@ def main():
         '-c jit=off -c enable_seqscan=off -c statement_timeout=180000 '
         '-c stannum.merge_tier_factor=8 -c stannum.max_segments=128 '
         '-c vacuum_cost_delay=0'))
-    if args.vacuum_strategy:
-        env['PGOPTIONS'] += ' -c stannum.experimental_vacuum_merge_strategy=' + args.vacuum_strategy
 
     def command(argv, **kwargs):
         result = subprocess.run(argv, env=env, text=True, capture_output=True,
@@ -311,10 +307,6 @@ ANALYZE docs;"""
         command(['createdb', '--maintenance-db=postgres', database])
         created = True
         sql(setup)
-        if args.vacuum_strategy:
-            # Unknown custom-GUC placeholders also pass current_setting();
-            # require a real registered setting before labeling the strategy.
-            verify_strategy(sql, args.vacuum_strategy)
         before = json.loads(sql("SELECT json_agg(row_to_json(s)) FROM stannum.segment_info('docs_idx') s"))
         assert len(before) == segments and all(row['kind'] == 'immutable' for row in before), before
         save(output / 'before.json', before)
@@ -417,10 +409,11 @@ ANALYZE docs;"""
         during = summarize_logs([output / 'overlap.log'], names, vacuum_seconds)
         after = json.loads(sql("SELECT coalesce(json_agg(row_to_json(s)), '[]'::json) FROM stannum.segment_info('docs_idx') s"))
         save(output / 'after.json', after)
-        assert len(after) == (1 if remaining else 0), after
+        live = live_segments(after)
+        assert len(live) == (1 if remaining else 0), after
         # A concurrent reader can prevent heap pruning. Those CTIDs were not
         # reported dead to the index AM, even if their rows are no longer visible.
-        assert remaining <= sum(s['docs'] - s['dead_docs'] for s in after) <= args.docs, after
+        assert remaining <= sum(s['docs'] - s['dead_docs'] for s in live) <= args.docs, after
         assert sql("SELECT count(*) FROM stannum.verify_index('docs_idx',true)") == '0'
         assert sql("SELECT count(*) FROM docs WHERE body ==> 'common AND w7'") == str(expected)
         assert sql(f"""WITH actual AS MATERIALIZED (SELECT id FROM docs WHERE body ==> 'common AND w7'),

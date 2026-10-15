@@ -23,7 +23,7 @@ The ordering of items is not stable, it is driven by a dependency graph.
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:281
+-- postgres/src/score.rs:282
 -- stannum::score::full_score
 CREATE  FUNCTION "full_score"(
 	"ctid" tid /* pg_sys :: ItemPointerData */
@@ -34,7 +34,7 @@ AS 'MODULE_PATHNAME', 'full_score_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:287
+-- postgres/src/score.rs:288
 -- stannum::score::full_score
 CREATE  FUNCTION "full_score"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -174,6 +174,19 @@ CREATE TYPE indexed_query (
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- postgres/src/highlight_udfs.rs:281
+-- stannum::highlight_udfs::highlight_ansi
+CREATE  FUNCTION "highlight_ansi"(
+	"text" TEXT, /* Option < & str > */
+	"wrap_to" INT, /* Option < i32 > */
+	"query" indexed_query /* indexed_query */
+) RETURNS TEXT /* Option < String > */
+STABLE PARALLEL SAFE 
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'highlight_ansi_bound_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- postgres/src/highlight_udfs.rs:196
 -- stannum::highlight_udfs::highlight
 CREATE  FUNCTION "highlight"(
@@ -185,31 +198,6 @@ CREATE  FUNCTION "highlight"(
 STABLE PARALLEL SAFE 
 LANGUAGE c /* Rust */
 AS 'MODULE_PATHNAME', 'highlight_bound_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- postgres/src/operator.rs:228
--- stannum::operator::bind_query
-CREATE  FUNCTION "bind_query"(
-	"query" TEXT, /* & str */
-	"index" oid /* pg_sys :: Oid */
-) RETURNS indexed_query /* indexed_query */
-IMMUTABLE STRICT PARALLEL SAFE
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'bind_query_wrapper';
-/* </end connected objects> */
-
-/* <begin connected objects> */
--- postgres/src/highlight_udfs.rs:281
--- stannum::highlight_udfs::highlight_ansi
-CREATE  FUNCTION "highlight_ansi"(
-	"text" TEXT, /* Option < & str > */
-	"wrap_to" INT, /* Option < i32 > */
-	"query" indexed_query /* indexed_query */
-) RETURNS TEXT /* Option < String > */
-STABLE PARALLEL SAFE 
-LANGUAGE c /* Rust */
-AS 'MODULE_PATHNAME', 'highlight_ansi_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
@@ -235,6 +223,18 @@ ALTER FUNCTION @extschema@.highlight_ansi(pg_catalog.text, pg_catalog.int4, pg_c
 /* </end connected objects> */
 
 /* <begin connected objects> */
+-- postgres/src/operator.rs:228
+-- stannum::operator::bind_query
+CREATE  FUNCTION "bind_query"(
+	"query" TEXT, /* & str */
+	"index" oid /* pg_sys :: Oid */
+) RETURNS indexed_query /* indexed_query */
+IMMUTABLE STRICT PARALLEL SAFE
+LANGUAGE c /* Rust */
+AS 'MODULE_PATHNAME', 'bind_query_wrapper';
+/* </end connected objects> */
+
+/* <begin connected objects> */
 -- postgres/src/storage/wal.rs:255
 -- stannum::storage::wal::logs_removal_horizons
 CREATE  FUNCTION "logs_removal_horizons"(
@@ -246,7 +246,7 @@ AS 'MODULE_PATHNAME', 'logs_removal_horizons_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/maintenance/sql.rs:208
+-- postgres/src/maintenance/sql.rs:209
 -- stannum::maintenance::sql::maintenance_jobs
 CREATE  FUNCTION "maintenance_jobs"() RETURNS TABLE (
 	"database" oid,  /* pg_sys :: Oid */
@@ -260,7 +260,7 @@ AS 'MODULE_PATHNAME', 'maintenance_jobs_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/maintenance/sql.rs:160
+-- postgres/src/maintenance/sql.rs:161
 -- stannum::maintenance::sql::maintenance_status
 CREATE  FUNCTION "maintenance_status"() RETURNS TABLE (
 	"preloaded" bool,  /* bool */
@@ -282,7 +282,7 @@ AS 'MODULE_PATHNAME', 'maintenance_status_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:310
+-- postgres/src/score.rs:311
 -- stannum::score::max_score
 CREATE  FUNCTION "max_score"(
 	"ctid" tid /* pg_sys :: ItemPointerData */
@@ -304,7 +304,7 @@ AS 'MODULE_PATHNAME', 'maybe_quote_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/maintenance/sql.rs:100
+-- postgres/src/maintenance/sql.rs:101
 -- stannum::maintenance::sql::merge
 CREATE  FUNCTION "merge"(
 	"index" regclass, /* PgRelation */
@@ -328,7 +328,7 @@ AS 'MODULE_PATHNAME', 'merge_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/maintenance/sql.rs:60
+-- postgres/src/maintenance/sql.rs:61
 -- stannum::maintenance::sql::promote
 CREATE  FUNCTION "promote"(
 	"index" regclass, /* PgRelation */
@@ -365,7 +365,7 @@ AS 'MODULE_PATHNAME', 'ql_parse_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:297
+-- postgres/src/score.rs:298
 -- stannum::score::score
 CREATE  FUNCTION "score"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -381,7 +381,7 @@ AS 'MODULE_PATHNAME', 'score_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:320
+-- postgres/src/score.rs:321
 -- stannum::score::score_bound
 CREATE  FUNCTION "score_bound"(
 	"document" TEXT, /* & str */
@@ -401,7 +401,7 @@ AS 'MODULE_PATHNAME', 'score_bound_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:429
+-- postgres/src/score.rs:430
 -- stannum::score::score_bound_indexed
 CREATE  FUNCTION "score_bound_indexed"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -421,7 +421,7 @@ AS 'MODULE_PATHNAME', 'score_bound_indexed_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:460
+-- postgres/src/score.rs:461
 -- stannum::score::score_bound_indexed_searches
 CREATE  FUNCTION "score_bound_indexed_searches"(
 	"ctid" tid, /* pg_sys :: ItemPointerData */
@@ -441,7 +441,7 @@ AS 'MODULE_PATHNAME', 'score_bound_indexed_searches_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:351
+-- postgres/src/score.rs:352
 -- stannum::score::score_bound_searches
 CREATE  FUNCTION "score_bound_searches"(
 	"document" TEXT, /* & str */
@@ -461,7 +461,7 @@ AS 'MODULE_PATHNAME', 'score_bound_searches_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:1523
+-- postgres/src/score.rs:1550
 -- stannum::score::score_inspect
 CREATE  FUNCTION "score_inspect"(
 	"index" regclass, /* Option < PgRelation > */
@@ -479,7 +479,7 @@ AS 'MODULE_PATHNAME', 'score_inspect_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:1788
+-- postgres/src/score.rs:1815
 -- stannum::score::score_support
 CREATE  FUNCTION "score_support"(
 	"request" internal /* Internal */
@@ -490,7 +490,7 @@ AS 'MODULE_PATHNAME', 'score_support_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/score.rs:2097
+-- postgres/src/score.rs:2124
 -- requires:
 --   full_score
 --   full_score_with_bm25
@@ -525,12 +525,12 @@ CREATE  FUNCTION "segment_info"(
 	"docs" bigint,  /* i64 */
 	"dead_docs" bigint,  /* i64 */
 	"sum_doc_lengths" bigint,  /* i64 */
-	"total_pages" bigint,  /* i64 */
-	"generation" bigint,  /* i64 */
 	"npostings" bigint,  /* Option < i64 > */
+	"total_pages" bigint,  /* i64 */
 	"source_state" TEXT,  /* String */
 	"origin" TEXT,  /* Option < String > */
-	"sequence" bigint  /* Option < i64 > */
+	"sequence" bigint,  /* Option < i64 > */
+	"generation" bigint  /* i64 */
 )
 STRICT VOLATILE PARALLEL UNSAFE
 LANGUAGE c /* Rust */
@@ -637,7 +637,7 @@ AS 'MODULE_PATHNAME', 'tokenize_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:373
+-- postgres/src/udfs.rs:370
 -- stannum::udfs::verify_index
 CREATE  FUNCTION "verify_index"(
 	"index" regclass, /* PgRelation */
@@ -653,7 +653,7 @@ AS 'MODULE_PATHNAME', 'verify_index_wrapper';
 /* </end connected objects> */
 
 /* <begin connected objects> */
--- postgres/src/udfs.rs:424
+-- postgres/src/udfs.rs:421
 -- stannum::udfs::version
 CREATE  FUNCTION "version"() RETURNS TEXT /* & '_ str */
 IMMUTABLE STRICT PARALLEL SAFE

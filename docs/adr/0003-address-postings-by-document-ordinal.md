@@ -1,7 +1,12 @@
 ---
-status: accepted
+status: superseded
+superseded-by: 0005
 ---
 # Address a term's documents by ordinal
+
+> Superseded by [ADR 0005](0005-address-postings-by-ctid.md): postings move
+> to heap ctids. The extension reads this format until that one is
+> integrated.
 
 A segment stores each term's documents only as ordinals into the segment's
 document table, which lists the segment's tuple locations in heap order. The

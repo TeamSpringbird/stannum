@@ -86,7 +86,7 @@ def main():
         return s['queued_jobs'] == 0 and s['running_jobs'] == 0 and s['worker_pid'] is None
 
     def fill(table, rows, database='postgres', first=1, settings=''):
-        """One row per statement, so every fourth row folds the buffer."""
+        """One row per statement, so every fourth row seals the write segment."""
         statements = '\n'.join(f"INSERT INTO {table} VALUES ({n}, 'needle w{n}');"
                                for n in range(first, first + rows))
         sql(f'SET stannum.write_buffer_docs = 4; {settings}\n{statements}', database)
@@ -137,8 +137,12 @@ def main():
         after = status()
         assert after['requested'] == before['requested'], (before, after)
         assert sql('SELECT count(*) FROM stannum.maintenance_jobs();') == '0'
-        unmerged = segments('man_idx')
+        # Ten seals: two wait sealed, the eight before them promoted by the
+        # seal that would have made a third; nothing merged.
+        unmerged = int(sql("SELECT count(*) FROM stannum.segment_info('man_idx') "
+                           "WHERE kind IN ('immutable', 'sealed');"))
         assert unmerged == 10, unmerged
+        assert int(sql("SELECT count(*) FROM stannum.segment_info('man_idx') WHERE kind = 'sealed';")) == 2
         fill('man', 4, first=42)
         wait_for('the worker to merge man_idx down to two segments', lambda: segments('man_idx') <= 2 and idle())
         assert status()['requested'] > after['requested']

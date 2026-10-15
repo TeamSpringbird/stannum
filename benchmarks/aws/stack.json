@@ -1,6 +1,6 @@
 {
   "AWSTemplateFormatVersion": "2010-09-09",
-  "Description": "Ephemeral PostgreSQL benchmark host; ARM managed-TIN comparison or x86 published-reference baseline. No inbound access.",
+  "Description": "Ephemeral PostgreSQL benchmark host; x86 (i7i.8xlarge) or ARM (i8g.8xlarge) published-setup comparison, or a small ARM host. No inbound access.",
   "Parameters": {
     "Ami": {
       "Type": "AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>",
@@ -12,8 +12,10 @@
       "AllowedValues": [
         "r8g.large",
         "r7g.large",
-        "i7i.8xlarge"
-      ]
+        "i7i.8xlarge",
+        "i8g.8xlarge"
+      ],
+      "Description": "i7i.8xlarge: TIN v1.0.6 x86 (5th-gen Xeon, 32 vCPU = 16 cores x 2 threads, 256 GiB, instance-store NVMe; needs the amd64 Ami). i8g.8xlarge: the ARM counterpart of the same size class (Graviton4, 32 vCPU = 32 cores, 256 GiB, instance-store NVMe; the default arm64 Ami); the post names i8g without a size."
     },
     "DiskGiB": {
       "Type": "Number",
@@ -23,14 +25,15 @@
     },
     "LifetimeHours": {
       "Type": "Number",
-      "Default": 8,
+      "Default": 6,
       "MinValue": 1,
-      "MaxValue": 24
+      "MaxValue": 24,
+      "Description": "Hours until the instance powers itself off (and terminates). Keep it short: a v2 session from a snapshot takes about 4 to 7 hours, a build on the instance about 10 (docs/benchmarks.md, cost table)."
     },
     "AvailabilityZone": {
       "Type": "AWS::EC2::AvailabilityZone::Name",
       "Default": "us-east-1a",
-      "Description": "i7i.8xlarge is not offered in every zone, such as us-east-1e."
+      "Description": "i7i.8xlarge is not offered in every zone, such as us-east-1e; check i8g.8xlarge with aws ec2 describe-instance-type-offerings --location-type availability-zone before choosing."
     },
     "CorpusBucket": {
       "Type": "String",
@@ -281,7 +284,7 @@
         ],
         "UserData": {
           "Fn::Base64": {
-            "Fn::Sub": "#!/bin/bash\nset -euo pipefail\n# Schedule termination before installation so a package failure cannot skip it.\ncat > /etc/systemd/system/benchmark-expiry.service <<'UNIT'\n[Unit]\nDescription=Terminate temporary benchmark instance\n[Service]\nType=oneshot\nExecStart=/usr/sbin/poweroff\nUNIT\ncat > /etc/systemd/system/benchmark-expiry.timer <<'UNIT'\n[Unit]\nDescription=Temporary benchmark lifetime limit\n[Timer]\nOnBootSec=${LifetimeHours}h\nUnit=benchmark-expiry.service\n[Install]\nWantedBy=timers.target\nUNIT\nsystemctl daemon-reload\nsystemctl enable --now benchmark-expiry.timer\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y docker.io git python3-venv python3-boto3 ca-certificates jq curl unzip postgresql-client\n# A newly created instance owns these otherwise empty instance-store disks.\n# Format only a verified, unmounted Amazon instance-store device, never EBS.\nif [ '${InstanceType}' = 'i7i.8xlarge' ]; then\n  systemctl stop docker.service docker.socket\n  DISK=$(lsblk -dn -o PATH,MODEL | awk '/Amazon EC2 NVMe Instance Storage/ {print $1; exit}')\n  test -n \"$DISK\"\n  test -z \"$(lsblk -n -o MOUNTPOINTS \"$DISK\" | tr -d '[:space:]')\"\n  test -z \"$(blkid -s TYPE -o value \"$DISK\" || true)\"\n  mkfs.ext4 -F \"$DISK\"\n  mkdir -p /mnt/benchmark\n  mount \"$DISK\" /mnt/benchmark\n  UUID=$(blkid -s UUID -o value \"$DISK\")\n  echo \"UUID=$UUID /mnt/benchmark ext4 defaults,nofail 0 2\" >> /etc/fstab\n  mkdir -p /mnt/benchmark/docker /mnt/benchmark/work /etc/docker\n  echo '{\"data-root\":\"/mnt/benchmark/docker\"}' > /etc/docker/daemon.json\n  ln -s /mnt/benchmark/work /opt/stannum-benchmark\nelse\n  install -d -m 0755 /opt/stannum-benchmark\nfi\nsystemctl enable --now docker\nuname -a > /opt/stannum-benchmark/kernel.txt\nlscpu > /opt/stannum-benchmark/cpu.txt\nlsblk -o NAME,SIZE,TYPE,MOUNTPOINTS > /opt/stannum-benchmark/disks.txt\ntouch /opt/stannum-benchmark/bootstrap-ready\n"
+            "Fn::Sub": "#!/bin/bash\nset -euo pipefail\n# Schedule termination before installation so a package failure cannot skip it.\ncat > /etc/systemd/system/benchmark-expiry.service <<'UNIT'\n[Unit]\nDescription=Terminate temporary benchmark instance\n[Service]\nType=oneshot\nExecStart=/usr/sbin/poweroff\nUNIT\ncat > /etc/systemd/system/benchmark-expiry.timer <<'UNIT'\n[Unit]\nDescription=Temporary benchmark lifetime limit\n[Timer]\nOnBootSec=${LifetimeHours}h\nUnit=benchmark-expiry.service\n[Install]\nWantedBy=timers.target\nUNIT\nsystemctl daemon-reload\nsystemctl enable --now benchmark-expiry.timer\nexport DEBIAN_FRONTEND=noninteractive\napt-get update\napt-get install -y docker.io git python3-venv python3-boto3 ca-certificates jq curl unzip postgresql-client\n# A newly created instance owns these otherwise empty instance-store disks.\n# Format only a verified, unmounted Amazon instance-store device, never EBS.\n# i7i and i8g carry instance-store NVMe; the first such disk holds Docker and the work tree.\ncase '${InstanceType}' in i7i.*|i8g.*) STORE=yes ;; *) STORE=no ;; esac\nif [ \"$STORE\" = yes ]; then\n  systemctl stop docker.service docker.socket\n  DISK=$(lsblk -dn -o PATH,MODEL | awk '/Amazon EC2 NVMe Instance Storage/ {print $1; exit}')\n  test -n \"$DISK\"\n  test -z \"$(lsblk -n -o MOUNTPOINTS \"$DISK\" | tr -d '[:space:]')\"\n  test -z \"$(blkid -s TYPE -o value \"$DISK\" || true)\"\n  mkfs.ext4 -F \"$DISK\"\n  mkdir -p /mnt/benchmark\n  mount \"$DISK\" /mnt/benchmark\n  UUID=$(blkid -s UUID -o value \"$DISK\")\n  echo \"UUID=$UUID /mnt/benchmark ext4 defaults,nofail 0 2\" >> /etc/fstab\n  mkdir -p /mnt/benchmark/docker /mnt/benchmark/work /etc/docker\n  echo '{\"data-root\":\"/mnt/benchmark/docker\"}' > /etc/docker/daemon.json\n  ln -s /mnt/benchmark/work /opt/stannum-benchmark\nelse\n  install -d -m 0755 /opt/stannum-benchmark\nfi\nsystemctl enable --now docker\nuname -a > /opt/stannum-benchmark/kernel.txt\nlscpu > /opt/stannum-benchmark/cpu.txt\nlscpu -e=CPU,CORE,SOCKET,NODE,ONLINE > /opt/stannum-benchmark/lscpu-e.txt\nlsblk -o NAME,SIZE,TYPE,MOUNTPOINTS > /opt/stannum-benchmark/disks.txt\ntouch /opt/stannum-benchmark/bootstrap-ready\n"
           }
         },
         "LaunchTemplate": {
@@ -381,11 +384,23 @@
   },
   "Conditions": {
     "PublishedHost": {
-      "Fn::Equals": [
+      "Fn::Or": [
         {
-          "Ref": "InstanceType"
+          "Fn::Equals": [
+            {
+              "Ref": "InstanceType"
+            },
+            "i7i.8xlarge"
+          ]
         },
-        "i7i.8xlarge"
+        {
+          "Fn::Equals": [
+            {
+              "Ref": "InstanceType"
+            },
+            "i8g.8xlarge"
+          ]
+        }
       ]
     }
   }
