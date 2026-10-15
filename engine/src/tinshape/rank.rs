@@ -4234,17 +4234,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// The place in [`Walk::held_list`] of the unread term bounding the
     /// candidate at hand highest, the first in the scorer's order on a tie
-    /// (`None` for none above -inf), folded without a branch.
+    /// (`None` for none above -inf). Experiment: branches as before, the
+    /// read state from the mask rather than the buckets.
     #[inline(always)]
     fn or_pick(&self, unread: &impl Unread) -> Option<usize> {
         let mut top = usize::MAX;
         let mut best = f32::NEG_INFINITY;
-        unread.each(|p| {
-            let v = self.held_bound[self.held_list[p]];
-            let take = v > best;
-            best = if take { v } else { best };
-            top = if take { p } else { top };
-        });
+        for (p, &h) in self.held_list.iter().enumerate() {
+            if unread.has(p) && self.held_bound[h] > best {
+                (best, top) = (self.held_bound[h], p);
+            }
+        }
         (top != usize::MAX).then_some(top)
     }
 
