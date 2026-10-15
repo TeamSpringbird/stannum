@@ -470,27 +470,65 @@ fn fold_frontier_pairs(
 /// length and on its own exit.
 const FOLD_PAIRS: usize = 4;
 
+/// Codes [`round_length`] gives: 0 to 895.
+const ROUNDED_CODES: usize = 896;
+
+/// [`rounded_length`] of each code, and `u32::MAX` (its value past them)
+/// last: one load per pair in [`fold_group_frontier`], where computing it
+/// took a dozen instructions on x86-64.
+static ROUNDED_LENGTHS: [u32; ROUNDED_CODES + 1] = {
+    let mut out = [0; ROUNDED_CODES + 1];
+    let mut code = 0;
+    while code <= ROUNDED_CODES {
+        out[code] = rounded_length(code as u32);
+        code += 1;
+    }
+    out
+};
+
 /// The best of `bound` over the pairs of the group frontier at `at` of
 /// `bytes`, 0 at least: [`GroupFrontier`]'s pairs folded by [`higher`],
 /// bit for bit. The head and the first [`FOLD_PAIRS`] pairs' varints, of
 /// one or two bytes each, are read from a window of sixteen bytes, each
-/// varint's length from its first byte's high bit rather than a branch,
-/// and all four pairs bounded: a pair past the frontier's count is the
-/// pair before it again. Pairs after them are read in a loop, and a
-/// frontier with a longer varint among its first is folded again by
-/// [`GroupFrontier`] (`bound` is pure: a pair may be bounded and dropped).
-/// `bytes` are a directory's with their slack
-/// ([`Directory::frontier_bytes`]): sixteen are read from `at` on.
+/// varint's length from its first byte's high bit rather than a branch;
+/// the four pairs are decoded first, then all bounded: a pair past the
+/// frontier's count is the pair before it again. Pairs after them are read
+/// in a loop, and a frontier with a longer varint among its first is
+/// folded by [`GroupFrontier`] instead. `bytes` are a directory's with
+/// their slack ([`Directory::frontier_bytes`]): sixteen are read from `at`
+/// on.
 #[inline(always)]
 pub fn fold_group_frontier(
     bytes: &[u8],
     at: usize,
     rounded: bool,
+    bound: impl FnMut(u8, u32) -> f32,
+) -> f32 {
+    // A record's frontiers are all rounded or all exact: a fold for each,
+    // with no test of it per pair.
+    if rounded {
+        fold_frontier::<true>(bytes, at, bound)
+    } else {
+        fold_frontier::<false>(bytes, at, bound)
+    }
+}
+
+/// [`fold_group_frontier`] of a record whose frontiers are `ROUNDED`.
+#[inline(always)]
+fn fold_frontier<const ROUNDED: bool>(
+    bytes: &[u8],
+    at: usize,
     mut bound: impl FnMut(u8, u32) -> f32,
 ) -> f32 {
-    let length = |code: u32| if rounded { rounded_length(code) } else { code };
+    let length = |code: u32| {
+        if ROUNDED {
+            ROUNDED_LENGTHS[(code as usize).min(ROUNDED_CODES)]
+        } else {
+            code
+        }
+    };
     let Some(window) = bytes.get(at..at + 16) else {
-        return fold_frontier_pairs(bytes, at, rounded, &mut bound);
+        return fold_frontier_pairs(bytes, at, ROUNDED, &mut bound);
     };
     let window: &[u8; 16] = window.try_into().expect("sixteen bytes");
     // The head: the count less one, and the first bucket. Then the first
@@ -499,16 +537,16 @@ pub fn fold_group_frontier(
     let count = usize::from(window[0] >> 4) + 1;
     let mut bucket = u32::from(window[0] & 15);
     let mut code = 0;
-    let mut best = 0.0_f32;
+    let mut pairs = [(0u8, 0u32); FOLD_PAIRS];
     let mut p = 1;
     let mut long = 0;
-    for k in 0..FOLD_PAIRS {
+    for (k, pair) in pairs.iter_mut().enumerate() {
         // A varint of two bytes when its first has the high bit; one of
         // three or more (a live pair's) sends the frontier to the loop.
         let b0 = u32::from(window[p & 15]);
         let b1 = u32::from(window[(p + 1) & 15]);
         let two = b0 >> 7;
-        let v = (b0 & 0x7f) | (two * (b1 & 0x7f)) << 7;
+        let v = (b0 & 0x7f) | (b1 & 0x7f & 0u32.wrapping_sub(two)) << 7;
         p += 1 + two as usize;
         // A pair past the count is the one before it again (its deltas
         // times zero), bounded as it was. A select of the bound (or of a
@@ -522,10 +560,14 @@ pub fn fold_group_frontier(
             bucket = (bucket + live * (1 + (v & 15))) & 15;
             code += live * (1 + (v >> 4));
         }
-        best = higher(best, bound(bucket as u8, length(code)));
+        *pair = (bucket as u8, length(code));
     }
     if long != 0 {
-        return fold_frontier_pairs(bytes, at, rounded, &mut bound);
+        return fold_frontier_pairs(bytes, at, ROUNDED, &mut bound);
+    }
+    let mut best = 0.0_f32;
+    for (bucket, length) in pairs {
+        best = higher(best, bound(bucket, length));
     }
     let mut p = at + p;
     for _ in FOLD_PAIRS..count {
@@ -3939,6 +3981,16 @@ mod tests {
         varint::put(&mut bytes, 0);
         let mut at = 0;
         assert!(skip_group_frontier(&bytes, &mut at).is_err());
+    }
+
+    #[test]
+    fn the_rounded_lengths_table_is_rounded_length() {
+        for code in 0..=ROUNDED_CODES as u32 + 40 {
+            let at = (code as usize).min(ROUNDED_CODES);
+            assert_eq!(ROUNDED_LENGTHS[at], rounded_length(code), "{code}");
+        }
+        assert_eq!(ROUNDED_LENGTHS[ROUNDED_CODES], u32::MAX);
+        assert_eq!(round_length(u32::MAX) as usize, ROUNDED_CODES - 1);
     }
 
     #[test]
