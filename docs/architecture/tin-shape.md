@@ -122,17 +122,24 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
                     (directory_len: the bytes of the payload before its
                     containers, layout 10)
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
-           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped),
-           | 0x20 when the directory ends in skip points (grouped, layout 11)
+           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped)
 lengths := base varint, width u8, (length - base) packed at width, by posting
 list    := Elias-Fano over the term's slots, universe = all slots
-directory := groups, (index gap, (count - 1) << 2 | kind, [len],
-                      group frontier)*, skip*: one entry per group the term
-                      occupies, then before every 16th entry past the first a
-                      skip point
-skip    := u32 LE each: the entry's offset from the first entry, the group
-           index after the entry before it, and the container bytes,
-           postings and TF bits before it
+directory := groups varint, widths u8 * 4, presence, base*, row*,
+             group frontier*                        (layout 14)
+widths  := bits of a row's deltas of postings, container bytes, TF bits and
+           frontier bytes (each at most 32; a row at most 120 bits)
+presence := more than one group in 16 held: a bitmap over the segment's
+            groups (u64 LE words, bit g of word g / 64), then per word the
+            groups held before it; else the groups' indexes, ascending
+            (indexes and ranks u16 LE, u32 past 65,536 groups)
+base    := u32 LE each: the postings, container bytes, TF bits and frontier
+           bytes before row 32k (one per block of 32 rows)
+row     := kind (2 bits), the frontier's largest bucket (4), then each
+           total's delta from its block's base at its width: groups + 1
+           rows in one bit string, the last (kind and bucket 0) holding the
+           record's totals; an entry's count and container length are the
+           next row's totals less its own
 group frontier := head u8 = (pairs - 1) << 4 | first bucket, first length
                   varint, then per pair ((length gap - 1) << 4 | bucket gap - 1)
                   varint: the group's impact frontier, its lengths rounded
@@ -194,13 +201,12 @@ footer entry per term and aligned 256-page group (its probes, rounds 2 and
 (bucket, shortest length) pairs no other posting of the group dominates (1
 to 16; 2.4 on average at 150M rows), and the group's buckets follow the
 groups before it in the TF tail, at the width the group's largest bucket
-needs. A walk reaches group `g`'s entry by its position in the directory
-(skimmed when the record is parsed, its entries decoded a block of 128 at a
-time as the walk reaches them: see [lazy group
-directories](#lazy-group-directories-layout-89)) and reads nothing of the
-groups before it but their entries; a group's bound is its frontier's best score, its floors per
-bucket come from the same pairs, and a group the term lacks bounds at
-zero. The frontier's lengths are rounded down to six significant bits
+needs. A walk finds group `g`'s entry by the group's rank in the record's
+presence (a popcount of its word) or among its group indexes, and reads its
+row and the next, nothing of the groups before it (see [the columnar
+directory](#the-columnar-directory-layout-14)); a group's bound is its
+frontier's best score, its floors per bucket come from the same pairs, and
+a group the term lacks bounds at zero. The frontier's lengths are rounded down to six significant bits
 (`round_length`, as TIN quantizes its lengths): a bound at the rounded
 length is a bound at the length, the frontier costs 3% less, and 0.1% more
 candidates pass (`Options::group_frontiers`, `Exact` keeps them whole).
@@ -1105,6 +1111,10 @@ lacking one, 8% of a conjunction's directory entries in the replay.
 
 ### Lazy group directories (layout 8/9)
 
+(History: since layout 14 a directory is rows of fixed width read in place,
+nothing decoded; see [the columnar
+directory](#the-columnar-directory-layout-14).)
+
 Since every directory entry carries its group's frontier (layout 8), an
 entry takes about 10 bytes (3 before), and decoding a common term's
 directory whole cost a cheap conjunction 1-3 ms at 150M rows: about 118,000
@@ -1167,6 +1177,9 @@ The skim was the floor while containers were found from the directory's
 end; layout 10 removed it (below). On x86-64 the scan has an SSSE3 body.
 
 ### Directory length in the header (layout 10)
+
+(The header still gives the directory's length; what follows here about
+skimming entries is history since layout 14.)
 
 A grouped record's header gives its directory's length (the bytes of its
 group count and entries, where its containers start) in the varint a
@@ -1268,6 +1281,9 @@ to `pg-ranked.tsv`; `--full` answers identical to the base's on the whole
 trace.
 
 ### Skip points in the directory (layout 11)
+
+(History: the columnar directory of layout 14 replaced the skip points; see
+[the columnar directory](#the-columnar-directory-layout-14).)
 
 An entry's totals (its container's offset, its first posting, its buckets'
 offset) count every entry before it, so a walk that asks a term for group

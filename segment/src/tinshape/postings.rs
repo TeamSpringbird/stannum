@@ -1777,13 +1777,20 @@ impl Directory {
     }
 
     /// Entry `b` of group `index` (its [`Self::index`]), checked against
-    /// the record and the segment's `groups`.
-    #[inline]
+    /// the record and the segment's `groups`: as a rule the entry read last
+    /// (a walk asks for a group's entry for each of its fields).
+    #[inline(always)]
     pub fn entry_of(&self, b: usize, index: u32, groups: &[Group]) -> Result<GroupEntry> {
         let (at, last) = self.last.get();
         if at == b {
             return Ok(last);
         }
+        self.read(b, index, groups)
+    }
+
+    /// [`Self::entry_of`], read from its rows.
+    #[inline(never)]
+    fn read(&self, b: usize, index: u32, groups: &[Group]) -> Result<GroupEntry> {
         if b >= self.len {
             return Err(Error::Corrupt("group directory entry"));
         }
@@ -1848,12 +1855,19 @@ impl Directory {
     /// Entry `b`, its group index found first: the entry read last as it
     /// was, the one after it by the next group its presence holds (a walk
     /// in order selects nothing).
-    #[inline]
+    #[inline(always)]
     pub fn get(&self, b: usize, groups: &[Group]) -> Result<GroupEntry> {
         let (at, last) = self.last.get();
         if at == b {
             return Ok(last);
         }
+        self.get_other(b, groups)
+    }
+
+    /// [`Self::get`] of an entry other than the one read last.
+    #[inline(never)]
+    fn get_other(&self, b: usize, groups: &[Group]) -> Result<GroupEntry> {
+        let (at, last) = self.last.get();
         if b >= self.len {
             return Err(Error::Corrupt("group directory entry"));
         }
