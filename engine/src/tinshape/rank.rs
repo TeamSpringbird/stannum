@@ -48,15 +48,9 @@ use crate::walk::{Ranked, TopRows, Visibility};
 /// times as many members.
 const SEEK_RATIO: usize = 4;
 
-/// Cache lines of a container asked for a group ahead ([`Walk::ask_next`]):
-/// a rare lead's container is a line or a few; a common term's is
-/// probed by the candidates, its first lines its header and first members.
+/// Cache lines of a container asked for a group ahead ([`Walk::run_or`]):
+/// its header and first members.
 const AHEAD_LINES: usize = 4;
-
-/// Groups past another required term's last entry [`Walk::ask_next`] looks
-/// for its entry of the lead's next group within: further, the walk's own
-/// seek (by skip points) costs less than a look ahead would.
-const AHEAD_REACH: u32 = 64;
 
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
@@ -730,10 +724,6 @@ struct Mem<'a> {
     /// for the group at hand), `usize::MAX` for none.
     hint: usize,
     entry: usize,
-    /// Where [`Walk::ask_next`] found the term's group `ahead_group` (the
-    /// lead's next) in its directory: [`load`] seeks it from there.
-    ahead: usize,
-    ahead_group: u32,
     /// Containers loaded from the directory, for [`MemoCounts`].
     ///
     /// [`MemoCounts`]: segment::tinshape::segment::MemoCounts
@@ -1121,10 +1111,6 @@ fn load<'a>(
         cursor.drain_below(end, |slot| list.push(slot - group.slot_base));
         mem.count = mem.list.len() as u32;
         return Ok(true);
-    }
-    if mem.ahead_group == g {
-        // Found a group ahead ([`Walk::ask_next`]): the seek starts there.
-        mem.hint = mem.hint.max(mem.ahead);
     }
     let Some(entry) = set.find(g, &mut mem.hint) else {
         mem.count = 0;
@@ -1572,7 +1558,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     self.touch,
                 )?;
             }
-            self.ask_next();
             let more = if self.all_grids(g) {
                 self.dense_group(g)?
             } else {
@@ -1584,37 +1569,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.group_done();
         }
         Ok(())
-    }
-
-    /// A group ahead: while the lead's group at hand is walked, asks for
-    /// the first reads of its next group (see [`TermSet::prefetch_entry`]),
-    /// the lead's and the second required term's, together. Each starts a
-    /// chain of dependent reads (an entry locates a container, whose
-    /// members index the next term's), so out-of-order execution overlaps
-    /// little of one chain with another; asked for a group early, they
-    /// arrive while this group's work runs. The second term's entry is
-    /// looked for among its next few decoded entries, and its load seeks
-    /// from there ([`load`]): the walk loads it in nearly every group its
-    /// lead's bound passes, and later terms only while candidates are left,
-    /// for which a look ahead cost more than it saved. The lead's next group
-    /// is its next directory entry: one the walk skips by its bound was asked
-    /// for for nothing.
-    #[inline]
-    fn ask_next(&mut self) {
-        let lead = self.req[0];
-        let set = self.terms[lead].as_ref().expect("the lead");
-        let Some(next) = set.prefetch_entry(self.mems[lead].hint + 1, AHEAD_LINES) else {
-            return;
-        };
-        let Some(&t) = self.req.get(1) else {
-            return;
-        };
-        let set = self.terms[t].as_ref().expect("required");
-        let mem = &mut self.mems[t];
-        if let Some(at) = set.near_group(next, mem.hint, AHEAD_REACH) {
-            (mem.ahead, mem.ahead_group) = (at, next);
-            set.prefetch_entry(at, AHEAD_LINES);
-        }
     }
 
     /// Ends a group's reads: the pages pinned since the walk's mark are
@@ -3525,9 +3479,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     self.present_list.push(i);
                 }
             }
-            // A group ahead, as in a conjunction (see [`Walk::ask_next`]):
-            // each present term's next group is its next directory entry,
-            // whose first reads arrive while this group is walked.
+            // A group ahead: each present term's next group is its next
+            // directory entry, whose first reads (see
+            // [`TermSet::prefetch_entry`]) arrive while this group is walked.
             for &i in &self.present_list {
                 let t = self.sc[i].term;
                 let set = self.terms[t].as_ref().expect("scoring");

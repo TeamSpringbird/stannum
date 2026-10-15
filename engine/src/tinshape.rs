@@ -428,47 +428,6 @@ impl<'a> TermSet<'a> {
         Some(entry.index)
     }
 
-    /// The directory position of a grouped term's group `group`, looked
-    /// for from entry `from` on where the entries are decoded already and
-    /// lie within `reach` groups: `None` when the term does not hold it,
-    /// or it is further or in a run not decoded. Nothing is decoded.
-    ///
-    /// Entries hold distinct groups in increasing order, so `group` lies
-    /// at most as many entries past `from` as groups: there exactly for a
-    /// term holding every group between (two lookups), else searched for
-    /// by halves between.
-    #[inline]
-    fn near_group(&self, group: u32, from: usize, reach: u32) -> Option<usize> {
-        let dir = self.dir.as_ref()?;
-        let at = dir.get_decoded(from)?.index;
-        if at >= group {
-            return (at == group).then_some(from);
-        }
-        if group - at > reach {
-            return None;
-        }
-        let furthest = from + (group - at) as usize;
-        let mut hi = furthest.min(dir.len() - 1);
-        let index = dir.get_decoded(hi)?.index;
-        if index < group {
-            return None;
-        }
-        if index == group && hi == furthest {
-            return Some(hi);
-        }
-        // Entry `lo` holds a group before `group`; entry `hi` it or a later.
-        let mut lo = from;
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if dir.get_decoded(mid)?.index < group {
-                lo = mid;
-            } else {
-                hi = mid;
-            }
-        }
-        (dir.get_decoded(hi)?.index == group).then_some(hi)
-    }
-
     /// The term's group `group`, if it holds it, looked for from `hint`
     /// forward (the hint is left at the first group at or after it).
     #[inline]
@@ -2288,59 +2247,6 @@ mod tests {
             Or(vec![Term(0), Term(1), Term(2)]),
         ];
         assert!(released_walks_match(&docs, &members, &blob, 64, &nodes) > 0);
-    }
-
-    /// A look ahead's search of a directory ([`TermSet::near_group`]) finds
-    /// what a seek from the same entry would, within its reach, and reads
-    /// only entries decoded already: a term in nearly every group (found
-    /// where the groups' count puts it) and a rarer one (searched by
-    /// halves).
-    #[test]
-    fn a_near_group_is_the_seeks_group_and_decodes_nothing() {
-        let (docs, members) = drawn(12_000, &[90, 4], 3);
-        let options = Options {
-            grid_min_postings: 0,
-            ..Options::default()
-        };
-        let blob = build(&docs, &members, options);
-        let segment = Segment::parse(&blob).unwrap();
-        let geometry = &segment.docs.geometry;
-        let groups = geometry.groups.len() as u32;
-        assert!(groups >= 60);
-        for name in ["t0", "t1"] {
-            let set = TermSet::open(&segment, name, &mut NoTouch)
-                .unwrap()
-                .unwrap();
-            let dir = set.dir.clone().expect("a grouped record");
-            assert!(dir.len() >= 8, "{name}: {} groups", dir.len());
-            for from in 0..dir.len() {
-                assert_eq!(
-                    set.near_group(groups - 1, from, u32::MAX),
-                    None,
-                    "{name}: not decoded"
-                );
-            }
-            dir.decode_all(&geometry.groups).unwrap();
-            let index = |i: usize| dir.get_decoded(i).unwrap().index;
-            let mut found = 0;
-            for reach in [1, 5, 64, u32::MAX] {
-                for from in 0..dir.len() {
-                    for group in 0..groups {
-                        let seek = (from..dir.len()).find(|&i| index(i) >= group);
-                        let expect = seek.filter(|&i| {
-                            index(i) == group && group.saturating_sub(index(from)) <= reach
-                        });
-                        assert_eq!(
-                            set.near_group(group, from, reach),
-                            expect,
-                            "{name} {from} {group} {reach}"
-                        );
-                        found += usize::from(expect.is_some());
-                    }
-                }
-            }
-            assert!(found > 2 * dir.len(), "{name}: {found} found");
-        }
     }
 
     /// TF tails and the DL sidecar are read a value at a time, never
