@@ -10,6 +10,7 @@
 pub mod areas;
 pub mod dump;
 pub mod paged;
+pub mod phrase_census;
 pub mod replay;
 pub mod tinshape;
 pub mod whatif;

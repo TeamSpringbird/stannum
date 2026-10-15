@@ -37,6 +37,11 @@
 //! gets per query the threshold they give and the final one;
 //! `--warm-untimed` takes it before the timed walks (a free warm-up).
 //!
+//! `--phrase-census` times, per query, the plain walk and the same walk
+//! with every phrase candidate's steps timed (see
+//! [`bench::phrase_census`]), and reports what candidates that do not
+//! hold the phrase spent on their common terms' buckets and after.
+//!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
 //! Every row is visible: there is no heap.
@@ -100,6 +105,7 @@ struct Args {
     /// time only the walk it starts (what a free warm-up would save).
     warm_untimed: bool,
     out: Option<PathBuf>,
+    phrase_census: bool,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -123,7 +129,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
-         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE]"
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] [--phrase-census]"
     );
     std::process::exit(2)
 }
@@ -154,6 +160,7 @@ fn args() -> Args {
         warm: None,
         warm_untimed: false,
         out: None,
+        phrase_census: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -194,6 +201,7 @@ fn args() -> Args {
                 }
             }
             "--out" => a.out = Some(value(&mut it).into()),
+            "--phrase-census" => a.phrase_census = true,
             _ => usage(),
         }
     }
@@ -832,6 +840,41 @@ impl Reader {
         Some(top.into_rows())
     }
 
+    /// [`Reader::walked`] unseeded, each phrase candidate's steps timed
+    /// into `tally` (`--phrase-census`).
+    fn census_walked(
+        &self,
+        scorer: &Scorer,
+        k: usize,
+        order: SegmentOrder,
+        answer: &[(f32, Tid)],
+        tally: &mut bench::phrase_census::Tally,
+    ) -> Option<Vec<(f32, Tid)>> {
+        let mut names = Vec::new();
+        let node = tin::lower(&scorer.query, &mut names)?;
+        let visit = self.visit(&names, scorer, order, answer);
+        let mut top = TopRows::new(k, false);
+        let mut visibility = Unseeded(FxHashSet::default());
+        for i in visit {
+            let mut census = bench::phrase_census::Census::new(tally);
+            self.segs[i]
+                .with(&names, |segment| {
+                    tin::top_k_into(
+                        segment,
+                        &node,
+                        &names,
+                        &scorer.terms,
+                        &mut top,
+                        &mut visibility,
+                        &mut census,
+                    )
+                })
+                .ok()?;
+            census.end();
+        }
+        Some(top.into_rows())
+    }
+
     /// The warm-up rows of a disjunction (`--warm`): the `k` best of a
     /// ranked AND of its two scoring terms of highest bound (their segment's
     /// largest bucket at length 0) over the first segment `order` visits,
@@ -1195,6 +1238,14 @@ fn run() -> Result<bool, String> {
     );
     let mut unsupported = 0usize;
     let mut mismatched = 0usize;
+    let mut census = bench::phrase_census::Tally {
+        clock_ns: if args.phrase_census {
+            bench::phrase_census::clock_ns()
+        } else {
+            0.0
+        },
+        ..Default::default()
+    };
     for (n, q) in trace.iter().enumerate() {
         let scorer = reader.scorer(&q.text)?;
         // Warm pass (also the answer, and what it decoded of the terms'
@@ -1255,6 +1306,25 @@ fn run() -> Result<bool, String> {
         }
         let counters1 = process_counters();
         let timed = (counters1.0 - counters0.0, counters1.1 - counters0.1);
+        if args.phrase_census {
+            if args.forget {
+                reader.forget();
+            }
+            let at = Instant::now();
+            std::hint::black_box(reader.walked(&scorer, args.k, None, args.order, &answer));
+            census.plain_ns += at.elapsed().as_nanos() as u64;
+            if args.forget {
+                reader.forget();
+            }
+            let at = Instant::now();
+            let rows = reader.census_walked(&scorer, args.k, args.order, &answer, &mut census);
+            census.walk_ns += at.elapsed().as_nanos() as u64;
+            census.queries += 1;
+            if rows.as_deref() != Some(answer.as_slice()) {
+                mismatched += 1;
+                eprintln!("census walk differs: {}", q.name);
+            }
+        }
         let mut pages = Pages::default();
         let pins0 = PINS.get();
         let hash0 = REFS.with_borrow_mut(|refs| {
@@ -1329,6 +1399,9 @@ fn run() -> Result<bool, String> {
         }
     }
     let _ = NoTouch;
+    if args.phrase_census {
+        print!("{}", census.report());
+    }
     if let Some(path) = &args.warm {
         std::fs::write(path, &warm_out).map_err(|e| e.to_string())?;
     }

@@ -77,6 +77,51 @@ impl Part {
 /// Where a query reads: `(part, blob offset, length)` per read.
 pub trait Touch {
     fn touch(&mut self, part: Part, at: usize, len: usize);
+
+    /// Whether a phrase's walk reports [`Touch::census_phrase`] (a lab
+    /// census of what checking positions before scoring would save; off
+    /// everywhere else, so the walk computes nothing for it).
+    #[inline]
+    fn census(&self) -> bool {
+        false
+    }
+
+    /// A phrase's walk took `step` for the candidate at slot `local` of
+    /// group `g`, or for the group (a sieve's steps).
+    #[inline]
+    fn census_phrase(&mut self, _g: u32, _local: u32, _step: PhraseStep) {}
+}
+
+/// A step of a phrase's ranked walk, for [`Touch::census_phrase`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PhraseStep {
+    /// Its positions are about to be checked apart (read untouched).
+    Oracle,
+    /// Its staging begins; whether it holds the phrase.
+    Stage {
+        holds: bool,
+    },
+    /// Its common terms' buckets are read next: its rarer terms'
+    /// buckets left it in reach.
+    Common,
+    /// Its staging ended, kept for finishing or not.
+    Staged {
+        kept: bool,
+    },
+    /// Its finishing (length, score, check) begins.
+    Finish,
+    /// A positions check of the walk's own begins, and ends.
+    Check,
+    Checked {
+        holds: bool,
+    },
+    /// Its finishing ended.
+    Finished,
+    /// The group's sieve begins over `n` candidates, and ends.
+    Sieve {
+        n: u32,
+    },
+    Sieved,
 }
 
 /// Reads recorded nowhere, for timing.

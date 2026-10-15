@@ -39,7 +39,8 @@ use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
 use super::{
-    Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
+    NoTouch, Node, Part, PhraseStep, RankedAnswer, Src, TermSet, Touch, kernels, matches,
+    open_terms, required_terms,
 };
 use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
@@ -1802,7 +1803,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         'chunks: for chunk in cands.chunks(SIEVE_CHUNK) {
             left.clear();
             left.extend_from_slice(chunk);
+            self.census(
+                g,
+                0,
+                PhraseStep::Sieve {
+                    n: chunk.len() as u32,
+                },
+            );
             self.sieve(g, &mut left)?;
+            self.census(g, 0, PhraseStep::Sieved);
             for &local in &left {
                 // A window cut skips its candidates (each is cut by it
                 // again, unread); with no term left, the rest of the group.
@@ -2392,7 +2401,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let sieved = kernels::popcount(&self.words) >= SIEVE_MIN as u64 && self.sieve_led(g)?;
         if sieved {
             let mut words = std::mem::take(&mut self.words);
+            if self.touch.census() {
+                let n = kernels::popcount(&words) as u32;
+                self.census(g, 0, PhraseStep::Sieve { n });
+            }
             let done = self.sieve_words(&mut words);
+            self.census(g, 0, PhraseStep::Sieved);
             self.words = words;
             done?;
         }
@@ -2522,8 +2536,18 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if self.sc.is_empty() && self.unscored_done(self.geometry.tid_in(g as usize, local)) {
             return Ok(false);
         }
-        if let Some((_, length)) = self.stage(g, local)? {
+        let staged = self.stage(g, local)?;
+        self.census(
+            g,
+            local,
+            PhraseStep::Staged {
+                kept: staged.is_some(),
+            },
+        );
+        if let Some((_, length)) = staged {
+            self.census(g, local, PhraseStep::Finish);
             self.finish(g, local, length)?;
+            self.census(g, local, PhraseStep::Finished);
         }
         Ok(true)
     }
@@ -2531,7 +2555,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Stages group `g`'s candidate at slot `local`: bounds it by its
     /// buckets and keeps it, best bound first, for [`Walk::finish_staged`].
     fn stage_into(&mut self, g: u32, local: u32) -> Result<()> {
-        let Some((reach, length)) = self.stage(g, local)? else {
+        let staged = self.stage(g, local)?;
+        self.census(
+            g,
+            local,
+            PhraseStep::Staged {
+                kept: staged.is_some(),
+            },
+        );
+        let Some((reach, length)) = staged else {
             return Ok(());
         };
         self.staged.push((reach, local, length));
@@ -2604,7 +2636,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.span_index
                 .copy_from_slice(&self.staged_span[i * width..(i + 1) * width]);
         }
-        self.finish(g, local, length)
+        self.census(g, local, PhraseStep::Finish);
+        let finished = self.finish(g, local, length);
+        self.census(g, local, PhraseStep::Finished);
+        finished
     }
 
     /// Bounds the candidate at slot `local` of group `g` by what can be
@@ -2620,6 +2655,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(None);
         }
         self.answer.candidates += 1;
+        if self.touch.census() {
+            self.census_stage(g, local)?;
+        }
         // Its ctid only breaks a tie with the threshold's: most candidates
         // never need it.
         let geometry = self.geometry;
@@ -2689,11 +2727,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // candidates its positions then ruled out).
         let span_first = matches!(self.verify, Verify::Span(_)) && self.bar.is_none();
         if span_first {
+            self.answer.position_checks += 1;
+            self.census(g, local, PhraseStep::Check);
             let Verify::Span(check) = &mut self.verify else {
                 unreachable!()
             };
-            self.answer.position_checks += 1;
-            if !check.holds(&self.span_index, self.touch)? {
+            let holds = check.holds(&self.span_index, self.touch)?;
+            self.census(g, local, PhraseStep::Checked { holds });
+            if !holds {
                 return Ok(());
             }
         }
@@ -2729,11 +2770,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // checked, as it is scored (best bound first in its group, so a
             // confirmed one raises the bar over the rest).
             Verify::Span(_) => {
+                self.answer.position_checks += 1;
+                self.census(g, local, PhraseStep::Check);
                 let Verify::Span(check) = &mut self.verify else {
                     unreachable!()
                 };
-                self.answer.position_checks += 1;
-                if check.holds(&self.span_index, self.touch)? {
+                let holds = check.holds(&self.span_index, self.touch)?;
+                self.census(g, local, PhraseStep::Checked { holds });
+                if holds {
                     self.push(total, tid);
                 }
             }
@@ -2861,6 +2905,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             // Then their buckets, each bounded at its block's frontier as
             // the others' are.
+            self.census(g, local, PhraseStep::Common);
             own = 0.0;
             for i in 0..self.sc.len() {
                 match self.buckets[i] {
@@ -3006,6 +3051,34 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.touch.touch(Part::DlSidecar, header, 8);
         self.touch.touch(Part::DlSidecar, bits, 4);
         self.segment.lengths.get(rank)
+    }
+
+    /// Reports `step` of a phrase's walk ([`Touch::census_phrase`]).
+    #[inline]
+    fn census(&mut self, g: u32, local: u32, step: PhraseStep) {
+        if self.touch.census() && matches!(self.verify, Verify::Span(_)) {
+            self.touch.census_phrase(g, local, step);
+        }
+    }
+
+    /// Reports a phrase's candidate at slot `local` of group `g` staged,
+    /// with whether it holds the phrase: checked apart, its reads not
+    /// touched.
+    #[cold]
+    fn census_stage(&mut self, g: u32, local: u32) -> Result<()> {
+        let Verify::Span(check) = &mut self.verify else {
+            return Ok(());
+        };
+        self.touch.census_phrase(g, local, PhraseStep::Oracle);
+        let mut index = Vec::with_capacity(check.slots.len());
+        for &t in &check.slots {
+            let found = self.mems[t].find(local);
+            index.push(found.expect("a candidate holds every span term"));
+        }
+        let holds = check.holds(&index, &mut NoTouch)?;
+        self.touch
+            .census_phrase(g, local, PhraseStep::Stage { holds });
+        Ok(())
     }
 
     /// The candidate's posting index in each span slot's term.
