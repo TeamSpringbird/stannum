@@ -196,7 +196,12 @@ fn check_words(mask: &[u64], live: u32, at: usize, rows: &[Row], bounds: &[f32],
 fn check_members(held: &[u64], bits: &[u8], bounds: &[f32], sums: &mut [f32]) {
     assert_eq!(held.len(), bounds.len(), "a bound per held word");
     assert_eq!(bits.len(), sums.len(), "a sum per member");
-    assert!(bits.iter().all(|b| *b < 64), "bit positions of a word");
+    // Folded rather than `all`: a loop without an early exit, which
+    // compilers widen (the bits are a group's members, a few to dozens).
+    assert!(
+        bits.iter().fold(0, |any, b| any | b) < 64,
+        "bit positions of a word"
+    );
 }
 
 /// The portable bodies: the one-at-a-time loops, the reference every level
