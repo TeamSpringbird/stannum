@@ -2035,7 +2035,9 @@ impl Directory {
         const {
             assert!(KIND_GRID == 0 && KIND_EF == 1 && KIND_PAGED == 2 && KIND_ARRAY == 3);
         }
-        let expected = [grid, len, len, 2 * count][usize::from(kind)];
+        // An array's length wraps as the check always took it: a corrupt
+        // count of any kind is doubled now.
+        let expected = [grid, len, len, count.wrapping_mul(2)][usize::from(kind)];
         const MOST_SLOTS: [u32; 4] = [u32::MAX, u32::MAX, u32::MAX, ARRAY_SLOTS_MAX];
         let ok = count >= 1
             && count <= slots
