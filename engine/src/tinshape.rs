@@ -1462,6 +1462,9 @@ pub struct RankedAnswer {
     /// them), and those whose positions were checked.
     pub candidates: u64,
     pub position_checks: u64,
+    /// A disjunction's (term, group) pairs whose members were probed per
+    /// candidate rather than read whole (non-essential lists).
+    pub probed: u64,
 }
 
 /// The `k` best matches of `node` in `segment` by the summed scores of
@@ -3820,6 +3823,96 @@ mod tests {
                 prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
             }
         }
+    }
+
+    /// A disjunction of a dense word (grids), mid-density words (Elias-Fano
+    /// lists and arrays) and rare ones: once the threshold leaves the
+    /// cheapest terms non-essential, their lists are probed per candidate
+    /// rather than read whole into rows, and the rows kept are a brute
+    /// force's, bit for bit.
+    #[test]
+    fn disjunctions_probe_non_essential_lists_and_keep_the_exact_top_rows() {
+        let n = 9_000;
+        let base = Options {
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let mut probed = 0;
+        // Rarer words as one list over the segment (sparse records); then
+        // grouped, as Elias-Fano lists, short lists, or arrays.
+        let grouped = Options {
+            sparse: false,
+            ..base
+        };
+        let arrays = Options {
+            array_max: 2_048,
+            ..grouped
+        };
+        for (seed, options) in [
+            (3u64, base),
+            (11, base),
+            (29, grouped),
+            (5, grouped),
+            (7, arrays),
+        ] {
+            let (docs, lengths, members) = dense_words(n, &[60, 20, 8, 2, 1], seed);
+            let all: Vec<usize> = (0..n).collect();
+            let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+            let segment = Segment::parse(&blob).unwrap();
+            let names: Vec<String> = (0..5).map(|t| format!("t{t}")).collect();
+            for node in [
+                Node::Or((0..5).map(Node::Term).collect()),
+                Node::Or(vec![Node::Term(1), Node::Term(4)]),
+                Node::Or(vec![Node::Term(0), Node::Term(2), Node::Term(3)]),
+            ] {
+                let scorers: Vec<(String, TermScorer)> = leaf_terms(&node)
+                    .into_iter()
+                    .map(|t| {
+                        let df = members[t].len().max(1) as u64;
+                        let scorer = TermScorer::from_statistics(
+                            n as u64,
+                            df,
+                            1.0,
+                            Bm25Params::default(),
+                            20.0,
+                        )
+                        .unwrap();
+                        (names[t].clone(), scorer)
+                    })
+                    .collect();
+                for k in [1, 5, 10, 40] {
+                    let mut want: Vec<(f32, Tid)> = (0..n)
+                        .filter(|r| eval(&node, &members, *r))
+                        .map(|r| {
+                            let mut total = 0.0_f32;
+                            for (name, scorer) in &scorers {
+                                let t: usize = name[1..].parse().unwrap();
+                                if let Some(tf) = holds(&members, t, r) {
+                                    total +=
+                                        scorer.score_bucket(TfBucket::from_count(tf), lengths[r]);
+                                }
+                            }
+                            (total, docs[r])
+                        })
+                        .collect();
+                    want.sort_by(crate::walk::rank);
+                    want.truncate(k);
+                    let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+                    let bits = |rows: &[(f32, Tid)]| {
+                        rows.iter()
+                            .map(|(s, t)| (s.to_bits(), *t))
+                            .collect::<Vec<_>>()
+                    };
+                    assert_eq!(
+                        bits(&got.rows),
+                        bits(&want),
+                        "seed {seed}, top {k} of {node:?}"
+                    );
+                    probed += got.probed;
+                }
+            }
+        }
+        assert!(probed > 0, "no list was probed");
     }
 
     /// Two dense words, with the final rows kept from the start: a group's
