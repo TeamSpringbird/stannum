@@ -310,13 +310,14 @@ pub const fn round_length(length: u32) -> u32 {
 
 /// The length [`round_length`]'s `code` stands for: the longest it rounds
 /// down to, never above a length that gives the code.
+///
+/// Without a branch on whether the code is exact (below 64), which a
+/// frontier's pairs mix: such a code is its own mantissa, shifted by
+/// nothing. No length gives a code past 895 (a shift of 26).
 #[inline]
 pub const fn rounded_length(code: u32) -> u32 {
-    if code < 64 {
-        return code;
-    }
-    let s = (code - 64) / 32 + 1;
-    let m = 32 + (code - 64) % 32;
+    let s = (code >> 5).saturating_sub(1);
+    let m = (code & 31) | ((code >= 32) as u32) << 5;
     if s >= 27 { u32::MAX } else { m << s }
 }
 

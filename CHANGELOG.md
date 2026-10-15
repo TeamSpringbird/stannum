@@ -217,7 +217,14 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   before; 7% fewer cycles than a merge eight values at a time on Apple
   cores), and keeps or drops each one (against a list, a grid or a
   probed Elias-Fano container) without a branch on its fate.
-  Footer readers take a pair's one- or two-byte length without a branch.
+  Footer readers take a pair's one- or two-byte length without a branch,
+  and a directory frontier's rounded lengths are decoded without one on
+  whether a code is exact. A term's group in the walk's directory lookup
+  is found inline, not returned through memory a field at a time (read
+  back wider, a blocked store forward on x86-64 per group loaded). Each
+  measured alone at 150 million rows on Sapphire Rapids: the lookup 1.8%
+  fewer cycles in `score` conjunctions and 1.1% in phrases, the lengths
+  1.4% in conjunctions and 1.2% in disjunctions.
   A query also allocates less: a dictionary lookup reuses its term
   buffers, and a walk sizes its vectors once (at 150 million rows, a
   conjunction's 4,500 allocations or so became about 860).
