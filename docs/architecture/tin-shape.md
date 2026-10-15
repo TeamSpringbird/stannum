@@ -448,11 +448,15 @@ again (2.5% fewer cycles in the full_score replay).
   document so rules out the common words' blocks, bounded by their short
   documents, before their TF is read: at 150M rows, scoring every term
   (`full_score`), a candidate past its blocks reads 60% fewer buckets and
-  a disjunction 38% fewer TF pages. Before any bucket, the candidate's
-  length class bounds it: its class's shortest length is the shared
-  length the buckets' floors then raise, so a long document falls short
-  before the common words' TF is read (see [length
-  classes](#length-classes-before-the-dl-read-at-150m-rows-branch-looplenclass-page-layout-13)).
+  a disjunction 38% fewer TF pages. Before any bucket, a candidate
+  holding four or more scoring terms is bounded by its length class: its
+  class's shortest length is the shared length the buckets' floors then
+  raise, so a long document falls short before the common words' TF is
+  read (see [length
+  classes](#length-classes-before-the-dl-read-at-150m-rows-branch-looplenclass-page-layout-13));
+  one holding fewer reads its class after its buckets, if they leave it
+  in reach (see [the disjunction's directories in
+  order](#a-disjunctions-directories-in-order-and-its-classes-by-the-terms-a-candidate-holds-branch-loopordisj14)).
   A flat disjunction's
   candidates left in reach are scored best bound first at the group's end,
   as a phrase's are, so the best of a group raise the threshold over the
@@ -1457,7 +1461,11 @@ seek of that entry's group returns it, and one whose first held group is
 the next set bit after it returns the next entry, neither counting a rank
 (baseline x86-64 has no POPCNT; on Sapphire Rapids the rank's popcount was
 2.1% of a conjunction's cycles before). A record whose rows take at most
-57 bits (98% of them) reads a row as one `u64` from its first byte.
+57 bits (98% of them) reads a row as one `u64` from its first byte. A
+disjunction, which asks each grouped term for every group it holds in
+order, reads the entries with no seek at all (`Directory::step`, since
+`loop/ordisj14`): the presence's next bit, the row after the one before,
+a block's bases only as a row starts it.
 
 This retires the skip points, the runs decoded as reached and read on, the
 SIMD varint scans (NEON, SSSE3) and the directory's slots of decoded
@@ -2313,7 +2321,9 @@ than reading it for every such candidate, the same cuts). A disjunction's
 candidate past its blocks reads its class before any bucket
 (`Walk::or_stage`): the class floor is the shared length the buckets'
 floors then raise, so a long document is ruled out before the common
-words' TF is read. Exact by construction: a class's floor is a lower bound
+words' TF is read. (Since `loop/ordisj14`, only a candidate holding four
+or more scoring terms; see the section after this one.) Exact by
+construction: a class's floor is a lower bound
 on the length, and the answers are bit-identical (whole trace: 1,228,
 1,253 and 1,252 queries equal to PostgreSQL's; `--full` outputs f0962a8's
 byte for byte; on x86 every arm's outputs equal the base's in every style
@@ -2373,6 +2383,80 @@ x86: a conjunction's cycles there do not move.
   are of `361f39b`, the final code but for a guard that only runs on a
   segment without classes. Mean latency on the first
   devbox (a slower host) moved 5 to 20%, where its counters moved 0 to 5.
+
+## A disjunction's directories in order, and its classes by the terms a candidate holds (branch `loop/ordisj14`)
+
+At layout 14 every style but score disjunctions gained 6-10% on x86-64;
+score disjunctions took 1.2% more cycles. Two causes, both measured.
+
+**The directory.** A disjunction asks each grouped term for every group
+it holds, in order: ~99.8K entries a query. Layout 14 found each by a
+seek from the entry read last (a check of the presence's next bit
+against the group asked) and read its row and the next. Layout 12 had
+decoded them in one pass. `Directory::step` reads the next entry with
+nothing sought: the presence's next bit from the word left after the
+entry before (or the next group index), the entry's totals the next
+row's that the step before decoded, the row after it from a running
+block base read only as a row starts a block, and every read's checks.
+The walk keeps one cursor (`InOrder`) per scoring term; conjunctions
+and phrases, which skip, keep their seeks. The directory's share of a
+score disjunction's samples on the M4 went from 6.2% to 4.1%.
+
+**The classes.** A disjunction read a candidate's class before any
+bucket. That pays where a candidate holds many terms: `full_score`'s
+candidates, holding the dense words, read 62% fewer buckets. A score
+disjunction elides its dense words, so its candidates hold few terms
+and lie far apart, and a class is a byte in a 64-byte line of the plane
+(256 documents) that no other candidate reads: 11.2K distinct lines a
+query on 17.2K class reads, 1,631 class pages. Counted by line (a lab
+build mapping each class line to its own page), on the M4, 100 queries,
+against reading every class first:
+
+| when a class is read | score: lines, pages pinned, instructions | `full_score`: lines, pages pinned, instructions |
+| --- | --- | --- |
+| first, always (layout 14) | 11,249, 6,293, 0 | 38,893, 16,723, 0 |
+| after the buckets, always | 2,156, 5,406, +1.9% | 4,316, 17,610, +7.2% |
+| first when the group's mask has ≥ 2 members per 256 slots | 7,244, 5,769, +0.3% | 28,685, 16,660, +0.6% |
+| first when the candidate before lies within 256 slots | 4,596, 5,607, +1.5% | 20,968, 17,863, +3.2% |
+| first when it holds ≥ 3 scoring terms | 8,153, 5,958, +0.0% | 35,088, 16,565, +0.2% |
+| **first when it holds ≥ 4 scoring terms** | **6,521, 5,734, +0.4%** | **32,830, 16,472, +0.2%** |
+| first when it holds ≥ 5 scoring terms | 4,099, 5,534, +1.0% | 28,700, 16,421, +0.6% |
+
+A candidate holding fewer than four terms (`CLASS_FIRST_TERMS`) reads its
+class after its buckets, only if they leave it in reach, at its class's
+shortest length where that is longer than the buckets' floor (a
+conjunction's tier, without its check at the longest class: read for
+every such candidate, the class's tighter bound orders the staged
+candidates, as the class read first did; checked first, 2% more
+candidates were scored). Read first, a class saves a bucket read per
+term it rules out; read after, a sparse candidate the buckets rule out
+touches no line. `full_score`'s class lines cost little: read in rank
+order within a group, one in two shares a line with the class before.
+
+Exact: whole trace `--expect` 1,228, 1,253 and 1,252 queries equal to
+PostgreSQL's, `--full` outputs f0962a8's byte for byte, every x86 output
+the base's. Against `perf-integrate14` (`a908527`) on Sapphire Rapids
+(`m7i.4xlarge` spot, one layout-14 dump re-encoded from version 6 on the
+box for both arms, three rounds in alternating order, 300 queries score
+and 200 `full_score`, `--forget`, perf user counters less a load-only
+run), both changes (`0614d33`):
+
+| against layout 14 | cycles (rounds) | instructions | pages pinned |
+| --- | --- | --- | --- |
+| score disjunction | -6.0% (-5.9/-6.1/-5.9) | -3.4% | -9.3% |
+| full disjunction | -2.7% (-2.8/-2.4/-2.8) | -3.1% | -1.5% |
+| score conjunction | -0.7% (+0.4/-1.1/-1.2) | -0.6% | 0 |
+| score phrase | -1.2% (-2.0/-0.0/-1.4) | -0.4% | 0 |
+| full conjunction | -0.3% (-0.3/-0.1/-0.5) | -0.3% | 0 |
+| full phrase | -0.3% (-0.1/-0.4/-0.4) | -0.2% | 0 |
+
+On the M4 (100 queries, two rounds): instructions -2.6% score
+disjunctions, -2.1% `full_score`, -0.3% to -0.5% conjunctions and
+phrases (their seeks share the read's checks, with the frontiers' offset
+now kept); pages -8.1% and -1.6%. Score disjunctions, 1.2% slower than
+layout 12 at `a908527`, come out about 5% faster than it (the two
+sessions' ratios multiplied); `full_score` disjunctions keep layout 14's
+7.5% and add 2.7%.
 
 ## Open
 

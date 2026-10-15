@@ -161,13 +161,12 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   class, two bits by rank (shorter than 16, 64, 256 words, or longer;
   page layout 14), and a ranked walk bounds a candidate at its class's
   shortest length before it reads the exact one: a conjunction or phrase
-  after its buckets, a disjunction before them. At 150 million rows the
-  index grows 0.10% and queries read 73% to 84% fewer lengths; on x86-64
-  phrases take 6.9% fewer cycles (2.6% scoring every term), conjunctions
-  3.6%, `full_score` disjunctions 8.0%, score disjunctions 0.8%; on
-  aarch64 3.5%, 0.5% more, 8.3% and 1.3% fewer. Score disjunctions read
-  10% more pages (a class for each candidate past its blocks); the
-  answers are the same.
+  after its buckets, a disjunction before them for a candidate holding
+  four or more scoring terms and after them otherwise. At 150 million
+  rows the index grows 0.10% and queries read 73% to 84% fewer lengths;
+  on x86-64 phrases take 6.9% fewer cycles (2.6% scoring every term),
+  conjunctions 3.6%, `full_score` disjunctions 8.0%; on aarch64 3.5%,
+  0.5% more, and 8.3% fewer. The answers are the same.
 - Segments in TIN's shape keep a grouped record's group directory as rows
   of fixed width (page layout 14): the record's presence over the
   segment's groups (a bitmap with each word's rank, or its group indexes),
@@ -178,17 +177,22 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   million rows the index grows 0.86%; on x86-64 conjunctions take 7.3%
   fewer cycles, phrases 2.9%, `full_score` conjunctions 6.1% and phrases
   3.2%, `full_score` disjunctions 0.4%; on aarch64 conjunctions retire 14.8%
-  fewer instructions and phrases 9.9%; the same answers. Score
-  disjunctions took 1.3% more cycles on x86-64, past the 1% a regression
-  may cost; the directory was kept for the conjunctions' gain and its
-  simpler code, and a disjunction's in-order read of the rows is the next
-  step. Layout 14 carries the length classes too: an index of layout 12
+  fewer instructions and phrases 9.9%; the same answers. A disjunction,
+  which asks each term for every group it holds in order, reads the rows
+  in order instead: the presence's next bit, the row after the one
+  before, a block's bases only as a row starts it, no seek (score
+  disjunctions had taken 1.3% more cycles on x86-64 with a seek per
+  entry). Layout 14 carries the length classes too: an index of layout 12
   or 13 must be rebuilt. Together, with the two branch-free lookups below
   (replay at 150 million rows on Sapphire Rapids against layout 12, three
   rounds, the same answers): conjunctions take 10.3% fewer cycles,
   phrases 10.4%, `full_score` conjunctions 6.9%, phrases 6.2% and
-  disjunctions 7.5%; score disjunctions 1.2% more (rounds +0.2, +0.4 and
-  +3.0%; 1.0% fewer instructions, 12% more pages, the classes'). Built
+  disjunctions 7.5%; score disjunctions took 1.2% more (12% more pages,
+  the classes'). Reading a disjunction's rows in order, and the classes
+  of a candidate holding fewer than four terms after its buckets, then
+  took score disjunctions 6.0% fewer cycles and 9.3% fewer pages,
+  `full_score` disjunctions 2.7% fewer cycles, the other styles 0.2% to
+  1.2% fewer (three rounds against `a908527`, the same answers). Built
   afresh, the 150 million-row index is 0.84% larger (37.45 to 37.76 GB)
   and its build 1.1% longer.
 - Segments in TIN's shape store a group's postings list of at most 64
