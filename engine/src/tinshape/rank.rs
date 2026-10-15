@@ -53,10 +53,10 @@ const SEEK_RATIO: usize = 4;
 /// probed by the candidates, its first lines its header and first members.
 const AHEAD_LINES: usize = 4;
 
-/// Directory entries [`Walk::ask_next`] looks through for another required
-/// term's entry of the lead's next group, from its last: a look ahead that
-/// must not cost what the walk's own seek (by skip points) would not.
-const AHEAD_STEPS: usize = 8;
+/// Groups past another required term's last entry [`Walk::ask_next`] looks
+/// for its entry of the lead's next group within: further, the walk's own
+/// seek (by skip points) costs less than a look ahead would.
+const AHEAD_REACH: u32 = 64;
 
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
@@ -1611,7 +1611,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         };
         let set = self.terms[t].as_ref().expect("required");
         let mem = &mut self.mems[t];
-        if let Some(at) = set.near_group(next, mem.hint, AHEAD_STEPS) {
+        if let Some(at) = set.near_group(next, mem.hint, AHEAD_REACH) {
             (mem.ahead, mem.ahead_group) = (at, next);
             set.prefetch_entry(at, AHEAD_LINES);
         }
