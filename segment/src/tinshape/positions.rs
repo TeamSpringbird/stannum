@@ -52,22 +52,28 @@ const NO_SUB: u16 = u16::MAX;
 
 /// Skips `n` varints from byte `p`, each ending at a byte below 0x80,
 /// counted eight bytes at a time.
+///
+/// The word holding the `n`th end finds it without a loop over the ends
+/// before it, whose count (an entry's positions) varies from entry to
+/// entry: byte `k` of `seen` counts the ends in bytes `0..=k`, and the
+/// first byte where that reaches `n` (at most 8 each, so adding
+/// `0x80 - n` to every byte carries into none) has its top bit set.
 #[inline]
 fn skip_varints(bytes: &[u8], mut p: usize, mut n: u32) -> Result<usize> {
+    const ONES: u64 = 0x0101_0101_0101_0101;
     while n > 0 {
         if let Some(chunk) = bytes.get(p..p + 8) {
             let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
-            let mut ends = !word & 0x8080_8080_8080_8080;
+            let ends = !word & 0x8080_8080_8080_8080;
             let c = ends.count_ones();
             if c < n {
                 n -= c;
                 p += 8;
                 continue;
             }
-            for _ in 1..n {
-                ends &= ends - 1;
-            }
-            return Ok(p + ends.trailing_zeros() as usize / 8 + 1);
+            let seen = (ends >> 7).wrapping_mul(ONES);
+            let reached = seen.wrapping_add(u64::from(0x80 - n) * ONES) & 0x8080_8080_8080_8080;
+            return Ok(p + reached.trailing_zeros() as usize / 8 + 1);
         }
         let b = *bytes.get(p).ok_or(Error::Truncated)?;
         p += 1;
@@ -404,6 +410,21 @@ mod tests {
         }
         assert!(positions.locate(count).is_err());
         positions
+    }
+
+    proptest::proptest! {
+        /// Skipping `n` varints ends one past the `n`th byte below 0x80,
+        /// from any start, in a word or across words.
+        #[test]
+        fn skips_to_the_nth_end(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..40), p in 0usize..40) {
+            let p = p.min(bytes.len());
+            let ends: Vec<usize> = (p..bytes.len()).filter(|&i| bytes[i] < 0x80).collect();
+            for n in 0..=ends.len() as u32 {
+                let want = if n == 0 { p } else { ends[n as usize - 1] + 1 };
+                proptest::prop_assert_eq!(skip_varints(&bytes, p, n).unwrap(), want);
+            }
+            proptest::prop_assert!(skip_varints(&bytes, p, ends.len() as u32 + 1).is_err());
+        }
     }
 
     #[test]
