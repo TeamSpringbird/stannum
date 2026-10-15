@@ -157,6 +157,17 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- A term lookup searches the term map's block index by each sampled block's
+  first eight bytes, held in a dense array, comparing a term's bytes only
+  among samples of its key; it read the probed samples' terms, a cache line
+  apart, and nearly every step missed the cache in a `memcmp` (at 150M rows
+  the lookups' `memcmp` was 3% of x86-64 conjunction cycles). A block's
+  entries are read forward once from their sample, and each next term keeps
+  its shared prefix in place, its order checked from its first byte past
+  it. On x86-64 a query's median time falls 4.7% for conjunctions, 4.6%
+  for phrases, 3.9-4.1% with every term scored, 0.8-1.4% for
+  disjunctions; total cycles 0.2-1.4% (aarch64: 1.1-1.7% fewer
+  instructions for conjunctions and phrases).
 - The DL sidecar of a segment in TIN's shape holds each document's length
   class, two bits by rank (shorter than 16, 64, 256 words, or longer;
   page layout 14), and a ranked walk bounds a candidate at its class's
