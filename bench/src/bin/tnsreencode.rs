@@ -5,11 +5,12 @@
 //! Re-encodes dumped `TNS1` segments of page layout version 14, 13, 12, 11,
 //! 10, 9, 8 or 6 to version 16, whose grouped records' directories are rows
 //! of fixed width found by a group's rank and hold short lists as arrays,
-//! whose containers of 16 members or more carry page masks, and whose DL
+//! whose groups of 16 members or more carry page masks, and whose DL
 //! sidecar holds length classes (or, with `--keep-records`, records as they
 //! were but for their headers and directories: no masks), and reports what
 //! that costs. Version 14 has its records encoded again (step 5, with
-//! `--fresh` or not; its containers copied, each given its mask). Version 13 (the DL sidecar's length classes, its
+//! `--fresh` or not; its containers copied, each group given its mask).
+//! Version 13 (the DL sidecar's length classes, its
 //! directories still varint entries) has its directories rewritten; with
 //! `--keep-records` every other area, and the header's flags, are copied.
 //!

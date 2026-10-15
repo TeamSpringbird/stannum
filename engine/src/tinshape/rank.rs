@@ -32,14 +32,13 @@ use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
-    MASK_BYTES, MASK_MIN, array_bytes, higher, lower,
+    MASK_MIN, array_bytes, higher, lower,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
 use super::{
-    Node, Part, RankedAnswer, Src, TermSet, Touch, container_bytes, kernels, matches, open_terms,
-    required_terms,
+    Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
 };
 use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
@@ -1695,8 +1694,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     /// Whether the required terms' page masks rule group `g` out before
-    /// any container is loaded (TIN's progressive refinement). Checked
-    /// only where the second term's container carries a mask: the lead's
+    /// any container is loaded (TIN's progressive refinement, from the
+    /// directories: no page of the containers). Checked only where the
+    /// second term's group carries a mask: the lead's
     /// (if it carries one), the second's and each later term's are ANDed
     /// until the AND is empty, or a later term lacks the group. A walk
     /// that goes on loads the containers whose entries were read here (a
@@ -1735,28 +1735,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         false
     }
 
-    /// Required term `t`'s page mask in group `g`: `None` when a grouped
-    /// term lacks the group, `Some(None)` when its container carries no
-    /// mask (or the term is not grouped).
+    /// Required term `t`'s page mask in group `g`, from its directory:
+    /// `None` when a grouped term lacks the group, `Some(None)` when the
+    /// group carries no mask (or the term is not grouped).
     #[inline]
     fn mask_of(&mut self, t: usize, g: u32) -> Option<Option<[u64; 4]>> {
         let set = self.terms[t].as_ref().expect("required");
         if !set.has_masks() {
             return Some(None);
         }
-        let mem = &mut self.mems[t];
-        let found = set.find(g, &mut mem.hint)?;
-        let Src::Container { entry, at, .. } = found.src else {
+        let found = set.find(g, &mut self.mems[t].hint)?;
+        let Src::Container { entry, .. } = found.src else {
             return Some(None);
         };
-        let Some(bytes) = set.postings.mask(&entry) else {
-            return Some(None);
-        };
-        self.touch.touch(Part::Payload, at - MASK_BYTES, MASK_BYTES);
-        let bytes = container_bytes(bytes);
-        Some(Some(std::array::from_fn(|w| {
-            u64::from_le_bytes(bytes[8 * w..8 * w + 8].try_into().expect("eight bytes"))
-        })))
+        Some(set.postings.mask(&entry))
     }
 
     /// Intersects the required terms' members in group `g`, which the lead

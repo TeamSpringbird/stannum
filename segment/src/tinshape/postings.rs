@@ -18,16 +18,11 @@
 //!            (bucket u8, min_length varint)* ascending in both: the
 //!            block's impact frontier
 //! grouped := form u8 (2, | 0x10 when the frontiers' lengths are rounded,
-//!                     | 0x20 when its containers carry page masks),
+//!                     | 0x20 when its groups carry page masks),
 //!            directory_len varint (bytes of the directory: where the
 //!                                  containers start),
 //!            payload_len varint,
-//!            directory, (mask? container)*, tf
-//! mask    := with the form's 0x20, before the container of a group of at
-//!            least 16 members that is not a grid: a bit per page of the
-//!            group's span, bit p of u64le word p / 64 set for each page
-//!            holding a member (page layout 16); the directory's container
-//!            bytes count it as its container's
+//!            directory, container*, tf
 //! directory := groups varint,
 //!            widths u8 * 4 (bits of a row's deltas of postings, container
 //!                           bytes, TF bits and frontier bytes; at most 32),
@@ -39,7 +34,7 @@
 //!              (at most 120): kind (2 bits), the frontier's largest bucket
 //!              (4), then each total's delta from its block's base; the
 //!              last row (kind and bucket 0) holds the record's totals,
-//!            group frontier*, one per group in order
+//!            (mask? group frontier)*, one per group in order
 //! presence := groups * 16 > the segment's groups:
 //!              a bitmap over the segment's groups, bit g of u64le word
 //!              g / 64 set for each group held, then per word the groups
@@ -53,6 +48,11 @@
 //!             | bucket - previous bucket - 1) varint, for each later pair:
 //!            the group's impact frontier, its lengths rounded down to six
 //!            significant bits when the form says so
+//! mask    := with the form's 0x20, before the frontier of a group of at
+//!            least 16 members whose container is not a grid: a bit per
+//!            page of the group's span, bit p of u64le word p / 64 set for
+//!            each page holding a member (page layout 16); the directory's
+//!            frontier bytes count it as its frontier's
 //! container := grid:  the group's slots in whole u64le words, bit `local`
 //!                     set for each member
 //!            | ef:    ef(count local slots below the group's slot count)
@@ -118,17 +118,18 @@ pub const FORM_COMPACT: u8 = 0x40;
 /// Set in a grouped record's form when its frontiers' lengths are rounded
 /// down to six significant bits ([`round_length`]).
 pub const FORM_ROUNDED: u8 = 0x10;
-/// Set in a grouped record's form when its containers of [`MASK_MIN`]
-/// members or more, but grids, carry a page mask (page layout 16).
+/// Set in a grouped record's form when its groups of [`MASK_MIN`] members
+/// or more, but grids, carry a page mask in the directory, before their
+/// frontier (page layout 16).
 pub const FORM_MASKS: u8 = 0x20;
 
-/// Least members of a group whose container carries a page mask.
+/// Least members of a group that carries a page mask.
 pub const MASK_MIN: u32 = 16;
 /// Bytes of a page mask: a bit per page of a group's span of at most 256.
 pub const MASK_BYTES: usize = 32;
 
-/// Whether a group container of `kind` and `count` members carries a page
-/// mask in a record of masks.
+/// Whether a group of `count` members in a container of `kind` carries a
+/// page mask in a record of masks.
 #[inline]
 pub const fn masked(kind: u8, count: u32) -> bool {
     kind != KIND_GRID && count >= MASK_MIN
@@ -211,8 +212,8 @@ pub struct Options {
     /// ([`super::docs::LENGTH_CLASSES`]), which a ranked walk bounds a
     /// candidate by before it reads the exact length.
     pub length_classes: bool,
-    /// Whether a grouped record's containers of [`MASK_MIN`] members or
-    /// more carry their page masks ([`FORM_MASKS`]).
+    /// Whether a grouped record's groups of [`MASK_MIN`] members or more
+    /// carry their page masks ([`FORM_MASKS`]).
     pub page_masks: bool,
 }
 
@@ -295,7 +296,7 @@ pub struct Stats {
     /// Bytes the array containers take less what their members would take
     /// as Elias-Fano lists (negative for a few lists of one to four).
     pub array_excess: isize,
-    /// Bytes of the containers' page masks (part of `payload`).
+    /// Bytes of the groups' page masks (part of `frontier_bytes`).
     pub mask_bytes: usize,
 }
 
@@ -625,7 +626,6 @@ pub fn encode_reusing<'r>(
     let grouped_len = grouped.len() as isize
         - grouped_stats.frontier_bytes as isize
         - grouped_stats.directory_bytes as isize
-        - grouped_stats.mask_bytes as isize
         + grouped_stats.entry_varints as isize
         - grouped_stats.array_excess;
     let use_sparse =
@@ -851,14 +851,6 @@ fn encode_groups<'r>(
             stats.entry_varints += varint_len(best as u64);
         }
         let before = bodies.len();
-        let mask = options.page_masks && masked(kind, locals.len() as u32);
-        if mask {
-            for word in page_mask(&locals, starts) {
-                bodies.extend_from_slice(&word.to_le_bytes());
-            }
-            stats.mask_bytes += MASK_BYTES;
-        }
-        let body = bodies.len();
         if let Some(r) = reused {
             bodies.extend_from_slice(r.bytes);
         } else {
@@ -879,7 +871,7 @@ fn encode_groups<'r>(
                 _ => bodies.extend_from_slice(&candidate),
             }
         }
-        debug_assert_eq!(bodies.len() - body, best);
+        debug_assert_eq!(bodies.len() - before, best);
         // The group's frontier, from its postings (a copied container's
         // included: a merge's is the least length per bucket over the
         // inputs' live postings there), and its buckets at its width.
@@ -890,7 +882,15 @@ fn encode_groups<'r>(
                 .zip(lengths[from..at].iter().copied()),
             options.group_frontiers,
         );
+        // Its span in the directory: its mask, if it carries one, then its
+        // frontier.
         let frontier = frontiers.len();
+        if options.page_masks && masked(kind, locals.len() as u32) {
+            for word in page_mask(&locals, starts) {
+                frontiers.extend_from_slice(&word.to_le_bytes());
+            }
+            stats.mask_bytes += MASK_BYTES;
+        }
         put_group_frontier(&mut frontiers, &pairs);
         stats.frontiers += 1;
         // A group's buckets are always packed at the group's own width.
@@ -903,10 +903,8 @@ fn encode_groups<'r>(
             index: index as u32,
             count: locals.len() as u32,
             kind,
-            // A mask counts as its container's bytes (a reader steps over
-            // it).
             at: u32::try_from(before).expect("a record's containers fit 32 bits"),
-            len: (bodies.len() - before) as u32,
+            len: best as u32,
             first: from as u32,
             frontier: frontier as u32,
             tf_bit: u32::try_from(tf_total).expect("a record's TF tail fits 32 bits"),
@@ -1293,24 +1291,14 @@ impl<'a> Postings<'a> {
             .tag(Kind::Container)
     }
 
-    /// The page mask before `entry`'s container, if it carries one
-    /// ([`FORM_MASKS`]): [`MASK_BYTES`] bytes, bit `p` set for each page of
-    /// the group's span holding a member.
+    /// `entry`'s page mask, if its group carries one ([`FORM_MASKS`],
+    /// [`Directory::mask`]).
     #[inline]
-    pub fn mask(&self, entry: &GroupEntry) -> Option<Bytes<'a>> {
-        let Form::Grouped(dir) = &self.form else {
-            return None;
-        };
-        if !dir.has_mask(entry) {
-            return None;
+    pub fn mask(&self, entry: &GroupEntry) -> Option<[u64; 4]> {
+        match &self.form {
+            Form::Grouped(dir) => dir.mask(entry),
+            _ => None,
         }
-        let at = self.containers_at + entry.at as usize;
-        Some(
-            self.payload
-                .sub(at - MASK_BYTES, at)
-                .expect("a mask within its payload")
-                .tag(Kind::Container),
-        )
     }
 
     /// Calls `visit` with every slot, in order.
@@ -1709,10 +1697,31 @@ impl Directory {
         self.masks
     }
 
-    /// Whether `entry`'s container carries a page mask ([`FORM_MASKS`]).
+    /// Whether `entry`'s group carries a page mask ([`FORM_MASKS`]).
     #[inline]
     pub fn has_mask(&self, entry: &GroupEntry) -> bool {
         self.masks && masked(entry.kind, entry.count)
+    }
+
+    /// `entry`'s page mask, if its group carries one ([`FORM_MASKS`]):
+    /// [`MASK_BYTES`] bytes before its frontier, bit `p` set for each page
+    /// of the group's span holding a member. Read from the directory's
+    /// copy: no page of the record.
+    #[inline]
+    pub fn mask(&self, entry: &GroupEntry) -> Option<[u64; 4]> {
+        if !self.has_mask(entry) {
+            return None;
+        }
+        let at = entry.frontier as usize - MASK_BYTES;
+        Some(std::array::from_fn(|w| {
+            u64::from_le_bytes(self.load(at + 8 * w))
+        }))
+    }
+
+    /// Where `entry`'s span of the directory starts: its mask, if any,
+    /// then its frontier.
+    fn span_start(&self, entry: &GroupEntry) -> usize {
+        entry.frontier as usize - if self.has_mask(entry) { MASK_BYTES } else { 0 }
     }
 
     #[inline]
@@ -2000,10 +2009,9 @@ impl Directory {
         let max_bucket = (head >> 2) as u8;
         let width = TF_WIDTH[usize::from(max_bucket)];
         let count = next[FIRST].wrapping_sub(v[FIRST]);
-        // A container's mask lies before it, counted as its bytes.
+        let len = next[AT].wrapping_sub(v[AT]);
+        // A group's mask lies before its frontier, counted as its bytes.
         let mask = MASK_BYTES as u32 * u32::from(self.masks && masked(kind, count));
-        let span = next[AT].wrapping_sub(v[AT]);
-        let len = span.wrapping_sub(mask);
         // A grid's and an array's length follow from the group and the
         // count, read as they are; an Elias-Fano list or a paged container
         // checks its own when parsed (its exact length is the verifier's,
@@ -2021,13 +2029,12 @@ impl Directory {
             && count <= slots
             && len == expected
             && len > 0
-            && span > mask
             && (kind != KIND_ARRAY || slots <= ARRAY_SLOTS_MAX)
             && u64::from(next[TF].wrapping_sub(v[TF])) == u64::from(count) * u64::from(width)
             && u64::from(next[TF]) <= self.tf_bits
             && u64::from(next[AT]) <= self.containers
             && next[FIRST] <= self.df
-            && next[FRONTIER] > v[FRONTIER];
+            && next[FRONTIER] > v[FRONTIER] + mask;
         if !ok {
             return Err(Error::Corrupt("group directory entry"));
         }
@@ -2037,10 +2044,10 @@ impl Directory {
             index,
             count,
             kind,
-            at: v[AT] + mask,
+            at: v[AT],
             len,
             first: v[FIRST],
-            frontier: (frontiers + v[FRONTIER] as usize) as u32,
+            frontier: (frontiers + (v[FRONTIER] + mask) as usize) as u32,
             tf_bit: v[TF],
             width,
             max_bucket,
@@ -2155,7 +2162,7 @@ impl Directory {
             }
             let mut at = e.frontier as usize;
             let max = skip_group_frontier(self.bytes(), &mut at)?;
-            let end = entries.get(i + 1).map_or(self.end, |n| n.frontier as usize);
+            let end = entries.get(i + 1).map_or(self.end, |n| self.span_start(n));
             if max != e.max_bucket || at != end {
                 return Err(Error::Corrupt("group frontier"));
             }

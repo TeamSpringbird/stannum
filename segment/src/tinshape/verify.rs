@@ -170,9 +170,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                             starts,
                             |l| locals.push(l),
                         )?;
-                        let want = super::postings::page_mask(&locals, starts);
-                        let mask = mask.all()?;
-                        if (0..4).any(|w| mask[8 * w..8 * w + 8] != want[w].to_le_bytes()) {
+                        if mask != super::postings::page_mask(&locals, starts) {
                             problems.push(format!(
                                 "group {}'s page mask is not its members' pages",
                                 e.index
