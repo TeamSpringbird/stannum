@@ -1125,6 +1125,8 @@ struct Row {
     pages: Pages,
     answer: tin::RankedAnswer,
     pins: u64,
+    /// Pages the timed passes pinned, all of them.
+    timed_pins: u64,
     /// The most pages held pinned at once in the instrumented pass, and
     /// the private refcount hash table operations its pins made.
     peak: u64,
@@ -1358,6 +1360,7 @@ fn run() -> Result<bool, String> {
                 .unwrap_or_default()
         });
         let counters0 = process_counters();
+        let timed_pins0 = PINS.get();
         for _ in 0..args.repeat {
             if args.forget {
                 reader.forget();
@@ -1398,6 +1401,7 @@ fn run() -> Result<bool, String> {
             (scorer_allocs, walk_allocs) = (a1.since(a0), a2.since(a1));
         }
         let counters1 = process_counters();
+        let timed_pins = PINS.get() - timed_pins0;
         let timed: [u64; 3] = std::array::from_fn(|i| counters1[i] - counters0[i]);
         let mut pages = Pages::default();
         let pins0 = PINS.get();
@@ -1459,6 +1463,7 @@ fn run() -> Result<bool, String> {
             pages,
             answer: counters,
             pins: PINS.get() - pins0,
+            timed_pins,
             peak: REFS.with_borrow(|refs| refs.peak),
             hash_ops: REFS.with_borrow(|refs| refs.hash_ops) - hash0,
             kinds: segment::tinshape::blob::stats(),
@@ -1639,13 +1644,15 @@ fn run() -> Result<bool, String> {
         }
         println!("{line}");
     }
-    println!("\npages pinned per query (in place), mean");
+    println!("\npages pinned per query (in place), mean: the instrumented pass, a timed pass");
     for style in &styles {
         let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
+        let n = of.len().max(1) as f64;
         println!(
-            "{:<12} {:>10.1}",
+            "{:<12} {:>10.1} {:>10.1}",
             style,
-            of.iter().map(|r| r.pins).sum::<u64>() as f64 / of.len().max(1) as f64
+            of.iter().map(|r| r.pins).sum::<u64>() as f64 / n,
+            of.iter().map(|r| r.timed_pins).sum::<u64>() as f64 / n / args.repeat.max(1) as f64
         );
     }
     println!(
