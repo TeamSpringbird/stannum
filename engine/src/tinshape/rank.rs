@@ -38,7 +38,7 @@ use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
 use super::{
-    Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
+    G, Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
 };
 use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
@@ -52,6 +52,10 @@ const SEEK_RATIO: usize = 4;
 /// a rare lead's container is a line or a few; a common term's is
 /// probed by the candidates, its first lines its header and first members.
 const AHEAD_LINES: usize = 4;
+
+/// Lines of another required term's grid asked for at the lead's members
+/// in its next group ([`Walk::ask_next`]): a rare lead's few members.
+const AHEAD_MEMBER_LINES: usize = 16;
 
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
@@ -778,6 +782,78 @@ impl Mem<'_> {
     }
 }
 
+/// The lead's members in its next group, read a group ahead
+/// ([`Walk::ask_next`]) and taken when the walk reaches it.
+struct Ahead {
+    /// The lead's directory position they were read from, `usize::MAX`
+    /// for none.
+    entry: usize,
+    first: u32,
+    count: u32,
+    /// The container's blob offset and length, touched when taken.
+    at: usize,
+    len: usize,
+    /// Local slots, ascending.
+    list: Vec<u32>,
+}
+
+impl Default for Ahead {
+    fn default() -> Self {
+        Self {
+            entry: usize::MAX,
+            first: 0,
+            count: 0,
+            at: 0,
+            len: 0,
+            list: Vec::new(),
+        }
+    }
+}
+
+/// Reads the members of the lead `set`'s directory entry `i` into `ahead`
+/// as [`load`] would decode them (a container decoded into a list, not a
+/// grid), where its container lies in memory already: nothing is pinned,
+/// loaded or touched for it. False, with nothing read, otherwise.
+fn read_ahead(set: &TermSet<'_>, geometry: &Geometry, i: usize, ahead: &mut Ahead) -> Result<bool> {
+    ahead.entry = usize::MAX;
+    if i >= set.group_count() {
+        return Ok(false);
+    }
+    let G {
+        index,
+        src: Src::Container {
+            entry: e,
+            bytes,
+            at,
+        },
+        ..
+    } = set.group_at(i)
+    else {
+        return Ok(false);
+    };
+    if e.kind == KIND_GRID || !bytes.resident() {
+        return Ok(false);
+    }
+    let index = index as usize;
+    ahead.list.clear();
+    kernels::container_locals(
+        &e,
+        bytes.all()?,
+        geometry.groups[index].slots(),
+        geometry.starts(index),
+        &mut ahead.list,
+    )?;
+    *ahead = Ahead {
+        entry: i,
+        first: e.first,
+        count: e.count,
+        at,
+        len: bytes.len(),
+        list: std::mem::take(&mut ahead.list),
+    };
+    Ok(true)
+}
+
 /// `x`'s place in [`f32::total_cmp`]'s order: `a.total_cmp(&b)` is
 /// `order_key(a).cmp(&order_key(b))` (the standard library's own mapping).
 #[inline(always)]
@@ -1390,6 +1466,8 @@ struct Walk<'s, 'a, T: Touch> {
     staged_span: Vec<u32>,
     staged_order: Vec<u32>,
     cands: Vec<u32>,
+    /// The lead's members in its next group, read a group ahead.
+    ahead: Ahead,
     /// The group at hand's sieve ([`Walk::sieve`]): the terms it reads,
     /// per scoring term what bounds a candidate before that term's bucket
     /// is read, and its scratch.
@@ -1552,7 +1630,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.answer.windows_pruned += 1;
                 continue;
             }
-            if self.mems[lead].loaded != g + 1 {
+            if self.mems[lead].loaded == g + 1 {
+            } else if self.ahead.entry == self.mems[lead].hint {
+                self.take_ahead(g);
+            } else {
                 let set = self.terms[lead].as_mut().expect("the lead");
                 load(
                     set,
@@ -1563,7 +1644,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     self.touch,
                 )?;
             }
-            self.ask_next();
+            self.ask_next()?;
             let more = if self.all_grids(g) {
                 self.dense_group(g)?
             } else {
@@ -1577,29 +1658,66 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(())
     }
 
-    /// A group ahead: while the lead's group at hand is walked, asks for
-    /// the first reads of its next group, of the lead and of every other
-    /// required term holding it (see [`TermSet::prefetch_entry`]), all at
-    /// once. Each is the start of a chain of dependent reads (the entry
-    /// locates the container, which lists the members that index the next
-    /// term's), so out-of-order execution overlaps little of one with
-    /// another; asked for together a group early, they arrive together,
-    /// while this group's work runs. The lead's next group is its next
-    /// directory entry (a group the walk skips by its bound was asked for
-    /// for nothing).
+    /// A software pipeline over the lead's groups: while the group at hand
+    /// is walked, the lead's next group's first reads are asked for, of
+    /// the lead and of every other required term holding it (see
+    /// [`TermSet::prefetch_entry`]), all at once, and the lead's container
+    /// of the group after. Each read starts a chain of dependent reads (an
+    /// entry locates a container, whose members index the next term's), so
+    /// out-of-order execution overlaps little of one chain with another;
+    /// asked for together a group early, they arrive together while this
+    /// group's work runs.
+    ///
+    /// The lead's next container, asked for a group earlier, is decoded
+    /// now where it lies in memory ([`read_ahead`]; the walk takes its
+    /// members when it reaches the group, [`Walk::take_ahead`]), and the
+    /// lines another term's grid holds them at are asked for too: the
+    /// first probe of the next group's intersection. The lead's next group
+    /// is its next directory entry: one the walk skips by its bound was
+    /// read for nothing.
     #[inline]
-    fn ask_next(&mut self) {
+    fn ask_next(&mut self) -> Result<()> {
         let lead = self.req[0];
         let set = self.terms[lead].as_ref().expect("the lead");
-        let Some(next) = set.prefetch_entry(self.mems[lead].hint + 1, AHEAD_LINES) else {
-            return;
+        let i = self.mems[lead].hint + 1;
+        set.prefetch_entry(i + 1, AHEAD_LINES);
+        let Some(next) = set.prefetch_entry(i, AHEAD_LINES) else {
+            return Ok(());
         };
+        let members = read_ahead(set, self.geometry, i, &mut self.ahead)?;
         for &t in &self.req[1..] {
             let set = self.terms[t].as_ref().expect("required");
             let mem = &mut self.mems[t];
             mem.ahead = mem.ahead.max(mem.hint);
-            set.prefetch_group(next, &mut mem.ahead, AHEAD_LINES);
+            if set.holds_group(next, &mut mem.ahead) {
+                set.prefetch_entry(mem.ahead, AHEAD_LINES);
+                if members {
+                    set.prefetch_members(mem.ahead, &self.ahead.list, AHEAD_MEMBER_LINES);
+                }
+            }
         }
+        Ok(())
+    }
+
+    /// Loads the lead's members in group `g` from [`Walk::ahead`], which
+    /// read them from the directory entry the walk's seek reached (as
+    /// [`load`] would have).
+    fn take_ahead(&mut self, g: u32) {
+        let lead = self.req[0];
+        let (mem, ahead) = (&mut self.mems[lead], &mut self.ahead);
+        debug_assert_eq!(ahead.entry, mem.hint);
+        self.touch.touch(Part::Payload, ahead.at, ahead.len);
+        mem.loaded = g + 1;
+        mem.kind = Kind::List;
+        std::mem::swap(&mut mem.list, &mut ahead.list);
+        mem.w = 0;
+        mem.run = 0;
+        mem.pos = 0;
+        mem.first = ahead.first;
+        mem.count = ahead.count;
+        mem.entry = mem.hint;
+        mem.used += 1;
+        ahead.entry = usize::MAX;
     }
 
     /// Ends a group's reads: the pages pinned since the walk's mark are
@@ -3140,6 +3258,7 @@ pub(super) fn walk_into<'s, 'a>(
         staged_span: Vec::new(),
         staged_order: Vec::new(),
         cands: Vec::new(),
+        ahead: Ahead::default(),
         sieve_terms: Vec::new(),
         sieve_ub: Vec::new(),
         sieve_vals: Vec::new(),

@@ -430,12 +430,38 @@ impl<'a> TermSet<'a> {
         Some(entry.index)
     }
 
-    /// [`Self::prefetch_entry`] of the term's group `group`, if it holds it,
-    /// looked for from `hint` forward as [`Self::find`] does.
+    /// Whether a grouped term holds group `group`, looked for from `hint`
+    /// forward as [`Self::find`] does (the hint is left at it).
     #[inline]
-    fn prefetch_group(&self, group: u32, hint: &mut usize, lines: usize) {
-        if self.dir.is_some() && self.seek_index(group, hint) == Some(group) {
-            self.prefetch_entry(*hint, lines);
+    fn holds_group(&self, group: u32, hint: &mut usize) -> bool {
+        self.dir.is_some() && self.seek_index(group, hint) == Some(group)
+    }
+
+    /// Asks for the lines of directory entry `i`'s container that the
+    /// group's `members` (local slots, ascending) probe, at most
+    /// `max_lines` of them, where the container is a grid in memory
+    /// already: a conjunction filters its lead's members by them.
+    #[inline]
+    fn prefetch_members(&self, i: usize, members: &[u32], max_lines: usize) {
+        let Some(dir) = &self.dir else {
+            return;
+        };
+        let entry = Self::entry(dir, &self.docs, i);
+        if entry.kind != KIND_GRID {
+            return;
+        }
+        let bytes = self.postings.container(&entry);
+        let (mut last, mut asked) = (usize::MAX, 0);
+        for &local in members {
+            let byte = local as usize / 8;
+            if byte / bits::LINE != last {
+                last = byte / bits::LINE;
+                bytes.prefetch(byte, 1);
+                asked += 1;
+                if asked == max_lines {
+                    break;
+                }
+            }
         }
     }
 
