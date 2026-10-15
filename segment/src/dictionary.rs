@@ -795,13 +795,25 @@ mod tests {
         let dictionary = owned.view();
         assert!(owned.index.samples.len() > 8);
         for (i, term) in refs.iter().enumerate() {
-            assert_eq!(dictionary.get(term).unwrap(), Some(entry(i as u32)), "{term:?}");
+            assert_eq!(
+                dictionary.get(term).unwrap(),
+                Some(entry(i as u32)),
+                "{term:?}"
+            );
             let miss = format!("{term}\0");
             if terms.binary_search(&miss).is_err() {
                 assert_eq!(dictionary.get(&miss).unwrap(), None, "{miss:?}");
             }
         }
-        for miss in ["", "a", "ab\0\0", "sharedprefix", "sharedprefix0", "zzzz", "\u{ff}"] {
+        for miss in [
+            "",
+            "a",
+            "ab\0\0",
+            "sharedprefix",
+            "sharedprefix0",
+            "zzzz",
+            "\u{ff}",
+        ] {
             assert_eq!(dictionary.get(miss).unwrap(), None, "{miss:?}");
         }
         let prefixed = dictionary.prefix("sharedprefix0299").count();
