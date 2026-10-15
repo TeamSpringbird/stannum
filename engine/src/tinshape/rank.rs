@@ -491,9 +491,16 @@ impl<'s, 'a> Sc<'s, 'a> {
     #[inline(never)]
     fn bound_of(&mut self, b: usize) -> f32 {
         let scorer = &self.scorer;
-        let v = self.footer.fold_bound(b, |bucket, length| {
-            scorer.bound_through(TfBucket::new(bucket).expect("a valid bucket"), length)
-        });
+        let bucket = |b: u8| TfBucket::new(b).expect("a valid bucket");
+        // The scorer's rise tested once, not per pair (on x86-64 it held a
+        // register and a branch in each of a frontier's unrolled pairs).
+        let v = if scorer.rises() {
+            self.footer
+                .fold_bound(b, |b, length| scorer.score_bucket(bucket(b), length))
+        } else {
+            self.footer
+                .fold_bound(b, |b, length| scorer.bound_through(bucket(b), length))
+        };
         if self.grouped() {
             self.gb = b;
             self.gv = v;
