@@ -1606,14 +1606,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let Some(next) = set.prefetch_entry(self.mems[lead].hint + 1, AHEAD_LINES) else {
             return;
         };
-        let Some(&t) = self.req.get(1) else {
-            return;
-        };
-        let set = self.terms[t].as_ref().expect("required");
-        let mem = &mut self.mems[t];
-        if let Some(at) = set.near_group(next, mem.hint, AHEAD_REACH) {
-            (mem.ahead, mem.ahead_group) = (at, next);
-            set.prefetch_entry(at, AHEAD_LINES);
+        for &t in &self.req[1..] {
+            let set = self.terms[t].as_ref().expect("required");
+            let mem = &mut self.mems[t];
+            if let Some(at) = set.near_group(next, mem.hint, AHEAD_REACH) {
+                (mem.ahead, mem.ahead_group) = (at, next);
+                set.prefetch_entry(at, AHEAD_LINES);
+            }
         }
     }
 
