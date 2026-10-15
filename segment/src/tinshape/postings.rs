@@ -1962,20 +1962,23 @@ impl Directory {
         // count, read as they are; an Elias-Fano list or a paged container
         // checks its own when parsed (its exact length is the verifier's,
         // [`Self::check_entries`]). Without a branch on the kind: the kinds
-        // mix within a directory.
+        // mix within a directory. Each kind's length and largest group are
+        // looked up by it: as selects, LLVM made them branches on the kind
+        // on x86-64.
         let slots = group.slots();
         let grid = group.grid_bytes() as u32;
-        let expected = if kind == KIND_GRID { grid } else { len };
-        let expected = if kind == KIND_ARRAY {
-            2 * count
-        } else {
-            expected
-        };
+        const {
+            assert!(KIND_GRID == 0 && KIND_EF == 1 && KIND_PAGED == 2 && KIND_ARRAY == 3);
+        }
+        // An array's length wraps as the check always took it: a corrupt
+        // count of any kind is doubled now.
+        let expected = [grid, len, len, count.wrapping_mul(2)][usize::from(kind)];
+        const MOST_SLOTS: [u32; 4] = [u32::MAX, u32::MAX, u32::MAX, ARRAY_SLOTS_MAX];
         let ok = count >= 1
             && count <= slots
             && len == expected
             && len > 0
-            && (kind != KIND_ARRAY || slots <= ARRAY_SLOTS_MAX)
+            && slots <= MOST_SLOTS[usize::from(kind)]
             && u64::from(next[TF].wrapping_sub(v[TF])) == u64::from(count) * u64::from(width)
             && u64::from(next[TF]) <= self.tf_bits
             && u64::from(next[AT]) <= self.containers
