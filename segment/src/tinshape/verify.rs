@@ -154,8 +154,32 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             // most as long), and its count must be its container's.
             let entries = match &found.postings.form {
                 super::postings::Form::Grouped(dir) => {
-                    dir.check_entries(&segment.docs.geometry.groups)?;
-                    dir.entries(&segment.docs.geometry.groups)?
+                    let geometry = &segment.docs.geometry;
+                    dir.check_entries(&geometry.groups)?;
+                    let entries = dir.entries(&geometry.groups)?;
+                    // A page mask is its container's members' pages.
+                    for e in &entries {
+                        let Some(mask) = found.postings.mask(e) else {
+                            continue;
+                        };
+                        let starts = geometry.starts(e.index as usize);
+                        let mut locals = Vec::with_capacity(e.count as usize);
+                        super::postings::for_each_local(
+                            e,
+                            found.postings.container(e).all()?,
+                            starts,
+                            |l| locals.push(l),
+                        )?;
+                        let want = super::postings::page_mask(&locals, starts);
+                        let mask = mask.all()?;
+                        if (0..4).any(|w| mask[8 * w..8 * w + 8] != want[w].to_le_bytes()) {
+                            problems.push(format!(
+                                "group {}'s page mask is not its members' pages",
+                                e.index
+                            ));
+                        }
+                    }
+                    entries
                 }
                 _ => Vec::new(),
             };

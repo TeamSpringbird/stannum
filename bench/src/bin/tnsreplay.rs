@@ -883,6 +883,7 @@ impl Reader {
             total.class_cuts += a.class_cuts;
             total.windows += a.windows;
             total.windows_pruned += a.windows_pruned;
+            total.masked_out += a.masked_out;
         }
         Some((top.into_rows(), total, work))
     }
@@ -1839,7 +1840,8 @@ fn run() -> Result<bool, String> {
         );
     }
     println!(
-        "\nwalk per query, mean: examined, scored, position checks, windows, pruned, ruled out by length class"
+        "\nwalk per query, mean: examined, scored, position checks, windows, pruned, ruled out by length class, \
+         by page masks"
     );
     for style in &styles {
         let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
@@ -1848,7 +1850,7 @@ fn run() -> Result<bool, String> {
             of.iter().map(|r| f(&r.answer)).sum::<u64>() as f64 / n
         };
         println!(
-            "{:<12} examined {:>10.0} scored {:>10.0} checks {:>8.0} windows {:>8.0} pruned {:>8.0} class cuts {:>8.0}",
+            "{:<12} examined {:>10.0} scored {:>10.0} checks {:>8.0} windows {:>8.0} pruned {:>8.0} class cuts {:>8.0} masked out {:>8.0}",
             style,
             m(&|a| a.candidates),
             m(&|a| a.scored),
@@ -1856,6 +1858,7 @@ fn run() -> Result<bool, String> {
             m(&|a| a.windows),
             m(&|a| a.windows_pruned),
             m(&|a| a.class_cuts),
+            m(&|a| a.masked_out),
         );
     }
     println!(

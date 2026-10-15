@@ -17,11 +17,17 @@
 //!            frontier_len u8 (1..=16),
 //!            (bucket u8, min_length varint)* ascending in both: the
 //!            block's impact frontier
-//! grouped := form u8 (2, | 0x10 when the frontiers' lengths are rounded),
+//! grouped := form u8 (2, | 0x10 when the frontiers' lengths are rounded,
+//!                     | 0x20 when its containers carry page masks),
 //!            directory_len varint (bytes of the directory: where the
 //!                                  containers start),
 //!            payload_len varint,
-//!            directory, container*, tf
+//!            directory, (mask? container)*, tf
+//! mask    := with the form's 0x20, before the container of a group of at
+//!            least 16 members that is not a grid: a bit per page of the
+//!            group's span, bit p of u64le word p / 64 set for each page
+//!            holding a member (page layout 16); the directory's container
+//!            bytes count it as its container's
 //! directory := groups varint,
 //!            widths u8 * 4 (bits of a row's deltas of postings, container
 //!                           bytes, TF bits and frontier bytes; at most 32),
@@ -59,6 +65,15 @@
 //!                     run    (first and count, less one, packed so)
 //!            | array: count u16le local slots, ascending (a group of at
 //!                     most 65,536 slots; kind 3, page layout 11)
+//! ```
+//!
+//! A conjunction or a phrase ANDs the page masks of a group's required
+//! terms before it decodes their containers, and passes a group whose AND
+//! is empty (TIN's progressive refinement: its level-1 page bitmaps). A
+//! group of fewer members holds them in a few bytes, and a grid is its own
+//! mask, so neither carries one.
+//!
+//! ```text
 //! tf      := sparse: per block, its buckets packed at the block's width,
 //!            each block's starting on a byte;
 //!            grouped: per group in directory order, its buckets packed at
@@ -103,6 +118,35 @@ pub const FORM_COMPACT: u8 = 0x40;
 /// Set in a grouped record's form when its frontiers' lengths are rounded
 /// down to six significant bits ([`round_length`]).
 pub const FORM_ROUNDED: u8 = 0x10;
+/// Set in a grouped record's form when its containers of [`MASK_MIN`]
+/// members or more, but grids, carry a page mask (page layout 16).
+pub const FORM_MASKS: u8 = 0x20;
+
+/// Least members of a group whose container carries a page mask.
+pub const MASK_MIN: u32 = 16;
+/// Bytes of a page mask: a bit per page of a group's span of at most 256.
+pub const MASK_BYTES: usize = 32;
+
+/// Whether a group container of `kind` and `count` members carries a page
+/// mask in a record of masks.
+#[inline]
+pub const fn masked(kind: u8, count: u32) -> bool {
+    kind != KIND_GRID && count >= MASK_MIN
+}
+
+/// The page mask of a group's members: `locals` its local slots, in order,
+/// and `starts` the group's page starts ([`Geometry::starts`]).
+pub fn page_mask(locals: &[u32], starts: &[u32]) -> [u64; 4] {
+    let mut mask = [0u64; 4];
+    let mut page = 0;
+    for &local in locals {
+        while starts[page + 1] <= local {
+            page += 1;
+        }
+        mask[page / 64] |= 1 << (page % 64);
+    }
+    mask
+}
 
 /// Postings a footer-less record holds at most.
 pub const COMPACT_MAX: u32 = 8;
@@ -167,6 +211,9 @@ pub struct Options {
     /// ([`super::docs::LENGTH_CLASSES`]), which a ranked walk bounds a
     /// candidate by before it reads the exact length.
     pub length_classes: bool,
+    /// Whether a grouped record's containers of [`MASK_MIN`] members or
+    /// more carry their page masks ([`FORM_MASKS`]).
+    pub page_masks: bool,
 }
 
 /// [`Options::group_frontiers`].
@@ -207,6 +254,7 @@ impl Default for Options {
             inline_lengths_min_documents: 1 << 16,
             group_frontiers: GroupFrontiers::Rounded,
             length_classes: true,
+            page_masks: true,
         }
     }
 }
@@ -247,6 +295,8 @@ pub struct Stats {
     /// Bytes the array containers take less what their members would take
     /// as Elias-Fano lists (negative for a few lists of one to four).
     pub array_excess: isize,
+    /// Bytes of the containers' page masks (part of `payload`).
+    pub mask_bytes: usize,
 }
 
 impl Stats {
@@ -575,6 +625,7 @@ pub fn encode_reusing<'r>(
     let grouped_len = grouped.len() as isize
         - grouped_stats.frontier_bytes as isize
         - grouped_stats.directory_bytes as isize
+        - grouped_stats.mask_bytes as isize
         + grouped_stats.entry_varints as isize
         - grouped_stats.array_excess;
     let use_sparse =
@@ -598,6 +649,7 @@ pub fn encode_reusing<'r>(
             } else {
                 0
             }
+            | if options.page_masks { FORM_MASKS } else { 0 }
     });
     if !use_sparse {
         footer.clear();
@@ -634,6 +686,7 @@ pub fn encode_reusing<'r>(
         stats.entry_varints = grouped_stats.entry_varints;
         stats.frontiers = grouped_stats.frontiers;
         stats.array_excess = grouped_stats.array_excess;
+        stats.mask_bytes = grouped_stats.mask_bytes;
     }
     stats
 }
@@ -798,6 +851,14 @@ fn encode_groups<'r>(
             stats.entry_varints += varint_len(best as u64);
         }
         let before = bodies.len();
+        let mask = options.page_masks && masked(kind, locals.len() as u32);
+        if mask {
+            for word in page_mask(&locals, starts) {
+                bodies.extend_from_slice(&word.to_le_bytes());
+            }
+            stats.mask_bytes += MASK_BYTES;
+        }
+        let body = bodies.len();
         if let Some(r) = reused {
             bodies.extend_from_slice(r.bytes);
         } else {
@@ -818,7 +879,7 @@ fn encode_groups<'r>(
                 _ => bodies.extend_from_slice(&candidate),
             }
         }
-        debug_assert_eq!(bodies.len() - before, best);
+        debug_assert_eq!(bodies.len() - body, best);
         // The group's frontier, from its postings (a copied container's
         // included: a merge's is the least length per bucket over the
         // inputs' live postings there), and its buckets at its width.
@@ -842,8 +903,10 @@ fn encode_groups<'r>(
             index: index as u32,
             count: locals.len() as u32,
             kind,
+            // A mask counts as its container's bytes (a reader steps over
+            // it).
             at: u32::try_from(before).expect("a record's containers fit 32 bits"),
-            len: best as u32,
+            len: (bodies.len() - before) as u32,
             first: from as u32,
             frontier: frontier as u32,
             tf_bit: u32::try_from(tf_total).expect("a record's TF tail fits 32 bits"),
@@ -1069,7 +1132,8 @@ impl<'a> Postings<'a> {
         let mut at = 1;
         let grouped = form & 3 == FORM_GROUPED;
         let rounded = form & FORM_ROUNDED != 0;
-        if rounded && !grouped {
+        let masks = form & FORM_MASKS != 0;
+        if (rounded || masks) && !grouped {
             return Err(Error::Corrupt("postings form"));
         }
         let footer_len = if form & FORM_COMPACT != 0 {
@@ -1090,7 +1154,7 @@ impl<'a> Postings<'a> {
             0
         };
         let compact = form & FORM_COMPACT != 0;
-        let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_ROUNDED);
+        let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_ROUNDED | FORM_MASKS);
         let footer_at = at;
         let payload_at = footer_at + footer_len;
         let lengths_at = payload_at + payload_len;
@@ -1145,6 +1209,7 @@ impl<'a> Postings<'a> {
                     df,
                     (payload.len() - end) as u64,
                     tf_len as u64,
+                    masks,
                 )?))
             }
             _ => return Err(Error::Corrupt("postings form")),
@@ -1226,6 +1291,26 @@ impl<'a> Postings<'a> {
             .sub(at, at + entry.len as usize)
             .expect("a container within its payload")
             .tag(Kind::Container)
+    }
+
+    /// The page mask before `entry`'s container, if it carries one
+    /// ([`FORM_MASKS`]): [`MASK_BYTES`] bytes, bit `p` set for each page of
+    /// the group's span holding a member.
+    #[inline]
+    pub fn mask(&self, entry: &GroupEntry) -> Option<Bytes<'a>> {
+        let Form::Grouped(dir) = &self.form else {
+            return None;
+        };
+        if !dir.has_mask(entry) {
+            return None;
+        }
+        let at = self.containers_at + entry.at as usize;
+        Some(
+            self.payload
+                .sub(at - MASK_BYTES, at)
+                .expect("a mask within its payload")
+                .tag(Kind::Container),
+        )
     }
 
     /// Calls `visit` with every slot, in order.
@@ -1455,6 +1540,8 @@ pub struct Directory {
     /// The directory's bytes, from its group count on, and [`SLACK`] zero
     /// bytes past them: entries' frontier offsets index them.
     bytes: Box<[u8]>,
+    /// Whether its containers carry page masks ([`FORM_MASKS`]).
+    masks: bool,
     end: usize,
     len: usize,
     presence: Presence,
@@ -1494,14 +1581,16 @@ impl std::fmt::Debug for Directory {
 
 impl Directory {
     /// Parses a directory, `directory` its bytes from its group count on, of
-    /// a record of `df` postings, `containers` container bytes and `tf_len`
-    /// TF bytes, in a segment of `groups` groups.
+    /// a record of `df` postings, `containers` container bytes (with page
+    /// masks if `masks`) and `tf_len` TF bytes, in a segment of `groups`
+    /// groups.
     fn parse(
         mut directory: Vec<u8>,
         groups: usize,
         df: u32,
         containers: u64,
         tf_len: u64,
+        masks: bool,
     ) -> Result<Self> {
         let corrupt = || Error::Corrupt("postings directory");
         let mut at = 0;
@@ -1551,6 +1640,7 @@ impl Directory {
         directory.resize(end + SLACK, 0);
         let dir = Self {
             bytes: directory.into_boxed_slice(),
+            masks,
             end,
             len,
             presence,
@@ -1611,6 +1701,18 @@ impl Directory {
     #[inline]
     pub fn len(&self) -> usize {
         self.len
+    }
+
+    /// Whether its containers carry page masks ([`FORM_MASKS`]).
+    #[inline]
+    pub fn masks(&self) -> bool {
+        self.masks
+    }
+
+    /// Whether `entry`'s container carries a page mask ([`FORM_MASKS`]).
+    #[inline]
+    pub fn has_mask(&self, entry: &GroupEntry) -> bool {
+        self.masks && masked(entry.kind, entry.count)
     }
 
     #[inline]
@@ -1898,7 +2000,10 @@ impl Directory {
         let max_bucket = (head >> 2) as u8;
         let width = TF_WIDTH[usize::from(max_bucket)];
         let count = next[FIRST].wrapping_sub(v[FIRST]);
-        let len = next[AT].wrapping_sub(v[AT]);
+        // A container's mask lies before it, counted as its bytes.
+        let mask = MASK_BYTES as u32 * u32::from(self.masks && masked(kind, count));
+        let span = next[AT].wrapping_sub(v[AT]);
+        let len = span.wrapping_sub(mask);
         // A grid's and an array's length follow from the group and the
         // count, read as they are; an Elias-Fano list or a paged container
         // checks its own when parsed (its exact length is the verifier's,
@@ -1916,6 +2021,7 @@ impl Directory {
             && count <= slots
             && len == expected
             && len > 0
+            && span > mask
             && (kind != KIND_ARRAY || slots <= ARRAY_SLOTS_MAX)
             && u64::from(next[TF].wrapping_sub(v[TF])) == u64::from(count) * u64::from(width)
             && u64::from(next[TF]) <= self.tf_bits
@@ -1931,7 +2037,7 @@ impl Directory {
             index,
             count,
             kind,
-            at: v[AT],
+            at: v[AT] + mask,
             len,
             first: v[FIRST],
             frontier: (frontiers + v[FRONTIER] as usize) as u32,
@@ -3975,6 +4081,9 @@ mod tests {
                                 GroupFrontiers::Exact
                             },
                             length_classes: grid_density == 0,
+                            // Masks with and without (a mask before an
+                            // array or a list of 16 or more members).
+                            page_masks: !adaptive_tf || block_size == 3,
                         });
                     }
                 }

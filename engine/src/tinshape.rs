@@ -392,6 +392,13 @@ impl<'a> TermSet<'a> {
         let _ = from;
     }
 
+    /// Whether its containers carry page masks
+    /// ([`segment::tinshape::postings::FORM_MASKS`]).
+    #[inline]
+    pub fn has_masks(&self) -> bool {
+        self.dir.as_ref().is_some_and(|dir| dir.masks())
+    }
+
     /// The number of groups the term holds (a sparse term's once
     /// [`Self::ensure_groups`] has listed them).
     #[inline]
@@ -1575,6 +1582,9 @@ pub struct RankedAnswer {
     pub scored: u64,
     pub windows: u64,
     pub windows_pruned: u64,
+    /// Groups a led walk passed because its required terms' page masks
+    /// hold no page in common.
+    pub masked_out: u64,
     /// Candidates the walk examined (bounded before anything was read for
     /// them), and those whose positions were checked.
     pub candidates: u64,
@@ -3381,6 +3391,87 @@ mod tests {
                     .iter()
                     .all(|m| answers[1].iter().any(|(_, t)| t == m))
             );
+        }
+    }
+
+    /// Two words hold 20 documents each in every group, on disjoint
+    /// pages but in the first group: their page masks rule the other seven
+    /// groups out before either container is decoded, for a conjunction
+    /// and a phrase alike, and the answers are those of a build without
+    /// masks.
+    #[test]
+    fn page_masks_rule_out_groups_whose_words_share_no_page() {
+        let mut docs = Vec::new();
+        for g in 0..8u32 {
+            for page in 0..200u32 {
+                for offset in 1..=2u16 {
+                    docs.push(Tid {
+                        block: g * 256 + page,
+                        offset,
+                    });
+                }
+            }
+        }
+        let n = docs.len();
+        let lengths = vec![4; n];
+        // Document r is the 2 * page + offset - 1th of its group's 400
+        // (so a group's 20 are a list, not a grid).
+        let in_pages = |r: usize, pages: std::ops::Range<usize>| pages.contains(&(r % 400 / 2));
+        let t0: Vec<(usize, u32)> = (0..n)
+            .filter(|&r| in_pages(r, 0..10))
+            .map(|r| (r, 1))
+            .collect();
+        let t1: Vec<(usize, u32)> = (0..n)
+            .filter(|&r| {
+                if r < 400 {
+                    in_pages(r, 0..10)
+                } else {
+                    in_pages(r, 100..110)
+                }
+            })
+            .map(|r| (r, 2))
+            .collect();
+        let members = vec![t0, t1];
+        let all: Vec<usize> = (0..n).collect();
+        let names = vec!["t0".to_owned(), "t1".to_owned()];
+        let scorer =
+            |df| TermScorer::from_statistics(100_000, df, 1.0, Bm25Params::default(), 4.0).unwrap();
+        let scorers = vec![
+            ("t0".to_owned(), scorer(160)),
+            ("t1".to_owned(), scorer(160)),
+        ];
+        let nodes = [
+            Node::And(vec![Node::Term(0), Node::Term(1)]),
+            Node::Span {
+                slots: vec![0, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+        ];
+        for node in &nodes {
+            let mut answers = Vec::new();
+            for page_masks in [false, true] {
+                // Grouped (one list over the segment would be smaller).
+                let options = Options {
+                    sparse: false,
+                    grid_min_postings: u32::MAX,
+                    inline_lengths_min_documents: u32::MAX,
+                    page_masks,
+                    ..Options::default()
+                };
+                let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+                let segment = Segment::parse(&blob).unwrap();
+                let got = top_k(&segment, node, &names, &scorers, 100, &mut NoTouch).unwrap();
+                let masked_out = if page_masks { 7 } else { 0 };
+                assert_eq!(got.masked_out, masked_out, "{node:?}, masks {page_masks}");
+                answers.push(
+                    got.rows
+                        .iter()
+                        .map(|(s, t)| (s.to_bits(), *t))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(answers[0].len(), 20, "{node:?}");
+            assert_eq!(answers[0], answers[1], "{node:?}");
         }
     }
 

@@ -32,13 +32,14 @@ use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::Positions;
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
-    array_bytes, higher, lower,
+    MASK_BYTES, MASK_MIN, array_bytes, higher, lower,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
 use super::{
-    Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
+    Node, Part, RankedAnswer, Src, TermSet, Touch, container_bytes, kernels, matches, open_terms,
+    required_terms,
 };
 use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
@@ -1060,6 +1061,14 @@ fn next_group(
 /// postings by slots stands for its count there). False, with nothing
 /// loaded, when a grouped term does not hold the group: the directory is
 /// looked up once.
+/// ANDs page mask `other` into `mask`.
+#[inline]
+fn and_mask(mask: &mut [u64; 4], other: &[u64; 4]) {
+    for (m, o) in mask.iter_mut().zip(other) {
+        *m &= o;
+    }
+}
+
 fn load<'a>(
     set: &mut TermSet<'a>,
     geometry: &Geometry,
@@ -1293,6 +1302,12 @@ struct Walk<'s, 'a, T: Touch> {
     sc: Vec<Sc<'s, 'a>>,
     /// Required terms, rarest first.
     req: Vec<usize>,
+    /// Whether the second required term's record carries page masks, so
+    /// a group is first ruled out by its required terms' masks
+    /// ([`Walk::masks_rule_out`]); and their AND in the group at hand,
+    /// for a lead without a mask to filter its members by.
+    masks: bool,
+    page_mask: Option<[u64; 4]>,
     /// With common terms, the scoring terms (indexes into `sc`), rarest
     /// first.
     sc_order: Vec<usize>,
@@ -1517,6 +1532,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let lead = self.req[0];
         let n = self.sc.len();
         let mut from = 0u32;
+        self.masks = self.req.len() >= 2
+            && self.terms[self.req[1]]
+                .as_ref()
+                .is_some_and(TermSet::has_masks);
         loop {
             // The lead's next group, from its directory (or its list): its
             // members are read only once the group's bound passes.
@@ -1544,6 +1563,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 continue;
             }
             if self.touch.skip_group(g, false) {
+                continue;
+            }
+            if self.masks && self.masks_rule_out(g) {
+                self.answer.masked_out += 1;
                 continue;
             }
             if self.mems[lead].loaded != g + 1 {
@@ -1671,6 +1694,71 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         true
     }
 
+    /// Whether the required terms' page masks rule group `g` out before
+    /// any container is loaded (TIN's progressive refinement). Checked
+    /// only where the second term's container carries a mask: the lead's
+    /// (if it carries one), the second's and each later term's are ANDed
+    /// until the AND is empty, or a later term lacks the group. A walk
+    /// that goes on loads the containers whose entries were read here (a
+    /// directory keeps the entry it read last); a lead without a mask
+    /// filters its members by the AND ([`Walk::page_mask`]).
+    fn masks_rule_out(&mut self, g: u32) -> bool {
+        self.page_mask = None;
+        let mut and = match self.mask_of(self.req[1], g) {
+            Some(Some(mask)) => mask,
+            Some(None) => return false,
+            None => return true,
+        };
+        let lead = match self.mask_of(self.req[0], g) {
+            Some(Some(mask)) => {
+                and_mask(&mut and, &mask);
+                true
+            }
+            _ => false,
+        };
+        for r in 2..self.req.len() {
+            if and == [0; 4] {
+                return true;
+            }
+            match self.mask_of(self.req[r], g) {
+                Some(Some(mask)) => and_mask(&mut and, &mask),
+                Some(None) => {}
+                None => return true,
+            }
+        }
+        if and == [0; 4] {
+            return true;
+        }
+        if !lead {
+            self.page_mask = Some(and);
+        }
+        false
+    }
+
+    /// Required term `t`'s page mask in group `g`: `None` when a grouped
+    /// term lacks the group, `Some(None)` when its container carries no
+    /// mask (or the term is not grouped).
+    #[inline]
+    fn mask_of(&mut self, t: usize, g: u32) -> Option<Option<[u64; 4]>> {
+        let set = self.terms[t].as_ref().expect("required");
+        if !set.has_masks() {
+            return Some(None);
+        }
+        let mem = &mut self.mems[t];
+        let found = set.find(g, &mut mem.hint)?;
+        let Src::Container { entry, at, .. } = found.src else {
+            return Some(None);
+        };
+        let Some(bytes) = set.postings.mask(&entry) else {
+            return Some(None);
+        };
+        self.touch.touch(Part::Payload, at - MASK_BYTES, MASK_BYTES);
+        let bytes = container_bytes(bytes);
+        Some(Some(std::array::from_fn(|w| {
+            u64::from_le_bytes(bytes[8 * w..8 * w + 8].try_into().expect("eight bytes"))
+        })))
+    }
+
     /// Intersects the required terms' members in group `g`, which the lead
     /// holds and has loaded: the lead's members, then each other required
     /// term's, rarest first, only while candidates are left (in most groups
@@ -1689,6 +1777,18 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             Kind::Grid(bytes) => kernels::set_bits_bytes(bytes, &mut cands),
             Kind::List => cands.extend_from_slice(&lead.list),
             Kind::Cursor { .. } | Kind::Array(_) => unreachable!("a lead is loaded whole"),
+        }
+        // A lead without a mask (a few members, or a grid's or a sparse
+        // term's many, which are not filtered) keeps the members on pages
+        // the others' masks hold.
+        if let Some(mask) = self.page_mask.take()
+            && cands.len() < MASK_MIN as usize
+        {
+            let geometry = self.geometry;
+            cands.retain(|&l| {
+                let page = geometry.page_of(g as usize, l);
+                mask[page / 64] >> (page % 64) & 1 == 1
+            });
         }
         let mut left = [0u32; 16];
         left[0] = cands.len() as u32;
@@ -3195,6 +3295,8 @@ pub(super) fn walk_into<'s, 'a>(
         inline: None,
         repeats: Vec::new(),
         req,
+        masks: false,
+        page_mask: None,
         sc_order: Vec::new(),
         common_terms: false,
         answer: RankedAnswer::default(),
@@ -3311,6 +3413,7 @@ pub(super) fn walk_into<'s, 'a>(
     answer.scored += done.scored;
     answer.windows += done.windows;
     answer.windows_pruned += done.windows_pruned;
+    answer.masked_out += done.masked_out;
     answer.candidates += done.candidates;
     answer.position_checks += done.position_checks;
     answer.class_cuts += done.class_cuts;

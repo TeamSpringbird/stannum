@@ -2,18 +2,20 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Re-encodes dumped `TNS1` segments of page layout version 13, 12, 11, 10,
-//! 9, 8 or 6 to version 14, whose grouped records' directories are rows of
-//! fixed width found by a group's rank and hold short lists as arrays, and
-//! whose DL sidecar holds length classes (or, with `--keep-records`,
-//! records as they were but for their headers and directories), and reports
-//! what that costs. Version 13 (the DL sidecar's length classes, its
+//! Re-encodes dumped `TNS1` segments of page layout version 14, 13, 12, 11,
+//! 10, 9, 8 or 6 to version 16, whose grouped records' directories are rows
+//! of fixed width found by a group's rank and hold short lists as arrays,
+//! whose containers of 16 members or more carry page masks, and whose DL
+//! sidecar holds length classes (or, with `--keep-records`, records as they
+//! were but for their headers and directories: no masks), and reports what
+//! that costs. Version 14 has its records encoded again (step 5, with
+//! `--fresh` or not; its containers copied, each given its mask). Version 13 (the DL sidecar's length classes, its
 //! directories still varint entries) has its directories rewritten; with
 //! `--keep-records` every other area, and the header's flags, are copied.
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 13|12|11|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--grid-share N] \
+//!     [--from 14|13|12|11|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--grid-share N] \
 //!     [--arrays N] [--jobs N] [--check] [--check-merge] [--fresh] [--census] [--keep-records]
 //! ```
 //!
@@ -34,9 +36,9 @@
 //! 3. **Directory lengths** (from 9 or 8). Each grouped record's header
 //!    gains its directory's length (version 10), found by stepping over
 //!    the directory's entries; nothing else of the record changes.
-//! 4. **Directory rows** (every source). Each grouped record's directory
-//!    of varint entries (versions 10 to 13, skip points left out) is
-//!    rewritten as version 14's (`postings::encode_directory`): its
+//! 4. **Directory rows** (every source but 14). Each grouped record's
+//!    directory of varint entries (versions 10 to 13, skip points left
+//!    out) is rewritten as version 14's (`postings::encode_directory`): its
 //!    presence, bases and rows, and its frontiers as they were; containers,
 //!    inline lengths and TF tail are copied.
 //! 5. **Renumbering.** The segment is merged alone with this build's
@@ -142,7 +144,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsreencode --in DIR --out DIR [--from 13|12|11|10|9|8|6] [--exact] \
+        "usage: tnsreencode --in DIR --out DIR [--from 14|13|12|11|10|9|8|6] [--exact] \
          [--segment FILE] [--grid-density N] [--grid-share N] [--arrays N] [--jobs N] [--check] \
          [--check-merge] [--fresh] [--census] [--keep-records]"
     );
@@ -189,8 +191,8 @@ fn args() -> Args {
     }
     if a.input.as_os_str().is_empty()
         || a.output.as_os_str().is_empty()
-        || !matches!(a.from, 6 | 8 | 9 | 10 | 11 | 12 | 13)
-        || (a.keep_records && a.from == 6)
+        || !matches!(a.from, 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14)
+        || (a.keep_records && matches!(a.from, 6 | 14))
         || a.jobs == 0
     {
         usage();
@@ -1087,7 +1089,9 @@ fn one(args: &Args, name: &str, cost: &mut Cost) -> Result<(String, bool), Strin
     } else if args.from < 10 {
         new = add_directory_lengths(&new, cost)?;
     }
-    new = directory_rows(&new, cost)?;
+    if args.from < 14 {
+        new = directory_rows(&new, cost)?;
+    }
     let new = if args.keep_records {
         new
     } else {
