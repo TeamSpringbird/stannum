@@ -2,19 +2,19 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Re-encodes dumped `TNS1` segments of page layout version 10, 9, 8 or 6
-//! to version 12, whose grouped records' directories end in skip points and
-//! hold short lists as arrays (or, with `--keep-records`, 10, whose grouped
-//! records' headers give their directory's length), and reports what that
-//! costs.
+//! Re-encodes dumped `TNS1` segments of page layout version 12, 11, 10, 9,
+//! 8 or 6 to version 14, whose grouped records' directories are rows of
+//! fixed width found by a group's rank, and hold short lists as arrays (or,
+//! with `--keep-records`, records as they were but for their headers and
+//! directories), and reports what that costs.
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--arrays N] \
-//!     [--jobs N] [--check] [--check-merge] [--census] [--keep-records]
+//!     [--from 12|11|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--arrays N] \
+//!     [--jobs N] [--check] [--check-merge] [--fresh] [--census] [--keep-records]
 //! ```
 //!
-//! Up to four steps per segment:
+//! Up to five steps per segment:
 //!
 //! 1. **The document set** (from 8 or 6). Versions 6 and 8 gave a group one
 //!    width `w`,
@@ -31,23 +31,32 @@
 //! 3. **Directory lengths** (from 9 or 8). Each grouped record's header
 //!    gains its directory's length (version 10), found by stepping over
 //!    the directory's entries; nothing else of the record changes.
-//! 4. **Renumbering.** The segment is merged alone with this build's
+//! 4. **Directory rows** (every source). Each grouped record's directory
+//!    of varint entries (versions 10 to 12, skip points left out) is
+//!    rewritten as version 14's (`postings::encode_directory`): its
+//!    presence, bases and rows, and its frontiers as they were; containers,
+//!    inline lengths and TF tail are copied.
+//! 5. **Renumbering.** The segment is merged alone with this build's
 //!    `merge::merge`, which derives the grid from its documents (each
 //!    page's width its largest offset) and encodes every record afresh, as
-//!    a build of the same documents does: from 10, the only step, which
-//!    makes the Elias-Fano lists of at most `--arrays` members (default
-//!    `Options::array_max`) array containers and adds the directories' skip
-//!    points (version 12).
+//!    a build of the same documents does, but for the containers of groups
+//!    whose geometry and members it keeps, which it copies where they are
+//!    what the options would choose (with `--fresh`, `merge::merge_afresh`:
+//!    none is copied); this makes the Elias-Fano lists of at most
+//!    `--arrays` members (default `Options::array_max`) array containers.
 //!
-//! `--keep-records` skips step 4: each record keeps its encoding but for
-//! the header (with `--check-merge`, the merge must give the same bytes).
+//! `--keep-records` skips step 5: each record keeps its encoding but for
+//! the header and the directory (with `--check-merge`, the merge must give
+//! the same bytes).
 //!
 //! `--grid-density N` encodes with `Options::grid_density` N (a writer
 //! option: a group of a big term holding one slot in N is a grid) to
 //! weigh other thresholds, and `--arrays N` with `Options::array_max` N
 //! (0: no array containers). `--check` verifies each output with
 //! `verify_segment`; `--check-merge`
-//! also merges the output alone again and requires the same bytes. Each
+//! also merges the output alone again (copying containers) and requires
+//! the same bytes (with `--fresh`: that copying writes what a fresh
+//! encoding does). Each
 //! segment holds a few copies of itself in memory; `--jobs` re-encodes
 //! that many at once (default 1).
 //!
@@ -67,10 +76,11 @@ use segment::dictionary::{DictionaryBuilder, Extent, TermEntry};
 use segment::tinshape::bits::BitWriter;
 use segment::tinshape::docs::{GROUP_PAGES, Geometry, encode_docset};
 use segment::tinshape::ef;
-use segment::tinshape::merge::{Input, merge};
+use segment::tinshape::merge::{Input, merge, merge_afresh};
 use segment::tinshape::postings::{
-    FORM_COMPACT, FORM_GROUPED, FORM_LENGTHS, FORM_ROUNDED, GroupEntry, GroupFrontiers, KIND_EF,
-    KIND_GRID, KIND_PAGED, Options, for_each_local, group_frontier, put_group_frontier, tf_width,
+    ARRAY_SLOTS_MAX, FORM_COMPACT, FORM_GROUPED, FORM_LENGTHS, FORM_ROUNDED, GroupEntry,
+    GroupFrontiers, KIND_EF, KIND_GRID, KIND_PAGED, Options, encode_directory, for_each_local,
+    group_frontier, put_group_frontier, tf_width,
 };
 use segment::tinshape::segment::{Area, Segment};
 use segment::tinshape::verify::verify_segment;
@@ -118,13 +128,14 @@ struct Args {
     check_merge: bool,
     census: bool,
     keep_records: bool,
+    fresh: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsreencode --in DIR --out DIR [--from 10|9|8|6] [--exact] [--segment FILE] \
-         [--grid-density N] [--arrays N] [--jobs N] [--check] [--check-merge] [--census] \
-         [--keep-records]"
+        "usage: tnsreencode --in DIR --out DIR [--from 12|11|10|9|8|6] [--exact] \
+         [--segment FILE] [--grid-density N] [--arrays N] [--jobs N] [--check] [--check-merge] \
+         [--fresh] [--census] [--keep-records]"
     );
     std::process::exit(2)
 }
@@ -144,6 +155,7 @@ fn args() -> Args {
         check_merge: false,
         census: false,
         keep_records: false,
+        fresh: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -160,13 +172,14 @@ fn args() -> Args {
             "--check-merge" => a.check_merge = true,
             "--census" => a.census = true,
             "--keep-records" => a.keep_records = true,
+            "--fresh" => a.fresh = true,
             _ => usage(),
         }
     }
     if a.input.as_os_str().is_empty()
         || a.output.as_os_str().is_empty()
-        || !matches!(a.from, 6 | 8 | 9 | 10)
-        || (a.keep_records && matches!(a.from, 6 | 10))
+        || !matches!(a.from, 6 | 8 | 9 | 10 | 11 | 12)
+        || (a.keep_records && a.from == 6)
         || a.jobs == 0
     {
         usage();
@@ -193,6 +206,12 @@ struct Cost {
     tf_after: u64,
     /// Frontiers by pair count, 1 to 16.
     by_pairs: [u64; 17],
+    /// Step 4: grouped records, their entries, and their directories'
+    /// bytes as varint entries and as rows.
+    rowed: u64,
+    rowed_entries: u64,
+    rows_before: u64,
+    rows_after: u64,
 }
 
 /// The source blob's header fields, in order.
@@ -704,6 +723,10 @@ impl Cost {
         for (a, b) in self.by_pairs.iter_mut().zip(other.by_pairs) {
             *a += b;
         }
+        self.rowed += other.rowed;
+        self.rowed_entries += other.rowed_entries;
+        self.rows_before += other.rows_before;
+        self.rows_after += other.rows_after;
     }
 }
 
@@ -823,28 +846,185 @@ fn regrid(blob: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
-/// Step 3: `blob` merged alone, every record encoded afresh over the grid
-/// of its documents.
-fn renumber(blob: &[u8], args: &Args) -> Result<Vec<u8>, String> {
+/// A version 10 to 12 group directory (`directory`, from its group count
+/// on, its skip points after its entries left out) of a record with
+/// `containers` container bytes, as version 14's: its entries with their
+/// totals, and their frontiers' bytes as they were.
+fn legacy_entries(
+    directory: &[u8],
+    containers: usize,
+    geometry: &Geometry,
+) -> Result<(Vec<GroupEntry>, Vec<u8>), String> {
+    let mut at = 0;
+    let n = varint::get(directory, &mut at)? as usize;
+    let mut entries = Vec::with_capacity(n);
+    let mut frontiers = Vec::new();
+    let (mut index, mut body, mut first, mut tf_bit) = (0u64, 0u64, 0u64, 0u64);
+    for i in 0..n {
+        let gap = varint::get(directory, &mut at)?;
+        index = if i == 0 { gap } else { index + 1 + gap };
+        let group = geometry
+            .groups
+            .get(index as usize)
+            .ok_or("a directory entry past the groups")?;
+        let packed = varint::get(directory, &mut at)?;
+        let (kind, count) = ((packed & 3) as u8, (packed >> 2) + 1);
+        let len = match kind {
+            KIND_GRID => group.grid_bytes() as u64,
+            KIND_EF => ef::encoded_len(count as usize, group.slots()) as u64,
+            KIND_PAGED => varint::get(directory, &mut at)?,
+            _ if group.slots() <= ARRAY_SLOTS_MAX => 2 * count,
+            _ => return Err("an array of a group past 65,536 slots".into()),
+        };
+        // The frontier: its head, its first length, a delta per later pair.
+        let from = at;
+        let head = *directory.get(at).ok_or("truncated frontier")?;
+        at += 1;
+        let mut bucket = u64::from(head & 15);
+        varint::get(directory, &mut at)?;
+        for _ in 0..head >> 4 {
+            bucket += 1 + (varint::get(directory, &mut at)? & 15);
+        }
+        let max_bucket = u8::try_from(bucket)
+            .ok()
+            .filter(|b| *b < 16)
+            .ok_or("frontier bucket")?;
+        let width = tf_width(max_bucket, true);
+        entries.push(GroupEntry {
+            index: index as u32,
+            count: count as u32,
+            kind,
+            at: body as u32,
+            len: len as u32,
+            first: first as u32,
+            frontier: frontiers.len() as u32,
+            tf_bit: tf_bit as u32,
+            width: width as u8,
+            max_bucket,
+        });
+        frontiers.extend_from_slice(&directory[from..at]);
+        body += len;
+        first += count;
+        tf_bit += count * u64::from(width);
+    }
+    if body != containers as u64 {
+        return Err("directory against its containers".into());
+    }
+    Ok((entries, frontiers))
+}
+
+/// Step 4: `blob`'s grouped records with their directories of varint
+/// entries rewritten as rows (version 14); every other byte of the records
+/// is copied.
+fn directory_rows(blob: &[u8], cost: &mut Cost) -> Result<Vec<u8>, String> {
+    /// Set in a version 11 or 12 grouped record's form: its directory
+    /// ends in skip points.
+    const FORM_SKIPS: u8 = 0x20;
+    let segment = Segment::parse(blob).map_err(|e| e.to_string())?;
+    let geometry = &segment.docs.geometry;
+    let (fields, _) = header_fields(blob)?;
+    let postings_at = segment.area_at(Area::Postings);
+    let mut out_postings = Vec::with_capacity(fields[5] as usize + fields[5] as usize / 20);
+    let mut dictionary = DictionaryBuilder::default();
+    for item in segment.dictionary().iter() {
+        let (term, entry) = item.map_err(|e| e.to_string())?;
+        let from = postings_at + entry.ordinals.offset as usize;
+        let record = &blob[from..from + entry.ordinals.len as usize];
+        let at = out_postings.len();
+        if entry.df > 1 && record[0] & 3 == FORM_GROUPED {
+            let form = record[0];
+            let mut p = 1;
+            let directory_len = varint::get(record, &mut p)? as usize;
+            let payload_len = varint::get(record, &mut p)? as usize;
+            let lengths_len = if form & FORM_LENGTHS != 0 {
+                Some(varint::get(record, &mut p)?)
+            } else {
+                None
+            };
+            let payload = record
+                .get(p..p + payload_len)
+                .ok_or_else(|| format!("{term}: payload past the record"))?;
+            let rest = &record[p + payload_len..];
+            let containers = payload
+                .get(directory_len..)
+                .ok_or_else(|| format!("{term}: directory past the payload"))?;
+            let (entries, frontiers) =
+                legacy_entries(&payload[..directory_len], containers.len(), geometry)
+                    .map_err(|e| format!("{term}: {e}"))?;
+            let mut directory = Vec::new();
+            encode_directory(geometry.groups.len(), &entries, &frontiers, &mut directory);
+            out_postings.push(form & !FORM_SKIPS);
+            varint::put(&mut out_postings, directory.len() as u64);
+            varint::put(
+                &mut out_postings,
+                (directory.len() + containers.len()) as u64,
+            );
+            if let Some(len) = lengths_len {
+                varint::put(&mut out_postings, len);
+            }
+            out_postings.extend_from_slice(&directory);
+            out_postings.extend_from_slice(containers);
+            out_postings.extend_from_slice(rest);
+            cost.rowed += 1;
+            cost.rowed_entries += entries.len() as u64;
+            cost.rows_before += directory_len as u64;
+            cost.rows_after += directory.len() as u64;
+        } else {
+            out_postings.extend_from_slice(record);
+        }
+        let moved = TermEntry {
+            ordinals: Extent {
+                offset: at as u64,
+                len: (out_postings.len() - at) as u32,
+            },
+            ..entry
+        };
+        dictionary.push(&term, moved).map_err(|e| e.to_string())?;
+    }
+    if segment.bounds[7] != blob.len() {
+        return Err("bytes past the liveness area".into());
+    }
+    let rest = &blob[segment.area_at(Area::Positions)..segment.bounds[7]];
+    let dictionary = dictionary.finish();
+    let mut fields = fields.clone();
+    fields[4] = dictionary.len() as u64;
+    fields[5] = out_postings.len() as u64;
+    let mut new = Vec::with_capacity(64 + dictionary.len() + out_postings.len() + rest.len());
+    new.extend_from_slice(b"TNS1");
+    for f in &fields {
+        varint::put(&mut new, *f);
+    }
+    new.extend_from_slice(&dictionary);
+    new.extend_from_slice(&out_postings);
+    new.extend_from_slice(rest);
+    Ok(new)
+}
+
+/// Step 5: `blob` merged alone, every record encoded over the grid of its
+/// documents: afresh (no container copied) when `fresh`.
+fn renumber(blob: &[u8], args: &Args, fresh: bool) -> Result<Vec<u8>, String> {
     let (fields, _) = header_fields(blob)?;
     let none = DeadDocs::decode(&segment::ordinals::encode(&[]), fields[0] as u32)
         .map_err(|e| e.to_string())?;
-    let merged = merge(
-        &[Input {
-            bytes: blob,
-            dead: &none,
-        }],
-        Options {
-            group_frontiers: args.mode,
-            grid_density: args.grid_density,
-            array_max: args.array_max,
-            ..Options::default()
-        },
-        || Ok(()),
-    )
-    .map_err(|e| e.to_string())?
-    .ok_or("no live document")?;
-    Ok(merged.blob)
+    let inputs = [Input {
+        bytes: blob,
+        dead: &none,
+    }];
+    let options = Options {
+        group_frontiers: args.mode,
+        grid_density: args.grid_density,
+        array_max: args.array_max,
+        ..Options::default()
+    };
+    let merged = if fresh {
+        merge_afresh(&inputs, options, || Ok(()))
+    } else {
+        merge(&inputs, options, || Ok(()))
+    };
+    Ok(merged
+        .map_err(|e| e.to_string())?
+        .ok_or("no live document")?
+        .blob)
 }
 
 /// One segment, re-encoded: its line of the report, its version-6 costs,
@@ -860,10 +1040,11 @@ fn one(args: &Args, name: &str, cost: &mut Cost) -> Result<(String, bool), Strin
     } else if args.from < 10 {
         new = add_directory_lengths(&new, cost)?;
     }
+    new = directory_rows(&new, cost)?;
     let new = if args.keep_records {
         new
     } else {
-        renumber(&new, args)?
+        renumber(&new, args, args.fresh)?
     };
     let after = area_sizes(&new)?;
     let mut line = format!(
@@ -881,7 +1062,7 @@ fn one(args: &Args, name: &str, cost: &mut Cost) -> Result<(String, bool), Strin
         ok &= clean;
     }
     if args.check_merge {
-        let again = renumber(&new, args)?;
+        let again = renumber(&new, args, false)?;
         let same = again == new;
         line += &format!("; equal to its own merge {same}");
         if !same {
@@ -1099,6 +1280,14 @@ fn main() {
     println!(
         "areas together {before} -> {after} ({:+.3}%)",
         100.0 * (after as f64 / before.max(1) as f64 - 1.0)
+    );
+    println!(
+        "directories as rows: {} grouped records, {} entries: {} -> {} B ({:+.2} B an entry)",
+        cost.rowed,
+        cost.rowed_entries,
+        cost.rows_before,
+        cost.rows_after,
+        (cost.rows_after as f64 - cost.rows_before as f64) / cost.rowed_entries.max(1) as f64
     );
     if args.from != 6 {
         println!(

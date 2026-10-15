@@ -364,8 +364,9 @@ pub struct MemoCounts {
     /// decoding them whole would decode.
     pub footer_blocks_whole: u64,
     pub footer_bytes_whole: u64,
-    /// Group directories parsed, their entries decoded, and the directory
-    /// bytes parsed for them.
+    /// Group directories parsed, their entries read by a ranked walk (a row
+    /// read each time an entry is asked for), and the directory bytes
+    /// parsed for them.
     pub directories: u64,
     pub directory_entries: u64,
     pub directory_bytes: u64,

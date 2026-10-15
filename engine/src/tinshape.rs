@@ -349,18 +349,23 @@ impl<'a> TermSet<'a> {
         }
     }
 
-    /// A grouped term's directory entry `i` (decoded if it was not yet).
+    /// A grouped term's directory entry `i`, of group `index` when that is
+    /// known (else found from the directory's presence).
     #[inline]
-    fn entry(dir: &Directory, docs: &DocSet, i: usize) -> GroupEntry {
-        *dir.get(i, &docs.geometry.groups)
-            .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")))
+    fn entry(dir: &Directory, docs: &DocSet, i: usize, index: Option<u32>) -> GroupEntry {
+        let groups = &docs.geometry.groups;
+        match index {
+            Some(index) => dir.entry_of(i, index, groups),
+            None => dir.get(i, groups),
+        }
+        .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")))
     }
 
     /// The geometry index of the term's `i`th group.
     #[inline]
     fn group_index(&self, i: usize) -> u32 {
         match &self.dir {
-            Some(dir) => Self::entry(dir, &self.docs, i).index,
+            Some(dir) => dir.index(i),
             None => self.groups[i].index,
         }
     }
@@ -371,7 +376,7 @@ impl<'a> TermSet<'a> {
         let Some(dir) = &self.dir else {
             return self.groups[i];
         };
-        self.group_of_entry(Self::entry(dir, &self.docs, i))
+        self.group_of_entry(Self::entry(dir, &self.docs, i, None))
     }
 
     /// A grouped term's group of directory entry `entry`.
@@ -390,9 +395,9 @@ impl<'a> TermSet<'a> {
 
     /// Moves `hint` forward to the term's first group whose index is
     /// `group` or more (to the group count if none is), and gives that
-    /// group's index. A grouped term's directory is sought by its skip
-    /// points past the hint's run ([`Directory::seek`]): the entries of the
-    /// runs it passes over are not decoded.
+    /// group's index. A grouped term's directory finds it by the group's
+    /// rank in its presence, or galloping its group indexes from the hint
+    /// ([`Directory::seek`]): no entry is read.
     #[inline]
     fn seek_index(&self, group: u32, hint: &mut usize) -> Option<u32> {
         let Some(dir) = &self.dir else {
@@ -401,10 +406,9 @@ impl<'a> TermSet<'a> {
             }
             return self.groups.get(*hint).map(|g| g.index);
         };
-        *hint = dir
-            .seek(group, *hint, &self.docs.geometry.groups)
-            .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")));
-        (*hint < dir.len()).then(|| Self::entry(dir, &self.docs, *hint).index)
+        let (b, index) = dir.seek(group, *hint);
+        *hint = b;
+        (b < dir.len()).then_some(index)
     }
 
     /// The term's group `group`, if it holds it, looked for from `hint`
@@ -415,8 +419,7 @@ impl<'a> TermSet<'a> {
             return None;
         }
         Some(match &self.dir {
-            // Decoded: the seek reached it.
-            Some(dir) => self.group_of_entry(Self::entry(dir, &self.docs, *hint)),
+            Some(dir) => self.group_of_entry(Self::entry(dir, &self.docs, *hint, Some(group))),
             None => self.groups[*hint],
         })
     }
@@ -2331,9 +2334,11 @@ mod tests {
         unsafe { pinned.close_span() };
         let got = got.unwrap();
         assert_eq!(got.rows, want.rows);
+        // The directory's pages, read when the term is opened, and a few of
+        // the walk's.
         let peak = source.0.peak.get();
         assert!(
-            peak < 12,
+            peak < footer_pages + 8,
             "{peak} pages held at once, of a {footer_pages}-page footer"
         );
     }
