@@ -190,6 +190,22 @@ pub struct DictionaryIndex<'a> {
     /// Every `SAMPLE`th entry: its first term, its block's offset and where
     /// the entry starts in `index_bytes`.
     samples: Vec<(&'a [u8], usize, usize)>,
+    /// Each sample's first term as a [`key`], searched before the terms:
+    /// a term's bytes lie in the index, a cache line apart from the next
+    /// sample's, so a binary search over them missed the cache at nearly
+    /// every step (most of a lookup's cost at 150M rows).
+    keys: Vec<u64>,
+}
+
+/// A term's first eight bytes, zero-padded, as a big-endian word: ordered
+/// as the terms are where two keys differ (`key(a) < key(b)` implies
+/// `a < b`); terms of equal keys compare by their bytes.
+#[inline]
+fn key(term: &[u8]) -> u64 {
+    let mut bytes = [0u8; 8];
+    let n = term.len().min(8);
+    bytes[..n].copy_from_slice(&term[..n]);
+    u64::from_be_bytes(bytes)
 }
 
 impl<'a> DictionaryIndex<'a> {
@@ -226,12 +242,14 @@ impl<'a> DictionaryIndex<'a> {
         if index_reader.remaining() != 0 {
             return Err(Error::Corrupt("dictionary index length"));
         }
+        let keys = samples.iter().map(|(first, _, _)| key(first)).collect();
         Ok(Self {
             count,
             header_len,
             index_bytes,
             blocks: block_count,
             samples,
+            keys,
         })
     }
 
@@ -282,16 +300,26 @@ impl<'a> DictionaryIndex<'a> {
     /// Index of the block that could contain `term`, if any block starts at or
     /// before it.
     fn block_for(&self, term: &[u8]) -> Option<usize> {
-        // The last sample at or before the term, then the last entry at or
-        // before it among the ones up to the next sample.
-        let sample = self
-            .samples
-            .partition_point(|(first, _, _)| *first <= term)
-            .checked_sub(1)?;
+        // The last sample at or before the term, by key, then by bytes among
+        // the samples of the term's key (rarely more than one).
+        let k = key(term);
+        let below = self.keys.partition_point(|s| *s < k);
+        let ties = self.keys[below..].iter().take_while(|s| **s == k).count();
+        let sample = (below
+            + self.samples[below..below + ties].partition_point(|(first, _, _)| *first <= term))
+        .checked_sub(1)?;
+        // Then the last entry at or before it among the ones up to the next
+        // sample, read forward from the sample once.
+        let (_, _, at) = self.samples[sample];
+        let mut reader = Reader::at(self.index_bytes, at);
         let mut block = sample * SAMPLE;
-        for next in block + 1..(block + SAMPLE).min(self.blocks) {
-            match self.entry(next) {
-                Some((first, _)) if first <= term => block = next,
+        for next in block..(block + SAMPLE).min(self.blocks) {
+            let parsed = reader
+                .varint_u32()
+                .and_then(|_| reader.varint_u32())
+                .and_then(|len| reader.take(len as usize));
+            match parsed {
+                Ok(first) if first <= term => block = next,
                 _ => break,
             }
         }
@@ -716,6 +744,41 @@ mod tests {
         assert_eq!(tail, terms[298..]);
         assert_eq!(dictionary.prefix("zzz").count(), 0);
         assert_eq!(dictionary.iter_from("a").count(), 300);
+    }
+
+    /// Samples searched by key (a term's first eight bytes): many samples,
+    /// runs of them sharing a key, terms shorter than a key and one holding
+    /// a NUL (padded alike), each found, and misses between them not.
+    #[test]
+    fn lookups_by_key_across_samples_of_equal_keys() {
+        let mut terms: Vec<String> = Vec::new();
+        for i in 0..3000 {
+            terms.push(format!("{i:03x}"));
+            terms.push(format!("sharedprefix{i:05}"));
+            terms.push(format!("x{i:04}"));
+        }
+        terms.push("ab".to_owned());
+        terms.push("ab\0".to_owned());
+        terms.push("ab\0\0z".to_owned());
+        terms.sort();
+        terms.dedup();
+        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let owned = OwnedDictionary::parse(&bytes).unwrap();
+        let dictionary = owned.view();
+        assert!(owned.index.samples.len() > 8);
+        for (i, term) in refs.iter().enumerate() {
+            assert_eq!(dictionary.get(term).unwrap(), Some(entry(i as u32)), "{term:?}");
+            let miss = format!("{term}\0");
+            if terms.binary_search(&miss).is_err() {
+                assert_eq!(dictionary.get(&miss).unwrap(), None, "{miss:?}");
+            }
+        }
+        for miss in ["", "a", "ab\0\0", "sharedprefix", "sharedprefix0", "zzzz", "\u{ff}"] {
+            assert_eq!(dictionary.get(miss).unwrap(), None, "{miss:?}");
+        }
+        let prefixed = dictionary.prefix("sharedprefix0299").count();
+        assert_eq!(prefixed, 10);
     }
 
     #[test]
