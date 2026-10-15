@@ -1347,7 +1347,13 @@ struct Walk<'s, 'a, T: Touch> {
     /// not split).
     or_tier: Vec<OrTier>,
     hi_rows: Vec<u64>,
-    lo_rows: Vec<u64>,
+    /// The words of `hi_rows` set for the group at hand, cleared before the
+    /// next group's are set (the rows are otherwise all clear).
+    hi_dirty: Vec<u32>,
+    /// Per row of `or_rows` that is a split term's (its high tier's row
+    /// after it), its index: a member's word there is the row's less the
+    /// high tier's.
+    or_lo: Vec<usize>,
     cand_hi: Vec<u64>,
     /// Per scoring term, whether the candidate at hand holds it in its low
     /// tier (bounded by the low pairs, not the group's frontier).
@@ -3173,7 +3179,8 @@ pub(super) fn walk_into<'s, 'a>(
         or_row_terms: Vec::new(),
         or_tier: vec![OrTier::default(); n],
         hi_rows: Vec::new(),
-        lo_rows: Vec::new(),
+        hi_dirty: Vec::new(),
+        or_lo: Vec::new(),
         cand_hi: Vec::with_capacity(n),
         held_lo: vec![false; n],
         held_bound: vec![0.0; n],
@@ -3392,6 +3399,22 @@ struct OrTier {
     lo_bound: f32,
     lo: [(u8, u32); 2],
     hi_at: RowAt,
+}
+
+/// What a split term's high tier adds to its low tier's bound `lo` in a
+/// word's sum, the group's bound being `hi`: `hi - lo`, raised so that
+/// adding `lo` and then it to any sum of at most `most` (every bound a word
+/// can add, summed) gives no less than adding `hi` to it. Each `f32`
+/// addition is within a relative half unit `u` of the exact sum, so with
+/// `a` the sum before, `((a + lo)(1 - u) + d)(1 - u) >= (a + hi)(1 + u)`
+/// holds for `d >= hi - lo + 4u(a + hi)`, and `a <= most`. Computed in
+/// `f64` and rounded up to `f32`.
+#[inline]
+fn tier_step(lo: f32, hi: f32, most: f64) -> f32 {
+    let u = f64::from(f32::EPSILON) / 2.0;
+    let want = f64::from(hi) - f64::from(lo) + 4.0 * u * (most + f64::from(hi));
+    let d = want as f32;
+    if f64::from(d) < want { d.next_up() } else { d }
 }
 
 /// A split group's low tier's bound under `scorer`: the best score of its
@@ -3883,51 +3906,60 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut sub = std::mem::take(&mut self.or_sub);
         let mut held = std::mem::take(&mut self.or_held);
         let mut row_terms = std::mem::take(&mut self.or_row_terms);
+        let mut lo_rows = std::mem::take(&mut self.or_lo);
         terms.clear();
         rows.clear();
         bounds.clear();
+        sub.clear();
         row_terms.clear();
+        lo_rows.clear();
+        // A split term is two rows: its own, at its low tier's bound, and
+        // its high tier's after it. A member's word in the first is the
+        // row's less the high tier's: it adds the low bound or the group's
+        // to its sum (`sub`), one of them, in the term's place in the
+        // scorer's order (the bound split into two addends would not bound
+        // the sum of the scores under rounding). A word adds the low bound
+        // where it holds the term and the rest of the group's where it holds
+        // a high member (`bounds`), that rest raised by what rounding the
+        // sum through two additions could lose, at most a few units of the
+        // last place of the largest sum (`tier_step`; twice what the bounds
+        // sum to before those rises, which they cannot reach).
+        let mut most = 0.0_f64;
+        for &i in &self.present_list {
+            if sb[i] > 0.0 {
+                most += f64::from(sb[i]);
+                if self.or_tier[i].on {
+                    most += f64::from(self.or_tier[i].lo_bound);
+                }
+            }
+        }
+        let mut group_total = 0.0_f32;
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
             if sb[i] > 0.0 {
                 terms.push(i);
                 row_terms.push(i);
-                // A split term is two rows, its low tier's members (the
-                // others less the high tier's) at its low pairs' bound and
-                // its high tier's at the group's: a member adds one of them
-                // to its sum, in the term's place in the scorer's order (a
-                // bound split into two addends would not bound the sum of
-                // the scores under rounding), and a word holding both adds
-                // both, no less than either.
+                rows.push(self.row_state[i].at);
+                group_total += sb[i];
                 let tier = self.or_tier[i];
                 if tier.on {
-                    if self.lo_rows.len() < n * words {
-                        self.lo_rows.resize(n * words, 0);
-                    }
-                    let lo = &mut self.lo_rows[i * words..(i + 1) * words];
-                    kernels::load(lo, self.row_state[i].at.bytes());
-                    kernels::andnot_bytes(lo, tier.hi_at.bytes());
-                    rows.push(RowAt::of(lo));
+                    lo_rows.push(rows.len() - 1);
                     bounds.push(tier.lo_bound);
+                    sub.push(tier.lo_bound);
                     rows.push(tier.hi_at);
-                    bounds.push(sb[i]);
+                    bounds.push(tier_step(tier.lo_bound, sb[i], 2.0 * most));
+                    sub.push(sb[i]);
                     row_terms.push(usize::MAX);
                 } else {
-                    rows.push(self.row_state[i].at);
                     bounds.push(sb[i]);
+                    sub.push(sb[i]);
                 }
             }
         }
         // A grouped term's sub-range bounds are its group bound, set once; a
         // sparse term's are taken per sub-range below. Without a sparse
         // term, every sub-range's sum is the group's.
-        sub.clear();
-        sub.extend_from_slice(&bounds);
         let sparse = terms.iter().any(|&i| !self.sc[i].grouped());
-        let mut group_total = 0.0_f32;
-        for &bound in &bounds {
-            group_total += bound;
-        }
         held.clear();
         held.resize(rows.len(), 0);
         // The sums the kernels weigh a sub-range's words and a word's members
@@ -4028,6 +4060,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             *h = row.word(w);
                         }
                     }
+                    for &h in &lo_rows {
+                        held[h] &= !held[h + 1];
+                    }
                     // Each member's verdict without a branch on it (see
                     // `BarKey::keeps`), at the bar as it stands now.
                     let bar = BarKey::of(self.bar).expect("weighed under a bar");
@@ -4085,6 +4120,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         self.or_terms = terms;
         self.or_row_terms = row_terms;
+        self.or_lo = lo_rows;
         self.or_rows = rows;
         self.or_bounds = bounds;
         self.or_sub = sub;
@@ -4200,8 +4236,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         plan.by_essential =
             (plan.required.is_empty() && plan.hi_required.is_empty()) || inessential > 0;
-        plan.lo_essential.clear();
-        plan.lo_essential.resize(sb.len(), false);
+        // Marks left clear between groups.
+        if plan.lo_essential.len() < sb.len() {
+            plan.lo_essential.resize(sb.len(), false);
+        }
         for k in inessential..plan.parts.len() {
             let (_, i, hi) = plan.parts[k];
             if !hi {
@@ -4212,6 +4250,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             } else if !plan.lo_essential[i] {
                 plan.essential_hi.push(i);
             }
+        }
+        for &i in &plan.essential {
+            plan.lo_essential[i] = false;
         }
     }
 
@@ -4226,6 +4267,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let i = self.present_list[p];
             self.or_tier[i].on = false;
         }
+        for &w in &self.hi_dirty {
+            self.hi_rows[w as usize] = 0;
+        }
+        self.hi_dirty.clear();
         if self.bar.is_none() {
             return Ok(false);
         }
@@ -4263,7 +4308,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.hi_rows.resize(n * words, 0);
             }
             let row = &mut self.hi_rows[i * words..(i + 1) * words];
-            row.fill(0);
             let hi = tiers.hi_bytes();
             if hi.len() >= 2
                 && usize::from(u16::from_le_bytes([hi[hi.len() - 2], hi[hi.len() - 1]]))
@@ -4271,7 +4315,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             {
                 return Err(Error::Corrupt("group tiers slots"));
             }
-            kernels::array_into_row(hi, row);
+            // Set in the clear row, each word it sets noted to clear later.
+            let at = (i * words) as u32;
+            for c in hi.chunks_exact(2) {
+                let v = usize::from(u16::from_le_bytes([c[0], c[1]]));
+                row[v / 64] |= 1 << (v % 64);
+                self.hi_dirty.push(at + (v / 64) as u32);
+            }
             self.or_tier[i] = OrTier {
                 on: true,
                 lo_bound: bound,
@@ -4910,6 +4960,33 @@ mod tests {
                 }
             }
             proptest::prop_assert!(split > 0 || members.len() < 256, "no group split");
+        }
+    }
+
+    proptest::proptest! {
+        /// A word's sum through a split term's two rows (its low bound,
+        /// then the step to the group's) is no lower than through the
+        /// group's bound in one addition, whatever the sum before it.
+        #[test]
+        fn a_tier_step_keeps_a_words_sum_no_lower(
+            lo in 0.0f32..50.0,
+            gap in 0.0f32..50.0,
+            before in proptest::collection::vec(0.0f32..100.0, 0..12),
+            share in 0.0f64..=1.0,
+        ) {
+            let hi = lo + gap;
+            proptest::prop_assume!(lo < hi);
+            let most: f64 = before.iter().map(|b| f64::from(*b)).sum::<f64>() + f64::from(hi) + f64::from(lo);
+            let d = tier_step(lo, hi, 2.0 * most);
+            // Every prefix of the sums before it, and a scaled one.
+            let mut a = 0.0_f32;
+            for b in before.iter().chain([&0.0]) {
+                for x in [a, (f64::from(a) * share) as f32] {
+                    let split = (x + lo) + d;
+                    proptest::prop_assert!(split >= x + hi, "{x} + {lo} + {d} below {x} + {hi}");
+                }
+                a += *b;
+            }
         }
     }
 
