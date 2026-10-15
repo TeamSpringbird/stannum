@@ -1462,9 +1462,6 @@ pub struct RankedAnswer {
     /// them), and those whose positions were checked.
     pub candidates: u64,
     pub position_checks: u64,
-    /// A disjunction's (term, group) pairs whose members were probed per
-    /// candidate rather than read whole (non-essential lists).
-    pub probed: u64,
 }
 
 /// The `k` best matches of `node` in `segment` by the summed scores of
@@ -3826,18 +3823,16 @@ mod tests {
     }
 
     /// A disjunction of a dense word (grids), mid-density words (Elias-Fano
-    /// lists and arrays) and rare ones: once the threshold leaves the
-    /// cheapest terms non-essential, their lists are probed per candidate
-    /// rather than read whole into rows, and the rows kept are a brute
-    /// force's, bit for bit.
+    /// lists, arrays, short lists) and rare ones, sparse records or grouped:
+    /// the rows kept are a brute force's, bit for bit, whichever terms the
+    /// threshold leaves non-essential in a group.
     #[test]
-    fn disjunctions_probe_non_essential_lists_and_keep_the_exact_top_rows() {
+    fn disjunctions_of_grids_lists_and_arrays_keep_the_exact_top_rows() {
         let n = 9_000;
         let base = Options {
             inline_lengths_min_documents: u32::MAX,
             ..Options::default()
         };
-        let mut probed = 0;
         // Rarer words as one list over the segment (sparse records); then
         // grouped, as Elias-Fano lists, short lists, or arrays.
         let grouped = Options {
@@ -3908,11 +3903,9 @@ mod tests {
                         bits(&want),
                         "seed {seed}, top {k} of {node:?}"
                     );
-                    probed += got.probed;
                 }
             }
         }
-        assert!(probed > 0, "no list was probed");
     }
 
     /// Two dense words, with the final rows kept from the start: a group's
