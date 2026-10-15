@@ -267,6 +267,15 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   instead of 30 (TIN 3), and round 4's elided-fill probes 61 instead of 121
   (TIN 118), with the same rows and scores. `EXPLAIN ANALYZE` reports the
   groups folded (`Stream Groups Folded`).
+- Segments in TIN's shape set a non-grid container's members in a row
+  without reading back the word the last one stored: on aarch64 eight at a
+  time at byte grain (NEON), elsewhere with the word held in a register.
+  Disjunctions (array containers, a sparse term's members), conjunctions
+  (short lists marked for the candidates' filter), counts and matches
+  (Elias-Fano and array containers) take it. At 150 million rows (replay)
+  every style takes 0.2-1.0% fewer cycles on Sapphire Rapids, with the
+  same answers; on Apple M4 Elias-Fano lists set into rows take 14% less
+  time a member.
 - A ranked conjunction or phrase over `TNS1` scoring a common term (in at
   least one document in ten of the segment, as `full_score` scores them)
   beside a rarer one bounds the common term's groups by its record rather
@@ -431,6 +440,12 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   unfolded, so every `score()`, `full_score()` and ranked scan over such an
   index failed with "cannot compute scores for this query". TIN 1.0.4
   scores them (round 4's d6 probe).
+- A merge copies an input's group container only where the output's
+  options choose that kind: a grid into a group they force into one, a
+  list or paged container into one they do not. A merge under other
+  options than the inputs' (as `tnsreencode` weighs a grid threshold) had
+  copied grids into groups the new options no longer force, and written a
+  hybrid of the two thresholds.
 - A generic plan with LIMIT or OFFSET a parameter declared `int` or
   `smallint` ranks only the top k: the parameter's cast to `bigint` kept the
   bound from the scan, which scored every match (68 ms against 0.4 ms for

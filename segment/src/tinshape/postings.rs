@@ -131,6 +131,10 @@ pub struct Options {
     /// smaller term whole costs microseconds, and a small table, every
     /// term of which is small, would pay for grids it never needs.
     pub grid_min_postings: u32,
+    /// ... and in at least one in this many of the segment's documents (0:
+    /// any share): a rarer term's dense groups are chosen by size like any
+    /// other's.
+    pub grid_min_share: u32,
     /// A group the encoder would store as an Elias-Fano list, of at most
     /// this many members, is an array of `u16` local slots instead
     /// ([`KIND_ARRAY`]): two bytes a member where the list takes 1.2 to 1.8
@@ -159,6 +163,17 @@ pub enum GroupFrontiers {
     Rounded,
 }
 
+impl Options {
+    /// Whether a term of `df` postings in a segment of `documents` documents
+    /// has its groups of at least one slot in [`Self::grid_density`] forced
+    /// into grids.
+    pub fn forces_grids(&self, df: u64, documents: u32) -> bool {
+        df >= u64::from(self.grid_min_postings)
+            && (self.grid_min_share == 0
+                || df * u64::from(self.grid_min_share) >= u64::from(documents))
+    }
+}
+
 impl Default for Options {
     fn default() -> Self {
         Self {
@@ -169,6 +184,7 @@ impl Default for Options {
             adaptive_tf: true,
             grid_density: 64,
             grid_min_postings: 4096,
+            grid_min_share: 0,
             array_max: 64,
             inline_lengths_max_df: 64,
             inline_lengths_min_documents: 1 << 16,
@@ -192,6 +208,11 @@ pub struct Stats {
     pub kind_bytes: [usize; 4],
     /// Groups made grids by [`Options::grid_density`].
     pub forced: usize,
+    /// Groups of at least one slot in [`Options::grid_density`] of a term
+    /// of at least [`Options::grid_min_postings`]: forced into grids but
+    /// for [`Options::grid_min_share`], and keeping the term grouped either
+    /// way.
+    pub dense: usize,
     /// Bytes of inline lengths ([`InlineLengths`]).
     pub lengths: usize,
     /// Bytes of the directory's group frontiers (part of `payload`), and
@@ -400,20 +421,21 @@ fn get_checked(bytes: &[u8], at: &mut usize) -> u64 {
 }
 
 /// A group container an input segment holds that a merge may copy: its
-/// kind and bytes (as [`Postings::container`] gives them), and the postings
-/// of the input term that holds it.
+/// kind and bytes (as [`Postings::container`] gives them).
 ///
 /// A copy is what a fresh encoding writes when the output group has the
 /// input's geometry (the same width, first page and span), its members are
-/// exactly the input's there (no dead document, no other input), the
-/// options are the same, and the two terms fall on the same side of
-/// [`Options::grid_min_postings`]; the caller vouches for all but the last,
-/// which the encoder checks, re-encoding the group when it fails.
+/// exactly the input's there (no dead document, no other input) and the
+/// options are the same; the caller vouches for these. The encoder copies a
+/// grid only into a group it forces into one (a grid whatever its size),
+/// and a list or a paged container only into a group it does not force:
+/// any other group is encoded afresh, an unforced grid too (it won by size
+/// under the input's options, which a tool re-encoding at another threshold
+/// changes).
 #[derive(Clone, Copy, Debug)]
 pub struct Reused<'a> {
     pub kind: u8,
     pub bytes: &'a [u8],
-    pub input_df: u32,
 }
 
 /// Encodes a term's postings: `slots` strictly increasing, with each
@@ -483,7 +505,7 @@ pub fn encode_reusing<'r>(
     let mut footer = Vec::new();
     let mut tf_bytes = Vec::new();
     let mut blocks = 0usize;
-    if options.sparse && grouped_stats.forced == 0 {
+    if options.sparse && grouped_stats.dense == 0 {
         let mut tf = BitWriter::new();
         let mut previous = 0u32;
         for (b, chunk) in slots.chunks(block).enumerate() {
@@ -513,7 +535,9 @@ pub fn encode_reusing<'r>(
             blocks += 1;
         }
     }
-    // A term with a group dense enough to be a grid stays grouped. The
+    // A term with a group dense enough to be a grid stays grouped (a grid
+    // or not, as its share decides: one list over the segment would trade
+    // the group's bounds and skips for a few bytes). The
     // directory's frontiers and the footer do not count: they buy the
     // walks their bounds, and leaving them out keeps each term's form
     // what it was without them, and so do its skip points. Arrays count as
@@ -524,7 +548,7 @@ pub fn encode_reusing<'r>(
         - grouped_stats.skip_bytes as isize
         - grouped_stats.array_excess;
     let use_sparse =
-        options.sparse && grouped_stats.forced == 0 && sparse.len() as isize <= grouped_len;
+        options.sparse && grouped_stats.dense == 0 && sparse.len() as isize <= grouped_len;
     let payload = if use_sparse { &sparse } else { &grouped };
     let mut inline_bytes = Vec::new();
     if inline {
@@ -575,6 +599,7 @@ pub fn encode_reusing<'r>(
         stats.kinds = grouped_stats.kinds;
         stats.kind_bytes = grouped_stats.kind_bytes;
         stats.forced = grouped_stats.forced;
+        stats.dense = grouped_stats.dense;
         stats.frontier_bytes = grouped_stats.frontier_bytes;
         stats.skip_bytes = grouped_stats.skip_bytes;
         stats.frontiers = grouped_stats.frontiers;
@@ -688,23 +713,23 @@ fn encode_groups<'r>(
         let mut best = group.grid_bytes();
         let dense = options.grid_density > 0
             && locals.len() as u64 * u64::from(options.grid_density) >= u64::from(group.slots());
-        let forced = dense && slots.len() as u64 >= u64::from(options.grid_min_postings);
+        let forced = dense && options.forces_grids(slots.len() as u64, geometry.documents);
         if forced {
             stats.forced += 1;
+        }
+        if dense && slots.len() as u64 >= u64::from(options.grid_min_postings) {
+            stats.dense += 1;
         }
         // A list of this many members is an array rather than Elias-Fano.
         let array =
             locals.len() as u64 <= u64::from(options.array_max) && group.slots() <= ARRAY_SLOTS_MAX;
-        // An input's container, where its term was forced as this one is
-        // and its list is the form these options give it.
-        let reused = reuse(index).filter(|r| {
-            let form = match r.kind {
-                KIND_EF => !array,
-                KIND_ARRAY => array,
-                _ => true,
-            };
-            form && (!dense
-                || (u64::from(r.input_df) >= u64::from(options.grid_min_postings)) == forced)
+        // An input's container of the kind this group takes: a grid where
+        // it is forced, else the list form these options give it, or paged.
+        let reused = reuse(index).filter(|r| match r.kind {
+            KIND_GRID => forced,
+            KIND_EF => !forced && !array,
+            KIND_ARRAY => !forced && array,
+            _ => !forced,
         });
         if let Some(r) = reused {
             kind = r.kind;
@@ -4276,6 +4301,7 @@ mod tests {
                             adaptive_tf,
                             grid_density,
                             grid_min_postings: 0,
+                            grid_min_share: 0,
                             // Arrays for lists of at most 64, of 2, of any
                             // length, and none.
                             array_max: match (block_size, grid_density) {
@@ -4548,6 +4574,58 @@ mod tests {
         let second = ef::encoded_len(109, geometry.groups[1].slots());
         assert_eq!(all.array_excess, (2 * 178 - first - second) as isize);
         assert_eq!(ef.array_excess, 0);
+    }
+
+    #[test]
+    fn grids_forced_only_for_terms_of_a_large_enough_share() {
+        // 512 full pages of 40 tuples (20,480 documents); a term in every
+        // 30th document holds one slot in 30 of each group: its groups are
+        // forced into grids at the default density (64) unless the share
+        // asked for is more than its own (683 documents, 1 in 29.98).
+        let tids: Vec<Tid> = (0..512u32)
+            .flat_map(|b| {
+                (1..=40u16).map(move |o| Tid {
+                    block: b,
+                    offset: o,
+                })
+            })
+            .collect();
+        let geometry = geometry(&tids);
+        let members: Vec<Tid> = tids.iter().step_by(30).copied().collect();
+        let slots: Vec<u32> = members
+            .iter()
+            .map(|t| geometry.slot_of(*t).unwrap())
+            .collect();
+        let buckets = vec![1u8; slots.len()];
+        let lengths = vec![50; slots.len()];
+        let forced = |share: u32| {
+            let options = Options {
+                grid_min_postings: 0,
+                grid_min_share: share,
+                ..Options::default()
+            };
+            round_trip(&geometry, &slots, &buckets, &lengths, &options).forced
+        };
+        assert_eq!(forced(0), 2);
+        assert_eq!(forced(16), 0);
+        // Its groups not forced, it stays grouped all the same.
+        let options = Options {
+            grid_min_postings: 0,
+            grid_min_share: 16,
+            ..Options::default()
+        };
+        let stats = round_trip(&geometry, &slots, &buckets, &lengths, &options);
+        assert_eq!((stats.sparse, stats.dense), (false, 2));
+        assert_eq!(forced(29), 0);
+        assert_eq!(forced(31), 2);
+        assert_eq!(forced(64), 2);
+        let options = Options {
+            grid_min_postings: 0,
+            grid_min_share: 16,
+            ..Options::default()
+        };
+        assert!(!options.forces_grids(1279, 20_480));
+        assert!(options.forces_grids(1280, 20_480));
     }
 
     #[test]

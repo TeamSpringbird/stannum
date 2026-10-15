@@ -149,7 +149,10 @@ kind    := 0 grid | 1 ef | 2 paged | 3 array
 The encoder takes the smallest form, with one exception: a group holding
 at least one slot in 64 of a term of at least 4,096 postings
 (`Options::grid_min_postings`) is a grid whatever else is smaller, and a
-term with such a group is grouped. A smaller term decodes whole in
+term with such a group is grouped. `Options::grid_min_share` N (0 by
+default: any share) forces those grids only for a term in at least one in N
+of the segment's documents; a rarer term's dense groups take the smallest
+form like any other's, and the term stays grouped. A smaller term decodes whole in
 microseconds, and a small table, all of whose terms are small, would pay
 for grids it never folds. Grids are what counts fold and what a ranked
 sieve reads word by word; Elias-Fano lists must be decoded a member at a
@@ -168,7 +171,8 @@ local slots as `u16`s instead (page layout 11; see
 [measurements](#short-lists-as-u16-arrays-at-150m-rows-branch-loopr8-page-layout-11)):
 two bytes a member where Elias-Fano takes 1.2 to 1.8 at these lengths,
 but nothing to decode. A walk widens an array into its list eight values
-a step (NEON, AVX2), sets it in a row a value at a time, and probes one
+a step (NEON, AVX2), sets it in a row eight values a step
+(`kernels::rows`, as Elias-Fano lists are set), and probes one
 much longer than its candidates in place by galloping. Roaring's array
 container is the precedent; TIN's sparse lists measure 3 to 4 bytes a
 posting (round 2, H5), so it likely stores short lists byte-wise too.
@@ -534,13 +538,16 @@ ways and compare) when:
 2. its members are exactly the input's there: no dead document of the
    input in the group, and no other input holding the group;
 3. both segments are built with the same `Options`;
-4. the output and input terms fall on the same side of
-   `Options::grid_min_postings` where the group is dense enough to be
-   forced to a grid.
+4. the container is a grid where the output group is forced into one, and
+   a list or paged container where it is not.
 
 The caller vouches for 1 to 3 (`kind` and `bytes` come from the input's
 `Postings::container` and its `GroupEntry::kind`); the builder checks 4
-and encodes the group afresh when it fails. The footer, the TF tail and
+and encodes the group afresh when it fails. Rule 4 holds by itself when 3
+does; it matters where 3 does not: `tnsreencode` merges each segment alone
+under the options it weighs, and a grid copied into a group the new
+threshold no longer forces made the output a hybrid of the two
+thresholds. The footer, the TF tail and
 the positions are always rebuilt: they depend on posting indexes, which
 interleave.
 
@@ -1478,6 +1485,64 @@ Measured on a Sapphire Rapids devbox (m7i.4xlarge, `perf stat` user cycles,
   first cut: `full_score` +1.8% (branch misses +7 points), score +1.4%
   (branches `loop/fx-rejected`, `loop/fx-held`). As with R6, the line's
   miss is not what the candidate waits on most.
+
+### Rows without a load per member, and the grid threshold (branch `loop/arrayfold`)
+
+A disjunction's row of a non-grid container, and a fold's (counts,
+matches), set each member by reading its word, ORing its bit in and storing
+it back: at one member in 16 slots about four share a word, and each waits
+on the store before (1.1 ns a member on the M4, 0.53 ns with the word held
+in a register as Elias-Fano rows already were). `kernels::rows` sets
+ascending values in a row clear from the first one's bit on: on NEON eight
+at a time at byte grain (each member's byte and bit, members sharing a byte
+ORed in three shifted steps, the last byte carried, a byte stored per
+member: 0.33 ns a member at densities 1/4 to 1/64); elsewhere the
+register-held word. Arrays, Elias-Fano chunks (on NEON), a sparse term's
+locals, a conjunction's marked short lists and a flat AND's matches take
+it; a fold ORs a cleared row of a dense container into a filled one. Elias-
+Fano rows into a row on the M4: 0.78 -> 0.67 ns a member.
+
+On x86-64 the portable body runs. An AVX2 body at 32-bit grain was slower
+on Sapphire Rapids (Elias-Fano rows 1.27 against 1.16 ns a member at AVX2,
+1.38 against 0.98 at AVX-512), and so was handing the AVX2 and AVX-512
+Elias-Fano bodies' chunks to the baseline-compiled loop (`shl reg, cl`, three
+micro-ops, where those bodies have BMI2's `shlx`): 14-19% more a member, so
+those bodies keep their own inlined loop.
+
+At 150M rows (replay, layout 12 as built, the same answers), against
+`eb8ff15`: Sapphire Rapids `full_score` disjunctions -1.0% cycles, score
+disjunctions -0.7%, conjunctions -0.3%, phrases -0.2% (2 rounds, `perf
+stat`).
+
+**The grid threshold, re-weighed with these rows** (the version-6 dump
+re-encoded on the devbox, every group encoded afresh; payload and all
+pages are distinct pages a query, cycles against the default at the same
+code):
+
+| encoding | postings | disj full: payload / pages / cycles | disj score | conj | phrase |
+| --- | ---: | --- | --- | --- | --- |
+| grids at 1 slot in 64 (default) | 16.40 GB | 10,771 / 17,475 | 4,137 / 6,360 | 2,182 / 3,225 | 2,402 / 4,332 |
+| grids only for terms in 1/16 of the documents (`grid_min_share` 16) | 12.03 GB | -17.7% / -10.9% / +6.8% | -46.7% / -30.3% / +13.3% | -29.8% / -20.2% / +21.4% | -29.1% / -16.1% / +18.1% |
+| grids at 1 slot in 16 (`grid_density` 16) | 11.23 GB | -20.1% / -8.8% / +16.0% | -50.7% / -28.0% / +28.5% | -28.4% / -16.9% / +34.0% | -28.5% / -14.7% / +25.6% |
+
+Neither meets the bar set for it (disjunction pages -15% at no more than
++2% cycles in any style); the default stays. A container that is not a
+grid costs its members' decoding where a grid is read in place: under the
+share rule a conjunction spends 21% of its cycles decoding and probing
+Elias-Fano lists. On TIN's probe corpus (1M rows, fresh builds) the share
+rule cut payload 42% and all pages 12% (round 4's D3 score disjunctions
+1,326 -> 394 payload pages, TIN 800), with counts of the D3 disjunctions
+about as fast as the default and density 16's twice as slow. `grid_min_share`
+stays an encoder option (0 by default); a term with a dense group stays
+grouped under it, which without that rule became one list over the segment
+(a 150M segment's sparse lists went from 67M to 383M members).
+
+`tnsreencode` weighs thresholds by merging each segment alone; merges
+copied a grid into any group the new options did not force, so encodings
+from a dump of the same geometry (layout 10 to 12) were hybrids of the two
+thresholds (density 16 cut postings 16.8% that way, 31.5% encoded afresh).
+A merge now copies a grid only into a forced group (see
+[copying containers](#writing-and-maintaining-it)).
 
 ## The first k matches of elided terms (branch `loop/zerofill`)
 

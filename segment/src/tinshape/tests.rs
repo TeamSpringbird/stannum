@@ -283,6 +283,53 @@ proptest! {
 }
 
 #[test]
+fn a_merge_at_another_grid_threshold_encodes_unforced_groups_afresh() {
+    // One input of three 256-page groups of 40 pages of 6 rows, written
+    // with grids forced at density 64: word "s", in every 20th row of the
+    // first two groups, is one slot in 20 there, a grid. Merged alone at
+    // density 16 (as tnsreencode weighs a threshold) those groups are not
+    // forced and a list is smaller: the merge writes what a build at 16
+    // writes, not the grid. In every 4th row of the third group, "s" stays
+    // grouped at 16 (a grid there). Word "w", in every row, is a grid at
+    // both and is copied.
+    let docs: Vec<Doc> = (0..3u32)
+        .flat_map(|group| {
+            (0..40u32).flat_map(move |page| {
+                (1..=6u16).map(move |offset| {
+                    let n = group * 1000 + page * 6 + u32::from(offset);
+                    let mut tokens = vec![("w".to_owned(), 0)];
+                    if n % (if group < 2 { 20 } else { 4 }) == 0 {
+                        tokens.push(("s".to_owned(), 1));
+                    }
+                    (Tid::new(group * 256 + page, offset).unwrap(), tokens)
+                })
+            })
+        })
+        .collect();
+    let at = |grid_density| Options {
+        block_size: 16,
+        grid_min_postings: 0,
+        grid_density,
+        ..Options::default()
+    };
+    let (written, wanted) = (tns(&docs, at(64)), tns(&docs, at(16)));
+    assert_ne!(written, wanted, "the threshold changes the encoding");
+    let none = DeadDocs::decode(&crate::ordinals::encode(&[]), docs.len() as u32).unwrap();
+    let merged = merge(
+        &[Input {
+            bytes: &written,
+            dead: &none,
+        }],
+        at(16),
+        || Ok(()),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(merged.reused >= 3, "{}", merged.reused);
+    assert_eq!(merged.blob, wanted);
+}
+
+#[test]
 fn a_merge_keeps_the_containers_of_groups_one_input_holds() {
     // Two inputs over two 256-page groups each, every page full to the same
     // offset, so each group's geometry survives the merge; a dense word and

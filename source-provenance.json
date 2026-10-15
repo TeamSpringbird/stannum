@@ -810,6 +810,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: Elias-Fano lists decoded a block at a time (a table per highs byte, a shuffle per eight low parts), per instruction set (NEON, AVX2) with a portable reference."
     },
+    "engine/src/tinshape/kernels/rows.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a group's ascending members set as bits in a row without reading back the word stored before (NEON eight at a time at byte grain, a register-held word elsewhere), and marked intersection through such a row."
+    },
     "engine/src/tinshape/kernels/weigh.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: a disjunction's words and members weighed by their terms' bounds in lanes (words, or a word's members), per instruction set (NEON, AVX2) with a portable reference."

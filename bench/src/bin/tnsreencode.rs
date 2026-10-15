@@ -10,7 +10,7 @@
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--arrays N] \
+//!     [--from 10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--grid-share N] [--arrays N] \
 //!     [--jobs N] [--check] [--check-merge] [--census] [--keep-records]
 //! ```
 //!
@@ -44,7 +44,9 @@
 //!
 //! `--grid-density N` encodes with `Options::grid_density` N (a writer
 //! option: a group of a big term holding one slot in N is a grid) to
-//! weigh other thresholds, and `--arrays N` with `Options::array_max` N
+//! weigh other thresholds, `--grid-share N` with `Options::grid_min_share`
+//! N (only a term in one document in N has its groups forced so), and
+//! `--arrays N` with `Options::array_max` N
 //! (0: no array containers). `--check` verifies each output with
 //! `verify_segment`; `--check-merge`
 //! also merges the output alone again and requires the same bytes. Each
@@ -111,6 +113,7 @@ struct Args {
     from: u8,
     mode: GroupFrontiers,
     grid_density: u32,
+    grid_share: u32,
     array_max: u32,
     only: Option<String>,
     jobs: usize,
@@ -123,7 +126,7 @@ struct Args {
 fn usage() -> ! {
     eprintln!(
         "usage: tnsreencode --in DIR --out DIR [--from 10|9|8|6] [--exact] [--segment FILE] \
-         [--grid-density N] [--arrays N] [--jobs N] [--check] [--check-merge] [--census] \
+         [--grid-density N] [--grid-share N] [--arrays N] [--jobs N] [--check] [--check-merge] [--census] \
          [--keep-records]"
     );
     std::process::exit(2)
@@ -137,6 +140,7 @@ fn args() -> Args {
         from: 8,
         mode: GroupFrontiers::Rounded,
         grid_density: Options::default().grid_density,
+        grid_share: Options::default().grid_min_share,
         array_max: Options::default().array_max,
         only: None,
         jobs: 1,
@@ -153,6 +157,7 @@ fn args() -> Args {
             "--from" => a.from = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--exact" => a.mode = GroupFrontiers::Exact,
             "--grid-density" => a.grid_density = value(&mut it).parse().unwrap_or_else(|_| usage()),
+            "--grid-share" => a.grid_share = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--arrays" => a.array_max = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--segment" => a.only = Some(value(&mut it)),
             "--jobs" => a.jobs = value(&mut it).parse().unwrap_or_else(|_| usage()),
@@ -837,6 +842,7 @@ fn renumber(blob: &[u8], args: &Args) -> Result<Vec<u8>, String> {
         Options {
             group_frontiers: args.mode,
             grid_density: args.grid_density,
+            grid_min_share: args.grid_share,
             array_max: args.array_max,
             ..Options::default()
         },
