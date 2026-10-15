@@ -1830,8 +1830,9 @@ impl Directory {
         Ok(entry)
     }
 
-    /// Entry `b`, its group index found first (the entry read last as it
-    /// was).
+    /// Entry `b`, its group index found first: the entry read last as it
+    /// was, the one after it by the next group its presence holds (a walk
+    /// in order selects nothing).
     #[inline]
     pub fn get(&self, b: usize, groups: &[Group]) -> Result<GroupEntry> {
         let (at, last) = self.last.get();
@@ -1841,7 +1842,12 @@ impl Directory {
         if b >= self.len {
             return Err(Error::Corrupt("group directory entry"));
         }
-        self.entry_of(b, self.index(b), groups)
+        let index = if at != usize::MAX && at + 1 == b {
+            self.seek_any(last.index + 1, b).1
+        } else {
+            self.index(b)
+        };
+        self.entry_of(b, index, groups)
     }
 
     /// The entry holding posting `index` (one of the record's): the last

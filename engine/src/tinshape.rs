@@ -397,7 +397,8 @@ impl<'a> TermSet<'a> {
     /// `group` or more (to the group count if none is), and gives that
     /// group's index. A grouped term's directory finds it by the group's
     /// rank in its presence, or galloping its group indexes from the hint
-    /// ([`Directory::seek`]): no entry is read.
+    /// ([`Directory::seek`]), and reads its entry, which the walk asks for
+    /// next (its bound, its container).
     #[inline]
     fn seek_index(&self, group: u32, hint: &mut usize) -> Option<u32> {
         let Some(dir) = &self.dir else {
@@ -408,7 +409,11 @@ impl<'a> TermSet<'a> {
         };
         let (b, index) = dir.seek(group, *hint);
         *hint = b;
-        (b < dir.len()).then_some(index)
+        if b == dir.len() {
+            return None;
+        }
+        Self::entry(dir, &self.docs, b, Some(index));
+        Some(index)
     }
 
     /// The term's group `group`, if it holds it, looked for from `hint`
@@ -461,9 +466,22 @@ impl<'a> TermSet<'a> {
             let group = &geometry.groups[g.index as usize];
             let base = group.slot_base;
             if base + group.slots() <= target {
-                // Skip the groups wholly before the target: a gallop from
-                // the group at hand, then a binary search, so that a lazy
-                // directory decodes about as far as the target.
+                // Skip the groups wholly before the target: a grouped
+                // term's directory seeks the target's group; a single or
+                // sparse term's groups are galloped from the group at hand.
+                if self.dir.is_some() {
+                    let mut hint = self.gpos;
+                    if target >= geometry.slots
+                        || self
+                            .seek_index(geometry.group_of_slot(target) as u32, &mut hint)
+                            .is_none()
+                    {
+                        hint = self.group_count();
+                    }
+                    self.gpos = hint;
+                    self.loaded = Loaded::None;
+                    continue;
+                }
                 let count = self.group_count();
                 let ends_before = |i: usize| {
                     let group = &geometry.groups[self.group_index(i) as usize];
