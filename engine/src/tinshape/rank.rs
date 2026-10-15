@@ -4136,6 +4136,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             held += (word >> bit & 1) as usize;
         }
         self.held_list.clear();
+        // The first pick of `or_reads`, folded here (see `Walk::or_pick`).
+        let mut top = usize::MAX;
+        let mut best = f32::NEG_INFINITY;
         for h in 0..held {
             let p = self.held_places[h];
             let i = self.present_list[p];
@@ -4155,6 +4158,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let v = s.bound(b);
             self.held_bound[i] = v;
             bound += v;
+            let take = v > best;
+            best = if take { v } else { best };
+            top = if take { h } else { top };
         }
         if self.cut(bound, tid) {
             return Ok(None);
@@ -4182,29 +4188,29 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.buckets.fill(NO_BUCKET);
         let held = self.held_list.len();
         if held <= 64 {
-            self.or_reads(
-                u64::MAX.checked_shr(64 - held as u32).unwrap_or(0),
-                bound,
-                tid,
-            )
+            let unread = u64::MAX.checked_shr(64 - held as u32).unwrap_or(0);
+            self.or_reads(unread, top, bound, tid)
         } else {
-            self.or_reads(WideUnread::all(held), bound, tid)
+            self.or_reads(WideUnread::all(held), top, bound, tid)
         }
     }
 
     /// Reads the buckets of the candidate at hand's held terms (by their
     /// places in [`Walk::held_list`], those in `unread`), the term bounding
     /// it highest first, while it is left in reach: see [`Walk::or_stage`],
-    /// whose result this is, `reach` its bound before any bucket is read.
+    /// whose result this is, `reach` its bound before any bucket is read
+    /// and `first` [`Walk::or_pick`]'s first pick.
     #[inline(always)]
     fn or_reads<U: Unread>(
         &mut self,
         mut unread: U,
+        first: usize,
         mut reach: f32,
         tid: impl Fn() -> Tid + Copy,
     ) -> Result<Option<(f32, u32)>> {
         let mut floor = 0u32;
-        while let Some(top) = self.or_pick(&unread) {
+        let mut next = (first != usize::MAX).then_some(first);
+        while let Some(top) = next {
             unread.remove(top);
             let top = self.held_list[top];
             let (f, bucket) = self.or_bucket_of(top)?;
@@ -4222,6 +4228,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if self.cut(reach, tid) {
                 return Ok(None);
             }
+            next = self.or_pick(&unread);
         }
         let carrier = self.held_list.iter().copied().find(|i| {
             self.terms[self.sc[*i].term]
