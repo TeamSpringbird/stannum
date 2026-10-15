@@ -164,6 +164,16 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   aarch64 3.5%, 0.5% more, 8.3% and 1.3% fewer. Score disjunctions read
   10% more pages (a class for each candidate past its blocks); the
   answers are the same. An index of layout 12 must be rebuilt.
+- (Branch `loop/tiers` only, not adopted.) A grouped record splits each
+  group of 64 postings or more whose low tier would bound at most 0.9 of
+  the group into impact tiers (page layout 15): its best tenth as local
+  slots after its container, two pairs bounding the rest. A disjunction
+  plans, weighs and bounds such a group's members by tier. At 150 million
+  rows the index grows 0.48% and score disjunctions examine 28% fewer
+  candidates (`full_score` 8%), but on aarch64 they retire 10.1% more
+  instructions (`full_score` 7.6%; conjunctions and phrases 0.8% to 1.6%):
+  setting a split group up costs more than the candidates it removes. The
+  answers are the same.
 - Segments in TIN's shape store a group's postings list of at most 64
   members as its local slots in sorted `u16`s (page layout 11) rather than
   Elias-Fano, which decodes them one at a time below 16 members at every

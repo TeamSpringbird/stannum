@@ -125,6 +125,10 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
            (sparse), | 0x10 when the frontiers' lengths are rounded (grouped),
            | 0x20 when the directory ends in skip points (grouped, layout 11)
+           | 0x08 when groups are split into impact tiers (grouped, layout
+           15: each entry's gap is shifted left a bit, the bit set for a
+           split group, whose container is followed by its tiers; measured
+           and not adopted, see [impact tiers](#impact-tiers-in-the-or-walk-branch-looptiers-page-layout-15))
 lengths := base varint, width u8, (length - base) packed at width, by posting
 list    := Elias-Fano over the term's slots, universe = all slots
 directory := groups, (index gap, (count - 1) << 2 | kind, [len],
@@ -2116,6 +2120,55 @@ x86: a conjunction's cycles there do not move.
   are of `361f39b`, the final code but for a guard that only runs on a
   segment without classes. Mean latency on the first
   devbox (a slower host) moved 5 to 20%, where its counters moved 0 to 5.
+
+## Impact tiers in the OR walk (branch `loop/tiers`, page layout 15)
+
+Not adopted: measured 2026-10-15 and left on its branch. Not TIN's structure (TIN bounds a document only by its
+group frontiers and L*), so it had to earn its place on x86; it lost on the M4 first, and went no further.
+
+**Format.** A grouped record's group of at least 64 postings is split in two by impact at BM25's defaults and
+the segment's average length: its high tier, the best tenth (`count.div_ceil(10)`), stored after its container as
+`u16` local slots, and two (bucket, length code) pairs that bound every other posting (three bytes). A group is
+split only where those pairs bound at most 0.9 of its frontier; the record sets `FORM_TIERS` (0x08) and its
+entries' gaps carry a bit saying which groups are (the directory's scan is unchanged). The writer chooses afresh
+per group, a merge too; `verify_segment` checks the slots and the cover. At 150M rows +0.48% of the index
+(37,282,996,198 to 37,462,020,184 bytes; `tnsreencode --from 13`, which with `--no-tiers` gives layout 13's
+records byte for byte). The census (`tnstiers`) chose the rule: the low tier bounds at 0.78 to 0.85 of the group
+at the top tenth, and 80 to 98% of groups of 64 postings or more fall to 0.9 or less.
+
+**Walk.** Under a bar, a disjunction plans a group with split terms as MaxScore over parts (a term's low tier at
+its pairs' bound, its high tier at the group's, a document holding one): a term essential by its high part alone
+puts that tier's row in the mask, and one without whose high tier the rest cannot reach the threshold has it
+ANDed in. A word's sum adds the low bound where it holds the term and the rest of the group's, raised by what two
+`f32` additions can lose, where it holds a high member; a member adds one or the other, in the term's place in the
+scorer's order (a bound split into two addends does not bound the sum of the scores under rounding: the tie tests
+found it). A candidate's low-tier term is bounded by the low pairs, its unread bucket by their largest, its floor
+by the longer of the group's and theirs. Exact: whole trace 1,228 / 1,253 / 1,252 equal, `--full` outputs
+f0962a8's byte for byte.
+
+On the M4 (`--forget`, 200 queries a style, against `06fa4bd` over layout 13; instructions / cycles, then mean
+pages and candidates examined a query):
+
+| | instructions / cycles | pages | candidates |
+| --- | --- | --- | --- |
+| score disjunction | +10.1 / +16.1% | -0.8% | -27.6% |
+| score conjunction | +1.6 / -0.1% | +1.1% | = |
+| score phrase | +1.2 / -0.0% | +0.9% | = |
+| full disjunction | +7.6 / +5.3% | -0.3% | -8.2% |
+| full conjunction | +1.1 / +1.5% | +0.9% | = |
+| full phrase | +0.8 / +0.9% | +0.7% | = |
+
+- A score disjunction weighs some 16.6K split (term, group)s a query. Setting each up (the low bound, the high
+  row from its slots) cost ~1,200 instructions, +6.9% of the query; planning by tiers was neutral; weighing and
+  bounding candidates by them cost 1.4% more than the 5.5K candidates a query (~1.2K instructions each) they
+  removed. The code with no tier anywhere cost +1.4% (layout-13 dump; +4.2% before the untiered paths were left
+  as they were).
+- The ceiling is low: candidates are ~8% of a score disjunction's instructions on the M4 and ~13% of its cycles
+  on x86 (27% for `full_score`), so even free tiers would give about -2 to -3.5% (score) and -2% (`full_score`),
+  short of the -8% / -10% gate. The census model's -35% members weighed and -77% kept bounded each posting at its
+  bucket's floor over a baseline weighing three times the walk's members; the walk's members are weighed before
+  any bucket is read.
+- Conjunctions and phrases never read the tiers, but step over them: +1.6% payload pages.
 
 ## Open
 
