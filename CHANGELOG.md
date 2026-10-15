@@ -183,7 +183,14 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   may cost; the directory was kept for the conjunctions' gain and its
   simpler code, and a disjunction's in-order read of the rows is the next
   step. Layout 14 carries the length classes too: an index of layout 12
-  or 13 must be rebuilt.
+  or 13 must be rebuilt. Together, with the two branch-free lookups below
+  (replay at 150 million rows on Sapphire Rapids against layout 12, three
+  rounds, the same answers): conjunctions take 10.3% fewer cycles,
+  phrases 10.4%, `full_score` conjunctions 6.9%, phrases 6.2% and
+  disjunctions 7.5%; score disjunctions 1.2% more (rounds +0.2, +0.4 and
+  +3.0%; 1.0% fewer instructions, 12% more pages, the classes'). Built
+  afresh, the 150 million-row index is 0.84% larger (37.45 to 37.76 GB)
+  and its build 1.1% longer.
 - Segments in TIN's shape store a group's postings list of at most 64
   members as its local slots in sorted `u16`s (page layout 11) rather than
   Elias-Fano, which decodes them one at a time below 16 members at every

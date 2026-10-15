@@ -1474,6 +1474,23 @@ layout 12 `--fresh`, 37.25 GB -> 37.60 GB (+0.96%), every segment
 verified and equal to its own merge; from the length classes' layout-13
 dump, `--from 13 --keep-records` writes the same bytes, segment for
 segment.
+Against layout 12 (`08366a2`) on Sapphire Rapids (`m7i.4xlarge`, three
+rounds in alternating order, 300 queries score and 200 `full_score`,
+`--forget`; every output the same), layout 14 with both and the
+branch-free lookups (`48fc9a7`):
+
+| layout 14 against 12 | cycles (rounds) | instructions | pages |
+| --- | --- | --- | --- |
+| score conjunction | -10.3% (-10.7/-8.3/-11.9) | -13.8% | -3.7% |
+| score phrase | -10.4% (-10.3/-10.5/-10.4) | -15.9% | -2.4% |
+| score disjunction | +1.2% (+0.2/+0.4/+3.0) | -1.0% | +12.1% |
+| full conjunction | -6.9% (-6.5/-6.9/-7.3) | -9.8% | -2.0% |
+| full phrase | -6.2% (-6.3/-6.2/-6.1) | -8.1% | -2.0% |
+| full disjunction | -7.5% (-7.5/-8.2/-6.9) | -5.1% | -8.3% |
+
+The 150M database built afresh at layout 14 (the v2 profile, as layout
+12's): index 37.76 GB against 37.45 (+0.84%), import 12.5 minutes and
+index build 147.1 against 12.4 and 145.5.
 
 **Speed.** Replay with `--forget` against layout 12 (`bd8e53b`), each arm on
 its own dump; all outputs the same. On x86-64 (Sapphire Rapids,
