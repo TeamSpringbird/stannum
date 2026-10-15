@@ -153,6 +153,17 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- The DL sidecar of a segment in TIN's shape holds each document's length
+  class, two bits by rank (shorter than 16, 64, 256 words, or longer;
+  page layout 13), and a ranked walk bounds a candidate at its class's
+  shortest length before it reads the exact one: a conjunction or phrase
+  after its buckets, a disjunction before them. At 150 million rows the
+  index grows 0.10% and queries read 73% to 84% fewer lengths; on x86-64
+  phrases take 6.9% fewer cycles (2.6% scoring every term), conjunctions
+  3.6%, `full_score` disjunctions 8.0%, score disjunctions 0.8%; on
+  aarch64 3.5%, 0.5% more, 8.3% and 1.3% fewer. Score disjunctions read
+  10% more pages (a class for each candidate past its blocks); the
+  answers are the same. An index of layout 12 must be rebuilt.
 - Segments in TIN's shape store a group's postings list of at most 64
   members as its local slots in sorted `u16`s (page layout 11) rather than
   Elias-Fano, which decodes them one at a time below 16 members at every

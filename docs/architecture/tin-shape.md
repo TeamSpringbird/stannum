@@ -369,7 +369,8 @@ again (2.5% fewer cycles in the full_score replay).
   bucket or more (the frontier's pairs at or above it), so the DL sidecar
   is read only for a candidate this leaves in reach, then by its length
   class (the buckets bounded at the class's shortest length, where that
-  is longer than their floor: a byte, see [DL sidecar](#dl-sidecar)), and
+  is longer than their floor: a byte, see [DL sidecar](#dl-sidecar), read
+  only when the longest class's floor would rule the candidate out), and
   the score is exact from the buckets and the length. (A required term carrying its lengths
   inline is read first instead, with a bound by its length against the
   window's largest buckets, `TermScorer::length_bound_parts`.) At 150
@@ -437,9 +438,12 @@ again (2.5% fewer cycles in the full_score replay).
   document so rules out the common words' blocks, bounded by their short
   documents, before their TF is read: at 150M rows, scoring every term
   (`full_score`), a candidate past its blocks reads 60% fewer buckets and
-  a disjunction 38% fewer TF pages. A candidate its buckets leave in reach
-  is then bounded at its length class's shortest length, as a
-  conjunction's is, before its length is read. A flat disjunction's
+  a disjunction 38% fewer TF pages. Before any bucket, the candidate's
+  length class bounds it: its class's shortest length is the shared
+  length the buckets' floors then raise, so a long document falls short
+  before the common words' TF is read (see [length
+  classes](#length-classes-before-the-dl-read-at-150m-rows-branch-looplenclass-page-layout-13)).
+  A flat disjunction's
   candidates left in reach are scored best bound first at the group's end,
   as a phrase's are, so the best of a group raise the threshold over the
   rest before their lengths are read (on TIN's corpus, 15 ORed terms read
@@ -2020,6 +2024,98 @@ a call through the level's dispatch even for three values. Every answer
 of the whole trace is PostgreSQL's (1,253, 1,228 and 1,252 queries equal),
 and `--full` outputs are f0962a8's byte for byte; on x86 both layouts give
 the same outputs in every style and mode.
+
+## Length classes before the DL read at 150M rows (branch `loop/lenclass`, page layout 13)
+
+The gate (gates2's census over the layout-12 dump, the recorded θ
+trajectory): 93 to 97% of DL reads were for candidates whose buckets
+bounded at their exact length already fell below the threshold, and a
+2-bit class at fixed floors 16/64/256 would rule out 84% of a score
+conjunction's reads, 81% of a disjunction's, 79% of a phrase's. TIN's
+probes (round 8) carry exact lengths inline for (term, group) lists of at
+most 62 postings and read DL for every candidate past the group's bound in
+longer ones, so classes go beyond TIN there.
+
+**Where the classes live.** A plane per DL block in a row between the
+block headers and the packed lengths (see [DL sidecar](#dl-sidecar)), by
+rank: a class is one byte load at `rank / 4`, and a group's candidates
+(a few thousand consecutive ranks) mostly share its line. 37.5 MB at 150M
+rows, +0.101% of the index (`tnsreencode --from 12` rewrites only the
+sidecar: 37.25 to 37.28 GB). Beside each header (72 bytes a block) would
+spread the headers a survivor reads over nine times the pages; per
+posting in the TF tail, where a bucket read already lands, would cost 2
+bits a posting (1.3 GB, +3.5%). A class costs a rank (in memory) and a
+byte; the DL read it replaces costs a header and a data line per
+scattered candidate.
+
+**Where the walks read them.** A conjunction's or phrase's candidate its
+buckets leave in reach is bounded at its class's floor when that is longer
+than the buckets' floor (`Walk::class_bound`), and its class is read only
+when the longest class's floor would rule it out (7% fewer class pages
+than reading it for every such candidate, the same cuts). A disjunction's
+candidate past its blocks reads its class before any bucket
+(`Walk::or_stage`): the class floor is the shared length the buckets'
+floors then raise, so a long document is ruled out before the common
+words' TF is read. Exact by construction: a class's floor is a lower bound
+on the length, and the answers are bit-identical (whole trace: 1,228,
+1,253 and 1,252 queries equal to PostgreSQL's; `--full` outputs f0962a8's
+byte for byte; on x86 every arm's outputs equal the base's in every style
+and mode).
+
+Replays against layout 12 (`eb8ff15`), `--forget`: on a Sapphire Rapids
+devbox (m7i.4xlarge spot, perf user counters less a load-only run, 300
+queries score and 200 `full_score`, two rounds A..D then D..A; DL reads
+are candidates scored, pages distinct per query, from the same runs):
+
+| layout 13 against 12 | x86 cycles (rounds) / instructions | DL reads | DL pages | class pages | all pages |
+| --- | --- | --- | --- | --- | --- |
+| score phrase | -6.9% (-6.2/-7.6) / -6.9% | -84% | -48% | 278 | -2.2% |
+| score conjunction | -3.6% (-3.3/-3.9) / -0.1% | -76% | -69% | 234 | -3.2% |
+| score disjunction | -0.8% (-0.8/-0.7) / -1.8% | -73% | -71% | 1,772 | +11.1% |
+| full phrase | -2.6% (-0.9/-4.2) / -1.5% | -78% | -49% | 341 | -2.1% |
+| full conjunction | +0.0% (-0.0/+0.1) / +0.2% | -81% | -62% | 259 | -1.9% |
+| full disjunction | -8.0% (-8.3/-7.8) / -5.7% | -79% | -67% | 2,654 | -5.8% |
+
+On the M4 (`--forget`, 300 queries a style, two rounds interleaved,
+timed instructions and cycles; the same runs' pages):
+
+| layout 13 against 12 | M4 instructions / cycles (rounds) | DL and class pages | all pages |
+| --- | --- | --- | --- |
+| score phrase | -6.6 / -3.5% (-2.3/-4.6) | -11% | -2.1% |
+| score conjunction | -0.4 / +0.5% (+1.9/-0.8) | -20% | -3.2% |
+| score disjunction | -2.2 / -1.3% (-2.0/-0.7) | +61% | +10.1% |
+| full phrase | -2.7 / -1.1% (+0.3/-2.3) | -12% | -2.1% |
+| full conjunction | -0.4 / -0.1% (-1.4/+1.2) | -17% | -2.4% |
+| full disjunction | -6.8 / -8.3% (-7.7/-8.8) | +64% | -5.3% |
+
+The M4's caches hold more of the DL sidecar's lines a query misses on
+x86: a conjunction's cycles there do not move.
+
+- A phrase's instructions fall with its DL reads (a length is a header
+  and a bit extraction, and a phrase reads the most: 9,505 a query); a
+  conjunction's cycles fall with no change in instructions, the DL lines
+  it no longer misses on. The classes cut as many reads as the census
+  modelled (phrase -84%), but a read cost less than its 1.5K cycles: it
+  estimated -13% for phrases and -3.7% for conjunctions.
+- A disjunction reading its class after its buckets (as a conjunction
+  does; first devbox session, one round) took score disjunctions -5.5%
+  and `full_score` -0.3%; read first, `full_score` reads half the TF
+  pages (4,013 to 1,913 a query on the M4), with 18% fewer branch misses.
+  But a class is then read for every candidate past its blocks: score
+  disjunctions read 1,772 class pages a query where they no longer read
+  1,000 DL pages, +11% pages in all. Server-side a page is a pin; the
+  replay's CPU does not see it.
+- Not kept: a conjunction's class read before its buckets, against the
+  window's largest buckets as an inline length is (`loop/lenclass-ck`):
+  no fewer cycles, +4.4% pages (481 class pages). A disjunction's class
+  read first only when the longest class's floor would rule it out
+  (`loop/lenclass-cq`): it never read the class after the buckets, so
+  cut half the DL reads it should have (+2.6% / +3.7% cycles).
+- Run-to-run cycles moved up to 4 points between two arms of the same
+  code in one round (score conjunction: -3.6% and -7.8%); the rounds above
+  are of `361f39b`, the final code but for a guard that only runs on a
+  segment without classes. Mean latency on the first
+  devbox (a slower host) moved 5 to 20%, where its counters moved 0 to 5.
 
 ## Open
 
