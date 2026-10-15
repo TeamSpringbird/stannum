@@ -246,23 +246,23 @@ per group rather than per byte-aligned block saved 46 MB of 1.7 GB at
 
 ### Positions
 
-`STN3`'s positions stream (`segment::tinshape::positions`): per term,
-entries in posting order with a skip table every 32, its head
-(`count << 2 | masks << 1 | subs`) flagging two tables. Subs, for a term in
-at least one document in 16 (and 4,096 postings): a `u16` offset of every
-8th entry from its 32-entry block's start, `0xffff` past 64 KiB. Masks,
-where they save bytes: per block a `u32` naming the entries holding one
-position, whose count is then left out (a byte saved on most postings, at
-a bit each: 28.6 MB at 1M rows). A posting's index (its
-rank in slot order, which is ctid order, which was `STN3`'s ordinal order)
-addresses it. A phrase checks a common word's positions for candidates far
-apart in its posting order: from a skip it decoded up to 31 entries to
-reach one, from a sub at most 7 (`Positions::skip_entries`: a block's mask
-read once, a run of masked entries skipped as one run of varints).
-`Builder::add_term` takes the
-`segment::payload` stream; `Positions::payload` gives it back.
-`Positions::skip(index, at)` and `read_entry(index, at, out)` take the
-entry's index (for its mask bit).
+`STN3`'s positions stream (`segment::tinshape::positions`, page layout
+15): per term, entries in posting order in blocks of 32 with a `u32` skip
+to each block after the first. A block is bit-packed at its own widths (a
+`u16` of widths, TIN's per-block bit-packing): its entries' counts less one
+as bit planes (bit `i` of plane `b` is bit `b` of entry `i`'s), their first
+positions, then their later positions as `delta - 1`, entry after entry. A
+posting's index (its rank in slot order, which is ctid order, which was
+`STN3`'s ordinal order) addresses it. A phrase checks a common word's
+positions for candidates far apart in its posting order, and nothing of
+another entry is decoded to reach one: its count is its bits of the planes,
+its gaps start at the planes' population counts below it, its first
+position is one read at `i * width` (`Positions::block`, `entry`). The
+engine unpacks an entry of 8 gaps or more with the Elias-Fano low-part
+kernels (`kernels::positions_decode`). 150M rows: positions 18.40 ->
+16.89 GB (-8.2%; the index -4.0%) against layout 14's varints with
+masks and subs. `Builder::add_term`
+takes the `segment::payload` stream; `Positions::payload` gives it back.
 
 ### DL sidecar
 
@@ -651,7 +651,8 @@ asked rather than copying the directory per query; `TermSet::find` returns
 the entry by value. Added: `ef::Ef::retain_members(&mut Vec<u32>)` (keep
 the values a list holds, its highs passed a word at a time and only the
 lows of the values' buckets read) and `ef::EfCursor::list`;
-`positions::Positions::skip_entries(from, at, to)`;
+`positions::Positions::skip_entries(from, at, to)` (gone with page layout
+15);
 `boldi_vigna::PhrasePlan::leaves`.
 
 Added for Elias-Fano decoding (branch `tinshape/ef-simd`):
