@@ -1469,6 +1469,11 @@ encoded afresh, each segment verified and equal to its own merge with
 containers copied): directories 696 MB -> 1,015 MB, the index 37.25 GB ->
 37.56 GB (+0.86%). Most of it is the rows, about 7 bytes an entry where
 the varint entries took about 3.5 beside their frontiers.
+Layout 14 carries the length classes as well (`perf-integrate14`): from
+layout 12 `--fresh`, 37.25 GB -> 37.60 GB (+0.96%), every segment
+verified and equal to its own merge; from the length classes' layout-13
+dump, `--from 13 --keep-records` writes the same bytes, segment for
+segment.
 
 **Speed.** Replay with `--forget` against layout 12 (`bd8e53b`), each arm on
 its own dump; all outputs the same. On x86-64 (Sapphire Rapids,
@@ -2275,8 +2280,8 @@ longer ones, so classes go beyond TIN there.
 block headers and the packed lengths (see [DL sidecar](#dl-sidecar)), by
 rank: a class is one byte load at `rank / 4`, and a group's candidates
 (a few thousand consecutive ranks) mostly share its line. 37.5 MB at 150M
-rows, +0.101% of the index (`tnsreencode --from 12` rewrites only the
-sidecar: 37.25 to 37.28 GB). Beside each header (72 bytes a block) would
+rows, +0.101% of the index (on its branch `tnsreencode --from 12`
+rewrote only the sidecar: 37.25 to 37.28 GB). Beside each header (72 bytes a block) would
 spread the headers a survivor reads over nine times the pages; per
 posting in the TF tail, where a bucket read already lands, would cost 2
 bits a posting (1.3 GB, +3.5%). A class costs a rank (in memory) and a
