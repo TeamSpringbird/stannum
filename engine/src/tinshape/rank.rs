@@ -1293,9 +1293,6 @@ struct Walk<'s, 'a, T: Touch> {
     sc: Vec<Sc<'s, 'a>>,
     /// Required terms, rarest first.
     req: Vec<usize>,
-    /// The required terms after the lead in the group at hand, cheapest
-    /// first, with their costs ([`Walk::group_and`]).
-    order: Vec<(u64, usize)>,
     /// With common terms, the scoring terms (indexes into `sc`), rarest
     /// first.
     sc_order: Vec<usize>,
@@ -1670,27 +1667,25 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Intersects the required terms' members in group `g`, which the lead
     /// holds and has loaded: the lead's members, then each other required
-    /// term's, cheapest first, only while candidates are left (in most
-    /// groups a rare lead's few members leave none after one or two terms).
-    /// A grid filters them by bit, an Elias-Fano list much longer than they
-    /// are by probing its high bits in place, any other list by a merge.
-    /// Then walks the candidates left.
+    /// term's, rarest first, only while candidates are left (in most groups
+    /// a rare lead's few members leave none after one or two terms). A grid
+    /// filters them by bit, an Elias-Fano list much longer than they are by
+    /// probing its high bits in place, any other list by a merge. Then walks
+    /// the candidates left.
     fn group_and(&mut self, g: u32) -> Result<bool> {
         let mut cands = std::mem::take(&mut self.cands);
         cands.clear();
-        let mut order = std::mem::take(&mut self.order);
-        if self.cost_order(g, &mut order) {
-            let lead = &self.mems[self.req[0]];
-            match &lead.kind {
-                Kind::Grid(bytes) => kernels::set_bits_bytes(bytes, &mut cands),
-                Kind::List => cands.extend_from_slice(&lead.list),
-                Kind::Cursor { .. } | Kind::Array(_) => unreachable!("a lead is loaded whole"),
-            }
+        let lead = &self.mems[self.req[0]];
+        match &lead.kind {
+            Kind::Grid(bytes) => kernels::set_bits_bytes(bytes, &mut cands),
+            Kind::List => cands.extend_from_slice(&lead.list),
+            Kind::Cursor { .. } | Kind::Array(_) => unreachable!("a lead is loaded whole"),
         }
-        for &(_, t) in &order {
+        for r in 1..self.req.len() {
             if cands.is_empty() {
                 break;
             }
+            let t = self.req[r];
             if self.mems[t].loaded != g + 1 {
                 let set = self.terms[t].as_mut().expect("required");
                 let mem = &mut self.mems[t];
@@ -1730,47 +1725,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
             }
         }
-        self.order = order;
         let more = self.walk_candidates(g, &cands)?;
         self.cands = cands;
         Ok(more)
-    }
-
-    /// The required terms after the lead, in `order` cheapest first in group
-    /// `g`, by their directory entries there (a lookup each): a grid, which
-    /// tests a bit per candidate, before any list, lists by their members
-    /// (a sparse term's by its share of the group's slots), each decoded or
-    /// probed only while candidates are left. False when a grouped term
-    /// does not hold the group: nothing is loaded.
-    fn cost_order(&mut self, g: u32, order: &mut Vec<(u64, usize)>) -> bool {
-        order.clear();
-        let group = &self.geometry.groups[g as usize];
-        for &t in &self.req[1..] {
-            let set = self.terms[t].as_ref().expect("required");
-            let cost = match &set.dir {
-                Some(dir) => {
-                    let Some(b) = dir.find(g) else {
-                        return false;
-                    };
-                    let e = dir
-                        .entry_of(b, g, &self.geometry.groups)
-                        .unwrap_or_else(|e| corrupt_footer(e));
-                    if e.kind == KIND_GRID {
-                        0
-                    } else {
-                        u64::from(e.count)
-                    }
-                }
-                None => {
-                    u64::from(set.df) * u64::from(group.slots())
-                        / u64::from(self.geometry.slots).max(1)
-                }
-            };
-            order.push((cost, t));
-        }
-        // Stable: equal costs keep the rarest first.
-        order.sort_by_key(|&(cost, _)| cost);
-        true
     }
 
     /// Bounds, scores and admits group `g`'s candidates `cands` (local
@@ -3166,7 +3123,6 @@ pub(super) fn walk_into<'s, 'a>(
         sieve_left: Vec::new(),
         words: Vec::new(),
         marks: Vec::new(),
-        order: Vec::new(),
         positions: Vec::new(),
         node_terms,
         touch,
