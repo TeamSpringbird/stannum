@@ -100,6 +100,15 @@ struct Args {
     /// time only the walk it starts (what a free warm-up would save).
     warm_untimed: bool,
     out: Option<PathBuf>,
+    /// `--perf-ctl CTL,ACK`: perf's control and ack FIFOs (`perf stat` or
+    /// `perf record` with `-D -1 --control fifo:CTL,ACK`); counting is
+    /// enabled around each timed pass only (not the load, the answer's
+    /// pass, the instrumented pass or a flush).
+    perf_ctl: Option<(PathBuf, PathBuf)>,
+    /// `--flush-mb N`: before each timed pass, walk an N MiB buffer (read
+    /// and write a byte per line) so the pass starts with the CPU caches
+    /// holding none of the query's data (the segments stay in memory).
+    flush_mb: usize,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -123,7 +132,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
-         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE]"
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
+         [--perf-ctl CTL,ACK] [--flush-mb N]"
     );
     std::process::exit(2)
 }
@@ -154,6 +164,8 @@ fn args() -> Args {
         warm: None,
         warm_untimed: false,
         out: None,
+        perf_ctl: None,
+        flush_mb: 0,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -194,6 +206,12 @@ fn args() -> Args {
                 }
             }
             "--out" => a.out = Some(value(&mut it).into()),
+            "--perf-ctl" => {
+                let v = value(&mut it);
+                let (ctl, ack) = v.split_once(',').unwrap_or_else(|| usage());
+                a.perf_ctl = Some((ctl.into(), ack.into()));
+            }
+            "--flush-mb" => a.flush_mb = value(&mut it).parse().unwrap_or_else(|_| usage()),
             _ => usage(),
         }
     }
@@ -1188,6 +1206,8 @@ fn run() -> Result<bool, String> {
         reader.segs.len(),
         start.elapsed().as_secs_f64()
     );
+    let mut perf = PerfCtl::open(args.perf_ctl.as_ref()).map_err(|e| format!("--perf-ctl: {e}"))?;
+    let mut flush = Flush::new(args.flush_mb);
     let mut rows = Vec::new();
     let mut warm_out = String::from(
         "name\tstyle\twarm_rows\ttheta_warm\ttheta_final\twarm_in_final\tand_examined\tand_scored\n",
@@ -1219,6 +1239,8 @@ fn run() -> Result<bool, String> {
             if args.forget {
                 reader.forget();
             }
+            flush.walk();
+            perf.send(b"enable\n");
             let at = Instant::now();
             let a0 = Allocs::now();
             let scorer = reader.scorer(&q.text)?;
@@ -1250,6 +1272,7 @@ fn run() -> Result<bool, String> {
             }
             let a2 = Allocs::now();
             times.push(at.elapsed().as_nanos() as u64);
+            perf.send(b"disable\n");
             (scorer_allocs, walk_allocs) = (a1.since(a0), a2.since(a1));
         }
         let counters1 = process_counters();
@@ -1654,6 +1677,48 @@ fn run() -> Result<bool, String> {
         std::fs::write(path, text).map_err(|e| e.to_string())?;
     }
     Ok(differ == 0 && mismatched == 0)
+}
+
+/// perf's control FIFO (`--perf-ctl`): each command waits for perf's ack,
+/// so the counters are on exactly while a timed pass runs.
+struct PerfCtl(Option<(std::fs::File, std::fs::File)>);
+
+impl PerfCtl {
+    fn open(paths: Option<&(PathBuf, PathBuf)>) -> std::io::Result<Self> {
+        Ok(Self(match paths {
+            Some((ctl, ack)) => Some((
+                std::fs::OpenOptions::new().write(true).open(ctl)?,
+                std::fs::File::open(ack)?,
+            )),
+            None => None,
+        }))
+    }
+
+    fn send(&mut self, command: &[u8]) {
+        use std::io::{Read, Write};
+        if let Some((ctl, ack)) = &mut self.0 {
+            ctl.write_all(command).expect("perf control FIFO");
+            let mut reply = [0u8; 5];
+            ack.read_exact(&mut reply).expect("perf ack FIFO");
+        }
+    }
+}
+
+/// A buffer larger than the CPU caches (`--flush-mb`), walked before each
+/// timed pass.
+struct Flush(Vec<u8>);
+
+impl Flush {
+    fn new(mb: usize) -> Self {
+        Self(vec![1u8; mb << 20])
+    }
+
+    fn walk(&mut self) {
+        for line in self.0.chunks_mut(64) {
+            line[0] = line[0].wrapping_add(1);
+        }
+        std::hint::black_box(&self.0);
+    }
 }
 
 fn main() {
