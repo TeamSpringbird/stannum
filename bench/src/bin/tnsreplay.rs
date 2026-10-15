@@ -1730,7 +1730,7 @@ fn run() -> Result<bool, String> {
         };
         println!(
             "{:<12} records {:.1} / {:.1} footers {:.1} / {:.1} blocks {:.0} reached {:.0} used {:.0} whole {:.0} footer KB {:.1} whole {:.1}  \
-             dirs {:.1} entries {:.0} reached {:.0} loaded {:.0} dir KB {:.1}",
+             dirs {:.1} entries {:.0} reached {:.0} loaded {:.0} dir KB {:.1} copied {:.1}",
             style,
             m(&|c| c.records_parsed),
             m(&|c| c.records_kept),
@@ -1747,6 +1747,7 @@ fn run() -> Result<bool, String> {
             m(&|c| c.entries_reached),
             m(&|c| c.entries_used),
             m(&|c| c.directory_bytes) / 1024.0,
+            m(&|c| c.directory_copied) / 1024.0,
         );
     }
     if let Some(path) = &args.per_query {

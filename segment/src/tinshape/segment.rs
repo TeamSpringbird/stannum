@@ -375,6 +375,8 @@ pub struct MemoCounts {
     pub directories: u64,
     pub directory_entries: u64,
     pub directory_bytes: u64,
+    /// Directory bytes copied (as they were first read).
+    pub directory_copied: u64,
     /// Directory entries a walk stepped over or read, and entries whose
     /// container it loaded.
     pub entries_reached: u64,
@@ -397,6 +399,7 @@ impl MemoCounts {
         directories: 0,
         directory_entries: 0,
         directory_bytes: 0,
+        directory_copied: 0,
         entries_reached: 0,
         entries_used: 0,
     };

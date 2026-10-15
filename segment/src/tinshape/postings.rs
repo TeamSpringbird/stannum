@@ -1847,6 +1847,8 @@ impl<'a> Directory<'a> {
                 let w = &self.copied[l / 64];
                 w.set(w.get() | 1 << (l % 64));
             }
+            let copied = (stop - first * LINE) as u64;
+            super::segment::count_memo(|c| c.directory_copied += copied);
         }
         Ok(())
     }
