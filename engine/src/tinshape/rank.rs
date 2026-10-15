@@ -53,6 +53,11 @@ const SEEK_RATIO: usize = 4;
 /// probed by the candidates, its first lines its header and first members.
 const AHEAD_LINES: usize = 4;
 
+/// Directory entries [`Walk::ask_next`] looks through for another required
+/// term's entry of the lead's next group, from its last: a look ahead that
+/// must not cost what the walk's own seek (by skip points) would not.
+const AHEAD_STEPS: usize = 8;
+
 /// Lines of another required term's grid asked for at the lead's members
 /// in its next group ([`Walk::ask_next`]): a rare lead's few members.
 const AHEAD_MEMBER_LINES: usize = 16;
@@ -729,10 +734,10 @@ struct Mem<'a> {
     /// for the group at hand), `usize::MAX` for none.
     hint: usize,
     entry: usize,
-    /// The directory position [`Walk::ask_next`] sought the lead's next
-    /// group from, apart from `hint`: the group at hand may not be loaded
-    /// yet.
+    /// Where [`Walk::ask_next`] found the term's group `ahead_group` (the
+    /// lead's next) in its directory: [`load`] seeks it from there.
     ahead: usize,
+    ahead_group: u32,
     /// Containers loaded from the directory, for [`MemoCounts`].
     ///
     /// [`MemoCounts`]: segment::tinshape::segment::MemoCounts
@@ -1192,6 +1197,10 @@ fn load<'a>(
         cursor.drain_below(end, |slot| list.push(slot - group.slot_base));
         mem.count = mem.list.len() as u32;
         return Ok(true);
+    }
+    if mem.ahead_group == g {
+        // Found a group ahead ([`Walk::ask_next`]): the seek starts there.
+        mem.hint = mem.hint.max(mem.ahead);
     }
     let Some(entry) = set.find(g, &mut mem.hint) else {
         mem.count = 0;
@@ -1688,11 +1697,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         for &t in &self.req[1..] {
             let set = self.terms[t].as_ref().expect("required");
             let mem = &mut self.mems[t];
-            mem.ahead = mem.ahead.max(mem.hint);
-            if set.holds_group(next, &mut mem.ahead) {
-                set.prefetch_entry(mem.ahead, AHEAD_LINES);
+            if let Some(at) = set.near_group(next, mem.hint, AHEAD_STEPS) {
+                (mem.ahead, mem.ahead_group) = (at, next);
+                set.prefetch_entry(at, AHEAD_LINES);
                 if members {
-                    set.prefetch_members(mem.ahead, &self.ahead.list, AHEAD_MEMBER_LINES);
+                    set.prefetch_members(at, &self.ahead.list, AHEAD_MEMBER_LINES);
                 }
             }
         }

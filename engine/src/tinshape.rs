@@ -407,20 +407,18 @@ impl<'a> TermSet<'a> {
         (*hint < dir.len()).then(|| Self::entry(dir, &self.docs, *hint).index)
     }
 
-    /// Asks for the first reads of a grouped term's directory entry `i`
-    /// (decoded if it was not yet) to be read into the cache: its
+    /// Asks for the first reads of a grouped term's directory entry `i`,
+    /// where it is decoded already, to be read into the cache: its
     /// container's first `lines` lines, its frontier (the group's bound)
     /// and the first line of its TF buckets, each only where it lies in
     /// memory already ([`Bytes::prefetch`]). Gives the entry's group index;
-    /// `None` past the directory or for a term without one.
+    /// `None` for an entry not decoded or past the directory, or a term
+    /// without one. Nothing is decoded, pinned or loaded.
     #[inline]
     fn prefetch_entry(&self, i: usize, lines: usize) -> Option<u32> {
         let dir = self.dir.as_ref()?;
-        if i >= dir.len() {
-            return None;
-        }
-        let entry = Self::entry(dir, &self.docs, i);
-        self.postings.container(&entry).prefetch(0, lines);
+        let entry = dir.get_decoded(i)?;
+        self.postings.container(entry).prefetch(0, lines);
         if let Some(frontier) = dir.bytes().get(entry.frontier as usize) {
             bits::prefetch_line(frontier);
         }
@@ -430,11 +428,20 @@ impl<'a> TermSet<'a> {
         Some(entry.index)
     }
 
-    /// Whether a grouped term holds group `group`, looked for from `hint`
-    /// forward as [`Self::find`] does (the hint is left at it).
+    /// The directory position of a grouped term's group `group`, looked
+    /// for among the `steps` entries from `from` on, where they are
+    /// decoded already: `None` when the term does not hold it, or holds it
+    /// further on or in a run not decoded. Nothing is decoded.
     #[inline]
-    fn holds_group(&self, group: u32, hint: &mut usize) -> bool {
-        self.dir.is_some() && self.seek_index(group, hint) == Some(group)
+    fn near_group(&self, group: u32, from: usize, steps: usize) -> Option<usize> {
+        let dir = self.dir.as_ref()?;
+        for i in from..from + steps {
+            let index = dir.get_decoded(i)?.index;
+            if index >= group {
+                return (index == group).then_some(i);
+            }
+        }
+        None
     }
 
     /// Asks for the lines of directory entry `i`'s container that the
@@ -443,14 +450,13 @@ impl<'a> TermSet<'a> {
     /// already: a conjunction filters its lead's members by them.
     #[inline]
     fn prefetch_members(&self, i: usize, members: &[u32], max_lines: usize) {
-        let Some(dir) = &self.dir else {
+        let Some(entry) = self.dir.as_ref().and_then(|dir| dir.get_decoded(i)) else {
             return;
         };
-        let entry = Self::entry(dir, &self.docs, i);
         if entry.kind != KIND_GRID {
             return;
         }
-        let bytes = self.postings.container(&entry);
+        let bytes = self.postings.container(entry);
         let (mut last, mut asked) = (usize::MAX, 0);
         for &local in members {
             let byte = local as usize / 8;
