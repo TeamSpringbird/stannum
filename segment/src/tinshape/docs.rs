@@ -34,9 +34,23 @@
 //!           | grid:   a u16le width per page, then the group's slots as a
 //!                     bitmap of whole u64le words
 //! dl       := block varint (documents per block), blocks varint,
+//!             [floor1 varint, floor2 varint, floor3 varint]   (classes)
 //!             (bits_at u32le, base u24le, width u8)* per block,
+//!             [64 bytes per block: 2 bits per document]       (classes)
 //!             per block its lengths less its base, packed at its width
 //!             (byte-aligned), by rank
+//! ```
+//!
+//! With the segment header's class flag (page layout 14), the DL sidecar
+//! holds a class plane: each document's length class (0: shorter than
+//! `floor1`, 1: shorter than `floor2`, 2: shorter than `floor3`, 3: the
+//! rest), four to a byte, low bits first, by rank. A block's plane is 64
+//! bytes, a cache line's worth, and the planes lie in a row between the
+//! headers and the lengths, so a candidate's class is one byte load at
+//! `rank / 4`, from a line its group's other candidates mostly share. A ranked walk bounds a
+//! candidate at its class's shortest length before it reads the exact one.
+//!
+//! ```text
 //! liveness := dead varint, then when dead > 0 a bitmap of u64le words over
 //!             document ranks, a set bit naming a dead document
 //! ```
@@ -543,13 +557,38 @@ pub const DL_BLOCK: u32 = 256;
 /// length is above it packs the rest at a wider width.
 const DL_BASE_MAX: u32 = (1 << 24) - 1;
 
-/// Encodes exact document lengths, by rank.
-pub fn encode_lengths(lengths: &[u32]) -> Vec<u8> {
+/// The shortest lengths of length classes 1 to 3 the writer gives a DL
+/// sidecar's class plane (class 0 holds the documents shorter than 16).
+/// Within two points of the best split for each style at 150M rows (the
+/// gates2 census: the best were 23/47/199, 29/75/199 and 41/122/286); the
+/// sidecar records them, so a writer may choose others.
+pub const LENGTH_CLASSES: [u32; 3] = [16, 64, 256];
+
+/// Bytes of class plane per DL block: two bits per document.
+const CLASS_PLANE: usize = DL_BLOCK as usize / 4;
+
+/// The class of a document of `length` among classes whose shortest
+/// lengths past class 0 are `floors` (ascending): how many it reaches.
+#[inline]
+pub fn length_class(floors: &[u32; 3], length: u32) -> u8 {
+    floors.iter().map(|f| u8::from(length >= *f)).sum()
+}
+
+/// Encodes exact document lengths, by rank, and with `classes` the class
+/// plane: per block, two bits per document naming its length class among
+/// [`LENGTH_CLASSES`].
+pub fn encode_lengths(lengths: &[u32], classes: bool) -> Vec<u8> {
     let blocks = lengths.len().div_ceil(DL_BLOCK as usize);
-    let mut out = Vec::with_capacity(8 + blocks * 8 + lengths.len());
+    let mut out = Vec::with_capacity(24 + blocks * (8 + CLASS_PLANE) + lengths.len());
     varint::put(&mut out, u64::from(DL_BLOCK));
     varint::put(&mut out, blocks as u64);
+    if classes {
+        for floor in LENGTH_CLASSES {
+            varint::put(&mut out, u64::from(floor));
+        }
+    }
     let mut headers = Vec::with_capacity(blocks * 8);
+    let mut plane = Vec::with_capacity(if classes { blocks * CLASS_PLANE } else { 0 });
     let mut data = Vec::new();
     for chunk in lengths.chunks(DL_BLOCK as usize) {
         let base = chunk.iter().copied().min().unwrap_or(0).min(DL_BASE_MAX);
@@ -562,48 +601,87 @@ pub fn encode_lengths(lengths: &[u32]) -> Vec<u8> {
             w.put(l - base, width);
         }
         data.extend_from_slice(&w.finish());
+        if classes {
+            let mut block = [0u8; CLASS_PLANE];
+            for (i, l) in chunk.iter().enumerate() {
+                block[i / 4] |= length_class(&LENGTH_CLASSES, *l) << (2 * (i % 4));
+            }
+            plane.extend_from_slice(&block);
+        }
     }
     out.extend_from_slice(&headers);
+    out.extend_from_slice(&plane);
     out.extend_from_slice(&data);
     out
 }
 
-/// The DL sidecar: exact lengths by document rank. Its bytes may load on
-/// demand ([`Bytes::Lazy`]): a length reads its block's header and the
-/// bytes its bits fall in.
+/// The DL sidecar: exact lengths by document rank and, when the segment has
+/// them, each document's length class. Its bytes may load on demand
+/// ([`Bytes::Lazy`]): a length reads its block's header and the bytes its
+/// bits fall in, a class the byte holding its two bits.
 #[derive(Clone, Copy, Debug)]
 pub struct Lengths<'a> {
-    /// Where the block headers and the packed lengths start within the
-    /// sidecar's bytes.
+    /// Where the block headers, the class plane (empty without classes)
+    /// and the packed lengths start within the sidecar's bytes.
     pub headers_at: usize,
+    pub classes_at: usize,
     pub data_at: usize,
     documents: u32,
     block: u32,
+    /// The shortest length of each class (all 0 without classes: every
+    /// document is in class 0, whose floor bounds nothing).
+    floors: [u32; 4],
     headers: Bytes<'a>,
+    classes: Bytes<'a>,
     data: Bytes<'a>,
 }
 
 impl<'a> Lengths<'a> {
-    pub fn parse(bytes: impl Into<Bytes<'a>>, documents: u32) -> Result<Self> {
+    /// Parses the sidecar of a segment of `documents` documents, holding a
+    /// class plane when `classes` (the segment header's flag).
+    pub fn parse(bytes: impl Into<Bytes<'a>>, documents: u32, classes: bool) -> Result<Self> {
         let bytes = bytes.into();
         let mut at = 0;
-        let prefix = bytes.window(0, 20)?;
+        let prefix = bytes.window(0, 40)?;
         let block = varint::get_u32(prefix, &mut at)?;
         let blocks = varint::get_u32(prefix, &mut at)? as usize;
         if block == 0 || blocks != documents.div_ceil(block) as usize {
             return Err(Error::Corrupt("length blocks"));
         }
-        let headers = bytes.sub(at, at + blocks * 8)?;
+        let mut floors = [0u32; 4];
+        let mut plane = 0;
+        if classes {
+            if block != DL_BLOCK {
+                return Err(Error::Corrupt("length class block"));
+            }
+            for f in 1..4 {
+                floors[f] = varint::get_u32(prefix, &mut at)?;
+                if floors[f] <= floors[f - 1] {
+                    return Err(Error::Corrupt("length class floors"));
+                }
+            }
+            plane = blocks * CLASS_PLANE;
+        }
         let headers_at = at;
-        let data_at = at + blocks * 8;
+        let classes_at = at + blocks * 8;
+        let data_at = classes_at + plane;
         Ok(Self {
             headers_at,
+            classes_at,
             data_at,
             documents,
             block,
-            headers,
+            floors,
+            headers: bytes.sub(headers_at, classes_at)?,
+            classes: bytes.sub(classes_at, data_at)?,
             data: bytes.sub(data_at, bytes.len())?,
         })
+    }
+
+    /// Whether the sidecar holds a class plane.
+    #[inline]
+    pub fn has_classes(&self) -> bool {
+        self.floors[3] != 0
     }
 
     /// Block `b`'s header: where its bits start, its base and its width.
@@ -639,6 +717,32 @@ impl<'a> Lengths<'a> {
         Ok(base + bits::get_at(bytes, bit % 8, width)?)
     }
 
+    /// The length class of the document at `rank` (0 without classes).
+    #[inline]
+    pub fn class(&self, rank: u32) -> Result<u8> {
+        if !self.has_classes() {
+            return Ok(0);
+        }
+        if rank >= self.documents {
+            return Err(Error::Corrupt("length rank"));
+        }
+        let at = rank as usize / 4;
+        let byte = self.classes.get(at, at + 1)?[0];
+        Ok(byte >> (2 * (rank % 4)) & 3)
+    }
+
+    /// The shortest length the document at `rank` can have by its class (0
+    /// without classes): a score bounded at it bounds the document's.
+    #[inline]
+    pub fn floor(&self, rank: u32) -> Result<u32> {
+        Ok(self.floors[usize::from(self.class(rank)?)])
+    }
+
+    /// The shortest length of each class (all 0 without classes).
+    pub fn floors(&self) -> [u32; 4] {
+        self.floors
+    }
+
     /// Where `rank`'s block header and its packed length lie within the
     /// sidecar's bytes, for page accounting.
     pub fn at(&self, rank: u32) -> (usize, usize) {
@@ -646,6 +750,12 @@ impl<'a> Lengths<'a> {
         let (at, _, width) = self.header(b).unwrap_or((0, 0, 0));
         let bit = (rank % self.block) as usize * width as usize;
         (self.headers_at + b * 8, self.data_at + at + bit / 8)
+    }
+
+    /// Where the byte holding `rank`'s class lies within the sidecar's
+    /// bytes, for page accounting.
+    pub fn class_at(&self, rank: u32) -> usize {
+        self.classes_at + rank as usize / 4
     }
 }
 
@@ -904,12 +1014,34 @@ mod tests {
         let mut lengths = vec![1, 65_534, 65_535, 70_000, 3, u32::MAX, 0, (1 << 24) + 5];
         lengths.extend((0..1000u32).map(|i| (i * 7919) % 4096 + 1));
         lengths.extend([7; 300]);
-        let bytes = encode_lengths(&lengths);
-        let parsed = Lengths::parse(&bytes, lengths.len() as u32).unwrap();
-        for (rank, length) in lengths.iter().enumerate() {
-            assert_eq!(parsed.get(rank as u32).unwrap(), *length);
+        for classes in [false, true] {
+            let bytes = encode_lengths(&lengths, classes);
+            let parsed = Lengths::parse(&bytes, lengths.len() as u32, classes).unwrap();
+            assert_eq!(parsed.has_classes(), classes);
+            for (rank, length) in lengths.iter().enumerate() {
+                let rank = rank as u32;
+                assert_eq!(parsed.get(rank).unwrap(), *length);
+                let floor = parsed.floor(rank).unwrap();
+                assert!(
+                    floor <= *length,
+                    "rank {rank}: floor {floor} above {length}"
+                );
+                if classes {
+                    let class = parsed.class(rank).unwrap();
+                    assert_eq!(class, length_class(&LENGTH_CLASSES, *length));
+                    // The longest class whose floor the length reaches.
+                    assert!(class == 3 || *length < LENGTH_CLASSES[usize::from(class)]);
+                } else {
+                    assert_eq!(floor, 0);
+                }
+            }
+            assert!(parsed.get(lengths.len() as u32).is_err());
         }
-        assert!(parsed.get(lengths.len() as u32).is_err());
+        // The plane costs 64 bytes a block of 256 documents, and the floors.
+        let plain = encode_lengths(&lengths, false).len();
+        let classed = encode_lengths(&lengths, true).len();
+        let blocks = lengths.len().div_ceil(DL_BLOCK as usize);
+        assert!(classed - plain >= blocks * 64 && classed - plain <= blocks * 64 + 8);
     }
 
     #[test]

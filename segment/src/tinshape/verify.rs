@@ -49,6 +49,18 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             Ok(length) => {
                 total += u64::from(length);
                 lengths.push(length);
+                // A class names the longest class whose floor the length
+                // reaches: a walk bounds the document at that floor.
+                let floors = segment.lengths.floors();
+                let want = super::docs::length_class(&[floors[1], floors[2], floors[3]], length);
+                match segment.lengths.class(rank as u32) {
+                    Ok(class) if !segment.lengths.has_classes() || class == want => {}
+                    Ok(class) => findings.error(
+                        format!("document {}", describe(*tid)),
+                        format!("length {length} is in class {want}, not {class}"),
+                    ),
+                    Err(error) => findings.error(format!("document {}", describe(*tid)), error),
+                }
             }
             Err(error) => {
                 findings.error(format!("document {}", describe(*tid)), error);
@@ -142,6 +154,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             // most as long), and its count must be its container's.
             let entries = match &found.postings.form {
                 super::postings::Form::Grouped(dir) => {
+                    dir.check_entries(&segment.docs.geometry.groups)?;
                     dir.entries(&segment.docs.geometry.groups)?
                 }
                 _ => Vec::new(),
