@@ -42,6 +42,7 @@
 //! with every phrase candidate's steps timed (see
 //! [`bench::phrase_census`]), and reports what candidates that do not
 //! hold the phrase spent on their common terms' buckets and after.
+//!
 //! `--plan conjunction:score:300,disjunction:full:200,...` replays several
 //! slices of the trace after one load (the first N queries of a style,
 //! ranked as `score` or as `full`), each reported as its own style (a full
