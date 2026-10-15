@@ -51,6 +51,7 @@ use std::cell::{Cell, RefCell};
 use std::mem::MaybeUninit;
 use std::ptr::NonNull;
 
+use super::bits;
 use crate::source::Source;
 use crate::{Error, Result};
 
@@ -711,6 +712,33 @@ impl LazyBlob {
         self.get_slow(from, to, kind)
     }
 
+    /// [`bits::prefetch`] of `[from, to)` (within the blob), its first
+    /// `max_lines` lines, where it lies in memory already: on a page the
+    /// open span pinned (that page's part of it), or loaded. Nothing is
+    /// pinned, loaded or marked used: a page not pinned yet is left to the
+    /// read that pins it.
+    #[inline]
+    fn prefetch(&self, from: usize, to: usize, max_lines: usize) {
+        if self.spans.get() > 0 && self.page_len > 0 {
+            let n = self.page_len;
+            let page = from / n;
+            let known = self.pages[page % PAGE_MEMO].get();
+            if known.page == page && known.span == self.span.get() && from < page * n + known.len {
+                let within = from - page * n;
+                bits::prefetch(
+                    known.data.wrapping_add(within),
+                    (to - from).min(known.len - within),
+                    max_lines,
+                );
+            }
+            return;
+        }
+        if self.is_loaded(from / CHUNK) {
+            let len = (to - from).min(CHUNK - from % CHUNK);
+            bits::prefetch(self.data.as_ptr().wrapping_add(from), len, max_lines);
+        }
+    }
+
     #[inline(never)]
     fn get_slow(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         if from > to {
@@ -943,6 +971,27 @@ impl<'a> Bytes<'a> {
                     return Err(Error::Truncated);
                 }
                 blob.get_kind(at + from, at + to, kind)
+            }
+        }
+    }
+
+    /// Asks for the cache lines of bytes `from..` of the range, at most
+    /// `max_lines`, to be read into the cache ([`bits::prefetch`]); nothing
+    /// is pinned, loaded or read. A lazy range is asked for only where it
+    /// lies in memory already: on a page the open span pinned (see
+    /// [`LazyBlob::prefetch`]) or in loaded chunks.
+    #[inline]
+    pub fn prefetch(&self, from: usize, max_lines: usize) {
+        match *self {
+            Self::Slice(bytes) => {
+                if from < bytes.len() {
+                    bits::prefetch(bytes[from..].as_ptr(), bytes.len() - from, max_lines);
+                }
+            }
+            Self::Lazy { blob, at, len, .. } => {
+                if from < len {
+                    blob.prefetch(at + from, at + len, max_lines);
+                }
             }
         }
     }

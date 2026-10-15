@@ -407,6 +407,38 @@ impl<'a> TermSet<'a> {
         (*hint < dir.len()).then(|| Self::entry(dir, &self.docs, *hint).index)
     }
 
+    /// Asks for the first reads of a grouped term's directory entry `i`
+    /// (decoded if it was not yet) to be read into the cache: its
+    /// container's first `lines` lines, its frontier (the group's bound)
+    /// and the first line of its TF buckets, each only where it lies in
+    /// memory already ([`Bytes::prefetch`]). Gives the entry's group index;
+    /// `None` past the directory or for a term without one.
+    #[inline]
+    fn prefetch_entry(&self, i: usize, lines: usize) -> Option<u32> {
+        let dir = self.dir.as_ref()?;
+        if i >= dir.len() {
+            return None;
+        }
+        let entry = Self::entry(dir, &self.docs, i);
+        self.postings.container(&entry).prefetch(0, lines);
+        if let Some(frontier) = dir.bytes().get(entry.frontier as usize) {
+            bits::prefetch_line(frontier);
+        }
+        if entry.width > 0 {
+            self.postings.tf.prefetch(entry.tf_bit as usize / 8, 1);
+        }
+        Some(entry.index)
+    }
+
+    /// [`Self::prefetch_entry`] of the term's group `group`, if it holds it,
+    /// looked for from `hint` forward as [`Self::find`] does.
+    #[inline]
+    fn prefetch_group(&self, group: u32, hint: &mut usize, lines: usize) {
+        if self.dir.is_some() && self.seek_index(group, hint) == Some(group) {
+            self.prefetch_entry(*hint, lines);
+        }
+    }
+
     /// The term's group `group`, if it holds it, looked for from `hint`
     /// forward (the hint is left at the first group at or after it).
     #[inline]

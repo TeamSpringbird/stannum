@@ -48,6 +48,11 @@ use crate::walk::{Ranked, TopRows, Visibility};
 /// times as many members.
 const SEEK_RATIO: usize = 4;
 
+/// Cache lines of a container asked for a group ahead ([`Walk::ask_next`]):
+/// a rare lead's container is a line or a few; a common term's is
+/// probed by the candidates, its first lines its header and first members.
+const AHEAD_LINES: usize = 4;
+
 /// [`Walk::buckets`] of a term the candidate does not hold.
 const NO_BUCKET: u8 = u8::MAX;
 
@@ -720,6 +725,10 @@ struct Mem<'a> {
     /// for the group at hand), `usize::MAX` for none.
     hint: usize,
     entry: usize,
+    /// The directory position [`Walk::ask_next`] sought the lead's next
+    /// group from, apart from `hint`: the group at hand may not be loaded
+    /// yet.
+    ahead: usize,
     /// Containers loaded from the directory, for [`MemoCounts`].
     ///
     /// [`MemoCounts`]: segment::tinshape::segment::MemoCounts
@@ -1554,6 +1563,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     self.touch,
                 )?;
             }
+            self.ask_next();
             let more = if self.all_grids(g) {
                 self.dense_group(g)?
             } else {
@@ -1565,6 +1575,31 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.group_done();
         }
         Ok(())
+    }
+
+    /// A group ahead: while the lead's group at hand is walked, asks for
+    /// the first reads of its next group, of the lead and of every other
+    /// required term holding it (see [`TermSet::prefetch_entry`]), all at
+    /// once. Each is the start of a chain of dependent reads (the entry
+    /// locates the container, which lists the members that index the next
+    /// term's), so out-of-order execution overlaps little of one with
+    /// another; asked for together a group early, they arrive together,
+    /// while this group's work runs. The lead's next group is its next
+    /// directory entry (a group the walk skips by its bound was asked for
+    /// for nothing).
+    #[inline]
+    fn ask_next(&mut self) {
+        let lead = self.req[0];
+        let set = self.terms[lead].as_ref().expect("the lead");
+        let Some(next) = set.prefetch_entry(self.mems[lead].hint + 1, AHEAD_LINES) else {
+            return;
+        };
+        for &t in &self.req[1..] {
+            let set = self.terms[t].as_ref().expect("required");
+            let mem = &mut self.mems[t];
+            mem.ahead = mem.ahead.max(mem.hint);
+            set.prefetch_group(next, &mut mem.ahead, AHEAD_LINES);
+        }
     }
 
     /// Ends a group's reads: the pages pinned since the walk's mark are
