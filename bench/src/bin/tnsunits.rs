@@ -256,7 +256,7 @@ fn scan(segment: &Segment<'_>, units: &mut Units) {
         let blocks = positions.count.div_ceil(32);
         let mut starts = Vec::with_capacity(blocks as usize + 1);
         for k in 0..blocks {
-            starts.push(positions.locate(k * 32).expect("a block").1);
+            starts.push(positions.block(k).expect("a block").at);
         }
         starts.push(stream.len());
         for w in starts.windows(2) {

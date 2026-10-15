@@ -111,6 +111,33 @@ pub fn ef_into_row_at(level: Level, ef: Ef<'_>, row: &mut [u64]) {
     }
 }
 
+/// Room [`unpack`] needs in `dst` past `n` values: the vector bodies
+/// store whole lanes.
+pub const UNPACK_ROOM: usize = 16;
+
+/// Values `0..n` of `l` bits (at most 32), packed as
+/// [`segment::tinshape::bits`] packs them from the start of `lows`, into
+/// `dst[..n]`, which must be zero there and hold [`UNPACK_ROOM`] more (the
+/// last lanes may overwrite them). The Elias-Fano lists' low-part bodies
+/// run it, eight or sixteen values at a time where `lows` holds their
+/// vector loads' bytes, else one at a time; a value past `lows` reads as 0.
+#[inline]
+pub fn unpack(lows: &[u8], l: u32, n: usize, dst: &mut [u32]) {
+    assert!(dst.len() >= n + UNPACK_ROOM && l <= 32);
+    ef_run!(level(), unpack(lows, l, n, dst));
+}
+
+/// [`unpack`] at `level`; panics if the CPU lacks it.
+pub fn unpack_at(level: Level, lows: &[u8], l: u32, n: usize, dst: &mut [u32]) {
+    assert!(
+        level.supported(),
+        "kernel level {} unsupported here",
+        level.name()
+    );
+    assert!(dst.len() >= n + UNPACK_ROOM && l <= 32);
+    ef_run!(level, unpack(lows, l, n, dst));
+}
+
 /// Appends a group container's members (local slots, in order), as
 /// [`for_each_local`] visits them: an Elias-Fano container's by
 /// [`ef_decode`], an array's by [`array_decode`]. `slots` is the group's
@@ -503,6 +530,13 @@ mod scalar {
         let mut put = super::RowPut::new();
         ef.for_each(|v| put.put(row, v));
     }
+
+    #[inline(never)]
+    pub fn unpack(lows: &[u8], l: u32, n: usize, dst: &mut [u32]) {
+        for (i, d) in dst[..n].iter_mut().enumerate() {
+            *d = segment::tinshape::bits::get(lows, i, l).unwrap_or(0);
+        }
+    }
 }
 
 /// The two passes and the drivers around them, for a module with
@@ -600,6 +634,23 @@ macro_rules! passes {
                 combine(lows, ef.low_width(), 0, found, dst);
                 out.set_len(start + found);
             }
+        }
+
+        /// See [`super::unpack`]; `dst` holds `n + UNPACK_ROOM` values.
+        $(#[$tf])*
+        #[inline(never)]
+        pub fn unpack(lows: &[u8], l: u32, n: usize, dst: &mut [u32]) {
+            debug_assert!(dst.len() >= n + super::UNPACK_ROOM);
+            const { assert!(Unpack::LANES <= super::UNPACK_ROOM) };
+            if l > super::WIDEST {
+                for (i, d) in dst[..n].iter_mut().enumerate() {
+                    *d = segment::tinshape::bits::get(lows, i, l).unwrap_or(0);
+                }
+                return;
+            }
+            // SAFETY: `dst` holds `n` rounded up to the lanes, all
+            // initialized (the caller's zeros).
+            unsafe { combine(lows, l, 0, n, dst.as_mut_ptr()) };
         }
 
         $(#[$tf])*
