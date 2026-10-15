@@ -2648,15 +2648,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // candidates the buckets leave in reach fall short at
                 // their exact length, and the class is a byte beside the
                 // ones its group's other candidates read.
-                if n > 0 && self.threshold().is_some() {
-                    let class = self.class_floor(g, local)?;
-                    if class > self.cand_floor {
-                        reach = self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), class);
-                        if self.cut(reach, tid) {
-                            self.answer.class_cuts += 1;
-                            return Ok(None);
-                        }
-                    }
+                if n > 0 {
+                    let Some(r) = self.class_bound(g, local, self.cand_floor, reach, tid)? else {
+                        return Ok(None);
+                    };
+                    reach = r;
                 }
                 (reach, u32::MAX)
             }
@@ -2919,15 +2915,51 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .any(|&(i, least)| self.buckets[i] < least)
     }
 
+    /// Bounds the candidate at slot `local` of group `g`, its buckets read
+    /// and bounding it at `reach` at length `floor`, by its length class:
+    /// at the class's shortest length, where that is longer than `floor`.
+    /// `None` when that rules it out, else its bound. The class is read
+    /// only for a candidate the longest class's floor would rule out (one
+    /// it leaves in reach reads its length whatever its class).
+    #[inline]
+    fn class_bound(
+        &mut self,
+        g: u32,
+        local: u32,
+        floor: u32,
+        reach: f32,
+        tid: impl FnOnce() -> Tid + Copy,
+    ) -> Result<Option<f32>> {
+        let top = self.segment.lengths.floors()[3];
+        if top <= floor || self.threshold().is_none() {
+            return Ok(Some(reach));
+        }
+        let n = self.sc.len();
+        let at_top = self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), top);
+        if !self.cut(at_top, tid) {
+            return Ok(Some(reach));
+        }
+        let class = self.class_floor(g, local)?;
+        if class <= floor {
+            return Ok(Some(reach));
+        }
+        let bound = if class == top {
+            at_top
+        } else {
+            self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), class)
+        };
+        if self.cut(bound, tid) {
+            self.answer.class_cuts += 1;
+            return Ok(None);
+        }
+        Ok(Some(bound))
+    }
+
     /// The shortest length of the length class of the document at slot
-    /// `local` of group `g` (0 when the segment has no classes): its length
-    /// is at least that.
+    /// `local` of group `g`: its length is at least that.
     #[inline]
     fn class_floor(&mut self, g: u32, local: u32) -> Result<u32> {
         let lengths = &self.segment.lengths;
-        if !lengths.has_classes() {
-            return Ok(0);
-        }
         let rank = self
             .segment
             .docs
@@ -4221,8 +4253,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // The length known, its buckets bound it at that length.
                 (self.reach(self.held_list.iter().copied(), length), length)
             }
-            // Then at its length class's shortest length, where that is
-            // longer than its buckets' floor (see `Walk::stage`).
             None => (reach, u32::MAX),
         }))
     }
