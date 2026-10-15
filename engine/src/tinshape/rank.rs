@@ -1375,6 +1375,9 @@ struct Walk<'s, 'a, T: Touch> {
     /// candidate at hand holds, both in the scorer's order.
     present_list: Vec<usize>,
     held_list: Vec<usize>,
+    /// Room for a disjunction's candidate's held terms' places in
+    /// `present_list` (see [`Walk::or_stage`]).
+    held_places: Vec<usize>,
     /// A disjunction's word at hand (`usize::MAX` for none yet in the
     /// group): per present term (as `present_list` orders them), its word
     /// of members there and the posting index of the first.
@@ -3132,6 +3135,7 @@ pub(super) fn walk_into<'s, 'a>(
         present: vec![false; n],
         present_list: Vec::with_capacity(n),
         held_list: Vec::with_capacity(n),
+        held_places: vec![0; n],
         cand_w: usize::MAX,
         cand_words: Vec::with_capacity(n),
         cand_base: Vec::with_capacity(n),
@@ -4123,27 +4127,34 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.or_word(w);
         }
         let below = (1u64 << bit) - 1;
+        // The places of the present terms it holds, gathered without a
+        // branch on its bit: each place is stored, and kept by its bit.
+        let mut held = 0;
+        let places = &mut self.held_places[..];
+        for (p, word) in self.cand_words.iter().enumerate() {
+            places[held] = p;
+            held += (word >> bit & 1) as usize;
+        }
         self.held_list.clear();
-        for p in 0..self.present_list.len() {
+        for h in 0..held {
+            let p = self.held_places[h];
             let i = self.present_list[p];
             let word = self.cand_words[p];
-            if word >> bit & 1 == 1 {
-                self.held_list.push(i);
-                // A member's block is its posting index's: the footer is
-                // decoded whole (`Sc::decode_all`), and its blocks hold
-                // `block_size` postings each.
-                let index = self.cand_base[p] + (word & below).count_ones();
-                debug_assert_eq!(index, self.row_index(i, local));
-                self.held_index[i] = index;
-                let entry = self.row_state[i].entry;
-                let s = &mut self.sc[i];
-                let b = s.block_of(index, entry);
-                debug_assert_eq!(Some(b), s.block_at(slot));
-                self.blocks[i] = b;
-                let v = s.bound(b);
-                self.held_bound[i] = v;
-                bound += v;
-            }
+            self.held_list.push(i);
+            // A member's block is its posting index's: the footer is decoded
+            // whole (`Sc::decode_all`), and its blocks hold `block_size`
+            // postings each.
+            let index = self.cand_base[p] + (word & below).count_ones();
+            debug_assert_eq!(index, self.row_index(i, local));
+            self.held_index[i] = index;
+            let entry = self.row_state[i].entry;
+            let s = &mut self.sc[i];
+            let b = s.block_of(index, entry);
+            debug_assert_eq!(Some(b), s.block_at(slot));
+            self.blocks[i] = b;
+            let v = s.bound(b);
+            self.held_bound[i] = v;
+            bound += v;
         }
         if self.cut(bound, tid) {
             return Ok(None);
