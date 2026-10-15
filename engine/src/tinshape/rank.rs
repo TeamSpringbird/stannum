@@ -1158,6 +1158,8 @@ pub(super) struct PosCursor<'a> {
     block: Option<Block>,
 }
 
+/// Bytes past an entry's gaps read with them for the vector bodies' loads.
+const GAP_SLACK: usize = 32;
 
 impl<'a> PosCursor<'a> {
     pub(super) fn new(stream: (segment::tinshape::blob::Bytes<'a>, usize)) -> Result<Self> {
@@ -1198,7 +1200,12 @@ impl<'a> PosCursor<'a> {
         }
         let (from, to) = entry.gap_bytes();
         touch.touch(Part::Positions, self.at + from, to - from);
-        entry.decode(self.positions.bytes.get(from, to)?, out)
+        let gaps = if entry.count as usize - 1 < kernels::POSITIONS_SHORT {
+            self.positions.bytes.get(from, to)?
+        } else {
+            self.positions.bytes.window(from, to - from + GAP_SLACK)?
+        };
+        kernels::positions_decode(&entry, gaps, out)
     }
 }
 
