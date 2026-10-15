@@ -25,6 +25,7 @@
 
 pub mod bits;
 pub mod blob;
+pub mod dir_census;
 pub mod docs;
 pub mod ef;
 pub mod index;

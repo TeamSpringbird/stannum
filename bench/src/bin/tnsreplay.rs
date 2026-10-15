@@ -47,6 +47,12 @@
 //! turns an outside `perf stat` or `perf record` (`-D -1 --control
 //! fifo:CTL,ACK`) on around each timed pass only.
 //!
+//! `--dir-census FILE` (a build with the `dir-census` feature, with
+//! `--forget`) writes, per query and group directory its answer's walk
+//! parsed: the term's role, the directory's bytes, and the 64-byte lines
+//! and 256-, 512- and 1024-byte chunks of them that the parse and the walk
+//! read (see `segment::tinshape::dir_census`).
+//!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
 //! Every row is visible: there is no heap.
@@ -64,6 +70,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use segment::Tid;
 use segment::dead::DeadDocs;
 use segment::index::Index;
+use segment::tinshape::dir_census;
 use segment::tinshape::segment::Segment;
 use tinql::runtime::{parse_tinql_to_query, parse_tinql_to_scoring_query};
 
@@ -116,6 +123,8 @@ struct Args {
     /// enabled around each timed pass only (not the load, the answer's
     /// pass or the instrumented one).
     perf_ctl: Option<(PathBuf, PathBuf)>,
+    /// `--dir-census FILE`: the directory census's per-query lines.
+    dir_census: Option<PathBuf>,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -140,7 +149,7 @@ fn usage() -> ! {
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
          [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
-         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK]"
+         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK] [--dir-census FILE]"
     );
     std::process::exit(2)
 }
@@ -173,6 +182,7 @@ fn args() -> Args {
         out: None,
         plan: Vec::new(),
         perf_ctl: None,
+        dir_census: None,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -231,6 +241,7 @@ fn args() -> Args {
                 let (ctl, ack) = v.split_once(',').unwrap_or_else(|| usage());
                 a.perf_ctl = Some((ctl.into(), ack.into()));
             }
+            "--dir-census" => a.dir_census = Some(value(&mut it).into()),
             _ => usage(),
         }
     }
@@ -1207,6 +1218,64 @@ fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Resu
     Ok(())
 }
 
+/// A `--dir-census` line: what a query read of one directory.
+fn census_line(out: &mut String, name: &str, style: &str, read: &dir_census::Read) {
+    let lines = |bits: &[u64]| bits.iter().map(|w| w.count_ones() as usize).sum::<usize>();
+    let both: Vec<u64> = read
+        .parse
+        .iter()
+        .zip(&read.walk)
+        .map(|(p, w)| p | w)
+        .collect();
+    // Chunks of `n` lines holding a line read.
+    let chunks = |n: usize| {
+        (0..read.len.div_ceil(64 * n))
+            .filter(|c| {
+                (c * n..(c + 1) * n)
+                    .any(|l| both.get(l / 64).is_some_and(|w| w >> (l % 64) & 1 != 0))
+            })
+            .count()
+    };
+    // The blob's 8 KiB pages it spans, and those holding a line read.
+    let (pages, pages_read) = match read.offset {
+        Some(at) => {
+            let mut read_pages: Vec<usize> = (0..read.len.div_ceil(64))
+                .filter(|l| both.get(l / 64).is_some_and(|w| w >> (l % 64) & 1 != 0))
+                .flat_map(|l| {
+                    [
+                        (at + 64 * l) / 8192,
+                        (at + (64 * l + 63).min(read.len - 1)) / 8192,
+                    ]
+                })
+                .collect();
+            read_pages.dedup();
+            read_pages.sort_unstable();
+            read_pages.dedup();
+            ((at + read.len - 1) / 8192 - at / 8192 + 1, read_pages.len())
+        }
+        None => (0, 0),
+    };
+    let _ = writeln!(
+        out,
+        "{name}\t{style}\t{:?}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+        read.role,
+        read.len,
+        lines(&read.parse),
+        lines(&read.walk),
+        lines(&both),
+        chunks(4),
+        chunks(8),
+        chunks(16),
+        read.sections[0],
+        read.sections[1],
+        read.sections[2],
+        read.blocks,
+        lines(&read.blocks_read),
+        pages,
+        pages_read,
+    );
+}
+
 fn run() -> Result<bool, String> {
     let args = args();
     let mut trace = bench::read_trace(&args.trace)?;
@@ -1251,6 +1320,13 @@ fn run() -> Result<bool, String> {
     );
     let mut unsupported = 0usize;
     let mut mismatched = 0usize;
+    if args.dir_census.is_some() && !(dir_census::BUILT && args.forget) {
+        return Err("--dir-census needs the dir-census feature and --forget".into());
+    }
+    let mut census_out = String::from(
+        "name\tstyle\trole\tbytes\tparse_lines\twalk_lines\tlines\tc256\tc512\tc1024\t\
+         eager\trows\tfrontiers\tblocks\tblocks_read\tpages\tpages_read\n",
+    );
     for (n, q) in trace.iter().enumerate() {
         reader.full.set(fulls[n]);
         let scorer = reader.scorer(&q.text)?;
@@ -1260,7 +1336,16 @@ fn run() -> Result<bool, String> {
         if args.forget {
             reader.forget();
         }
-        let Some(answer) = reader.ranked(&scorer, args.k) else {
+        if args.dir_census.is_some() {
+            dir_census::start();
+        }
+        let answer = reader.ranked(&scorer, args.k);
+        if args.dir_census.is_some() {
+            for read in dir_census::take() {
+                census_line(&mut census_out, &q.name, &q.style, &read);
+            }
+        }
+        let Some(answer) = answer else {
             unsupported += 1;
             continue;
         };
@@ -1390,6 +1475,9 @@ fn run() -> Result<bool, String> {
     let _ = NoTouch;
     if let Some(path) = &args.warm {
         std::fs::write(path, &warm_out).map_err(|e| e.to_string())?;
+    }
+    if let Some(path) = &args.dir_census {
+        std::fs::write(path, &census_out).map_err(|e| e.to_string())?;
     }
     // Answers and the comparison.
     let tids: FxHashSet<Tid> = rows

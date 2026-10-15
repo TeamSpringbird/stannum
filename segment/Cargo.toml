@@ -10,6 +10,10 @@ authors.workspace = true
 license.workspace = true
 description = "Byte codecs for immutable search-index segments: dictionary, document-ordinal streams, document table, positions, forward records"
 
+[features]
+# A lab census of the directory bytes a query reads (tinshape::dir_census).
+dir-census = []
+
 [dependencies]
 rustc-hash.workspace = true
 thiserror.workspace = true
