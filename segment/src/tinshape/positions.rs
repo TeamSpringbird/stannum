@@ -52,22 +52,34 @@ const NO_SUB: u16 = u16::MAX;
 
 /// Skips `n` varints from byte `p`, each ending at a byte below 0x80,
 /// counted eight bytes at a time.
+///
+/// The word holding the `n`th end finds it without a branch on `n`, which
+/// varies from entry to entry (and is 0 for a run of no entries): byte
+/// `k` of `seen` counts the ends in bytes `0..=k`, and adding `0x80 - n`
+/// to every byte (at most 8 each, so no byte carries into the next) sets
+/// the top bit of each byte from the `n`th end on.
 #[inline]
 fn skip_varints(bytes: &[u8], mut p: usize, mut n: u32) -> Result<usize> {
-    while n > 0 {
+    const ONES: u64 = 0x0101_0101_0101_0101;
+    const TOPS: u64 = 0x8080_8080_8080_8080;
+    loop {
         if let Some(chunk) = bytes.get(p..p + 8) {
             let word = u64::from_le_bytes(chunk.try_into().expect("eight bytes"));
-            let mut ends = !word & 0x8080_8080_8080_8080;
+            let ends = !word & TOPS;
             let c = ends.count_ones();
             if c < n {
                 n -= c;
                 p += 8;
                 continue;
             }
-            for _ in 1..n {
-                ends &= ends - 1;
-            }
-            return Ok(p + ends.trailing_zeros() as usize / 8 + 1);
+            let seen = (ends >> 7).wrapping_mul(ONES);
+            let reached = seen.wrapping_add(u64::from(0x80 - n) * ONES) & TOPS;
+            // Past the `n`th end's byte; `p` itself for no varint.
+            let past = reached.trailing_zeros() as usize / 8 + 1;
+            return Ok(p + past * usize::from(n > 0));
+        }
+        if n == 0 {
+            return Ok(p);
         }
         let b = *bytes.get(p).ok_or(Error::Truncated)?;
         p += 1;
@@ -75,7 +87,6 @@ fn skip_varints(bytes: &[u8], mut p: usize, mut n: u32) -> Result<usize> {
             n -= 1;
         }
     }
-    Ok(p)
 }
 
 /// The stream of a term in this shape, from its [`crate::payload`] stream,
@@ -278,10 +289,11 @@ impl<'a> Positions<'a> {
     }
 
     /// Skips entries `from..to`, entry `from` starting at byte `at`; where
-    /// entry `to` starts. A block's mask is read once, a run of entries it
-    /// names (a position each, no count) is skipped as one run of varints,
-    /// and another entry's count and positions are read from one window
-    /// where they fit in it.
+    /// entry `to` starts. A block's mask is read once; a run of entries it
+    /// names (a position each, no count), maybe none, is skipped as one
+    /// run of varints, and the entry after it by its count and positions,
+    /// from one window where they fit in it (without a branch on whether
+    /// the run is empty: the mask's runs and other entries mix).
     pub fn skip_entries(&self, from: u32, at: usize, to: u32) -> Result<usize> {
         let mut p = at;
         let mut i = from;
@@ -294,15 +306,15 @@ impl<'a> Positions<'a> {
                 }
                 None => 0,
             };
-            while i < end {
+            loop {
                 let ones = (mask >> (i % SKIP_INTERVAL)).trailing_ones().min(end - i);
-                if ones > 0 {
-                    p += skip_varints(self.varints(p, ones)?, 0, ones)?;
-                    i += ones;
-                    continue;
+                let window = self.bytes.window(p, (ones as usize + 3) * VARINT_MAX)?;
+                let mut q = skip_varints(window, 0, ones)?;
+                i += ones;
+                if i == end {
+                    p += q;
+                    break;
                 }
-                let window = self.bytes.window(p, 3 * VARINT_MAX)?;
-                let mut q = 0;
                 let n = varint::get_u32(window, &mut q)?;
                 p += match skip_varints(window, q, n) {
                     Ok(next) => next,
@@ -310,6 +322,9 @@ impl<'a> Positions<'a> {
                     Err(_) => q + skip_varints(self.varints(p + q, n)?, 0, n)?,
                 };
                 i += 1;
+                if i == end {
+                    break;
+                }
             }
         }
         Ok(p)
@@ -404,6 +419,21 @@ mod tests {
         }
         assert!(positions.locate(count).is_err());
         positions
+    }
+
+    proptest::proptest! {
+        /// Skipping `n` varints ends one past the `n`th byte below 0x80,
+        /// from any start, in a word or across words.
+        #[test]
+        fn skips_to_the_nth_end(bytes in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..40), p in 0usize..40) {
+            let p = p.min(bytes.len());
+            let ends: Vec<usize> = (p..bytes.len()).filter(|&i| bytes[i] < 0x80).collect();
+            for n in 0..=ends.len() as u32 {
+                let want = if n == 0 { p } else { ends[n as usize - 1] + 1 };
+                proptest::prop_assert_eq!(skip_varints(&bytes, p, n).unwrap(), want);
+            }
+            proptest::prop_assert!(skip_varints(&bytes, p, ends.len() as u32 + 1).is_err());
+        }
     }
 
     #[test]
