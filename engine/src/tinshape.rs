@@ -2736,7 +2736,10 @@ mod tests {
         let tids: Vec<Tid> = local.iter().map(|r| docs[*r]).collect();
         let mut builder =
             Builder::new(tids, local.iter().map(|r| lengths[*r]).collect(), options).unwrap();
-        for (t, m) in members.iter().enumerate() {
+        // Terms are added in their names' order (`t10` before `t2`).
+        let mut order: Vec<usize> = (0..members.len()).collect();
+        order.sort_by_key(|t| format!("t{t}"));
+        for (t, m) in order.into_iter().map(|t| (t, &members[t])) {
             let held: Vec<(u32, u32)> = m
                 .iter()
                 .filter_map(|(r, tf)| local.binary_search(r).ok().map(|i| (i as u32, *tf)))
@@ -3949,6 +3952,65 @@ mod tests {
                 let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
                 let bits = |rows: &[(f32, Tid)]| rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect::<Vec<_>>();
                 prop_assert_eq!(bits(&got.rows), bits(&want), "top {} of {:?}", k, node);
+            }
+        }
+    }
+
+    /// A disjunction's candidate's unread terms are tracked in one word up
+    /// to 64 and in several past that (`rank::Unread`): with 70 words, most
+    /// in nearly every document, candidates hold more than 64, and the
+    /// rows kept are a brute force's, bit for bit.
+    #[test]
+    fn disjunctions_of_more_than_64_words_keep_the_exact_top_rows() {
+        let n = 2500;
+        let density: Vec<u32> = (0..70)
+            .map(|t| if t % 10 == 3 { 20 } else { 96 + t % 4 })
+            .collect();
+        let (docs, lengths, members) = dense_words(n, &density, 0x5DEE_CE66_D1CE_4E5B);
+        let all: Vec<usize> = (0..n).collect();
+        let options = Options {
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+        let segment = Segment::parse(&blob).unwrap();
+        let names: Vec<String> = (0..density.len()).map(|t| format!("t{t}")).collect();
+        for terms in [70usize, 65, 64, 63] {
+            let node = Node::Or((0..terms).map(Node::Term).collect());
+            let scorers: Vec<(String, TermScorer)> = leaf_terms(&node)
+                .into_iter()
+                .map(|t| {
+                    let df = members[t].len().max(1) as u64;
+                    let scorer =
+                        TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 20.0);
+                    (names[t].clone(), scorer.unwrap())
+                })
+                .collect();
+            let mut want: Vec<(f32, Tid)> = (0..n)
+                .filter(|r| eval(&node, &members, *r))
+                .map(|r| {
+                    let mut total = 0.0_f32;
+                    for (name, scorer) in &scorers {
+                        let t: usize = name[1..].parse().unwrap();
+                        if let Some(tf) = holds(&members, t, r) {
+                            total += scorer.score_bucket(TfBucket::from_count(tf), lengths[r]);
+                        }
+                    }
+                    (total, docs[r])
+                })
+                .collect();
+            want.sort_by(crate::walk::rank);
+            for k in [1, 10] {
+                let mut top = want.clone();
+                top.truncate(k);
+                let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+                let bits = |rows: &[(f32, Tid)]| {
+                    rows.iter()
+                        .map(|(s, t)| (s.to_bits(), *t))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(bits(&got.rows), bits(&top), "top {k} of {terms} words");
             }
         }
     }
