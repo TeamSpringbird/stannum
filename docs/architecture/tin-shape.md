@@ -1445,6 +1445,15 @@ passes, 300 queries, 2 rounds; the POPCNT build is x86-64's only)
 `full_score` disjunctions -2.0% cycles (-1.2% instructions, mean -2.0%),
 score ones -0.2%; conjunctions and phrases run the same instructions.
 
+A later M4 A/B of the whole branch against `29c0f46` (400 queries,
+interleaved) measured score disjunctions +6.4% cycles, but it ran beside
+the v2 campaign's eight loaded cores. Bisected on an otherwise quiet M4
+(the same binaries, 3 rounds score, 2 full): the verdicts -0.2% / -0.9%
+(score / `full_score` cycles), the candidate context -4.7% / -3.2% on
+top, the POPCNT build (its inlining reaches aarch64) +0.5% / -0.4%; the
+branch -5.0% / -4.2% in all, instructions +0.6% / -0.2%. Each round
+agreed. Nothing of it is aarch64's to restore.
+
 Not kept:
 
 - The OR sieve (`Walk::sieve`) in groups whose terms are not all required,
