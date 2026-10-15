@@ -1358,6 +1358,11 @@ struct Walk<'s, 'a, T: Touch> {
     /// Per scoring term, whether the candidate at hand holds it in its low
     /// tier (bounded by the low pairs, not the group's frontier).
     held_lo: Vec<bool>,
+    tier_plan: TierPlan,
+    /// Whether any scoring term's record splits groups into tiers, and
+    /// whether the group at hand is weighed by them.
+    any_tiers: bool,
+    group_tiered: bool,
     /// A disjunction's candidate at hand: per scoring term it holds, the
     /// bound of the block or, once its bucket is read, of the bucket (see
     /// [`Walk::or_stage`]).
@@ -3183,6 +3188,9 @@ pub(super) fn walk_into<'s, 'a>(
         or_lo: Vec::new(),
         cand_hi: Vec::with_capacity(n),
         held_lo: vec![false; n],
+        tier_plan: TierPlan::default(),
+        any_tiers: false,
+        group_tiered: false,
         held_bound: vec![0.0; n],
         buckets: vec![NO_BUCKET; n],
         held_index: vec![0; n],
@@ -3230,6 +3238,7 @@ pub(super) fn walk_into<'s, 'a>(
         held: Vec::new(),
     };
     walk.term_sc = vec![usize::MAX; walk.terms.len()];
+    walk.any_tiers = walk.sc.iter().any(|s| s.tiers);
     for i in 0..n {
         let r = required.contains(&walk.sc[i].term);
         walk.sc_required.push(r);
@@ -3378,12 +3387,16 @@ struct Plan {
     essential: Vec<usize>,
     by_essential: bool,
     order: Vec<(f32, usize)>,
-    /// With impact tiers ([`Walk::plan_tiered`]): split terms whose high
-    /// tier every candidate must hold (without it, its low tier's bound
-    /// and the others' cannot reach the threshold), and those whose high
-    /// tier a candidate may hold instead of an essential term (their low
-    /// tier is not essential); the plan's parts, and which terms' low
-    /// tiers are essential.
+}
+
+/// What impact tiers add to a group's [`Plan`] ([`Walk::plan_tiered`]):
+/// split terms whose high tier every candidate must hold (without it, its
+/// low tier's bound and the others' cannot reach the threshold), and those
+/// whose high tier a candidate may hold instead of an essential term
+/// (their low tier is not essential); the plan's parts, and which terms'
+/// low tiers are essential (left clear between groups).
+#[derive(Default)]
+struct TierPlan {
     hi_required: Vec<usize>,
     essential_hi: Vec<usize>,
     parts: Vec<(f32, usize, bool)>,
@@ -3810,7 +3823,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         // The present terms split into impact tiers here, under a bar (no
         // bound cuts anything before one).
-        let tiered = self.or_tiers(&sb, words)?;
+        let tiered = self.any_tiers && self.or_tiers(&sb, words)?;
+        self.group_tiered = tiered;
+        let mut tp = if tiered {
+            std::mem::take(&mut self.tier_plan)
+        } else {
+            TierPlan::default()
+        };
         let dead = self.segment.liveness.groups[g as usize].as_deref();
         let mut plan = std::mem::take(&mut self.plan);
         // The group's plan at its own bounds and the threshold now: a
@@ -3822,7 +3841,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // before its bounds are taken.
         let real: f64 = sb.iter().map(|b| f64::from(*b)).sum();
         if tiered {
-            self.plan_tiered(&mut plan, self.threshold(), &sb, real);
+            self.plan_tiered(&mut plan, &mut tp, self.threshold(), &sb, real);
         } else {
             self.plan_group(&mut plan, self.threshold(), &sb, real);
         }
@@ -3832,9 +3851,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut mask = std::mem::take(&mut self.words);
         mask.clear();
         mask.resize(words, 0);
-        let essential = plan.essential.len() + plan.essential_hi.len();
+        let essential = plan.essential.len() + tp.essential_hi.len();
         let filters = plan.required.len()
-            + plan.hi_required.len()
+            + tp.hi_required.len()
             + if plan.by_essential { essential } else { 0 };
         if filters == 0 {
             mask.fill(!0);
@@ -3843,7 +3862,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // above, then the required terms (and high tiers) ANDed in; without
         // essential terms the first required one is the mask to start from.
         let mut required = plan.required.iter();
-        let mut hi_required = plan.hi_required.iter();
+        let mut hi_required = tp.hi_required.iter();
         if plan.by_essential && essential > 0 {
             for e in 0..plan.essential.len() {
                 let i = plan.essential[e];
@@ -3851,7 +3870,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 loaded[i] = true;
                 kernels::or_bytes(&mut mask, self.row_state[i].at.bytes());
             }
-            for &i in &plan.essential_hi {
+            for &i in &tp.essential_hi {
                 kernels::or_bytes(&mut mask, self.or_tier[i].hi_at.bytes());
             }
         } else if let Some(&first) = required.next() {
@@ -3871,6 +3890,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         if let Some(dead) = dead {
             kernels::andnot_words(&mut mask, dead);
+        }
+        let hi_required_len = tp.hi_required.len();
+        if tiered {
+            self.tier_plan = tp;
         }
         if !kernels::any_set(&mask) {
             self.answer.windows_pruned += 1;
@@ -3924,36 +3947,33 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // sum through two additions could lose, at most a few units of the
         // last place of the largest sum (`tier_step`; twice what the bounds
         // sum to before those rises, which they cannot reach).
-        let mut most = 0.0_f64;
-        for &i in &self.present_list {
-            if sb[i] > 0.0 {
-                most += f64::from(sb[i]);
-                if self.or_tier[i].on {
-                    most += f64::from(self.or_tier[i].lo_bound);
+        let mut group_total = 0.0_f32;
+        if tiered {
+            self.or_tier_rows(
+                &sb,
+                &mut terms,
+                &mut rows,
+                &mut bounds,
+                &mut sub,
+                &mut row_terms,
+                &mut lo_rows,
+            );
+            for &i in &terms {
+                group_total += sb[i];
+            }
+        } else {
+            for p in 0..self.present_list.len() {
+                let i = self.present_list[p];
+                if sb[i] > 0.0 {
+                    terms.push(i);
+                    rows.push(self.row_state[i].at);
+                    bounds.push(sb[i]);
                 }
             }
-        }
-        let mut group_total = 0.0_f32;
-        for p in 0..self.present_list.len() {
-            let i = self.present_list[p];
-            if sb[i] > 0.0 {
-                terms.push(i);
-                row_terms.push(i);
-                rows.push(self.row_state[i].at);
-                group_total += sb[i];
-                let tier = self.or_tier[i];
-                if tier.on {
-                    lo_rows.push(rows.len() - 1);
-                    bounds.push(tier.lo_bound);
-                    sub.push(tier.lo_bound);
-                    rows.push(tier.hi_at);
-                    bounds.push(tier_step(tier.lo_bound, sb[i], 2.0 * most));
-                    sub.push(sb[i]);
-                    row_terms.push(usize::MAX);
-                } else {
-                    bounds.push(sb[i]);
-                    sub.push(sb[i]);
-                }
+            sub.extend_from_slice(&bounds);
+            row_terms.extend_from_slice(&terms);
+            for &bound in &bounds {
+                group_total += bound;
             }
         }
         // A grouped term's sub-range bounds are its group bound, set once; a
@@ -3973,7 +3993,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // conjunction there) and whose mask holds many (a `full_score`
         // disjunction of dense words; a `score` one's holds some 85, which
         // their own checks bound for less).
-        let sieving = plan.required.len() + plan.hi_required.len() == terms.len()
+        let sieving = plan.required.len() + hi_required_len == terms.len()
             && kernels::popcount(&mask) >= OR_SIEVE_MIN
             && self.or_sieve(&terms, &sb);
         if sieving {
@@ -4060,8 +4080,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             *h = row.word(w);
                         }
                     }
-                    for &h in &lo_rows {
-                        held[h] &= !held[h + 1];
+                    if tiered {
+                        for &h in &lo_rows {
+                            held[h] &= !held[h + 1];
+                        }
                     }
                     // Each member's verdict without a branch on it (see
                     // `BarKey::keeps`), at the bar as it stands now.
@@ -4137,8 +4159,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     fn plan_group(&self, plan: &mut Plan, theta: Option<f32>, sb: &[f32], total: f64) {
         plan.required.clear();
         plan.essential.clear();
-        plan.hi_required.clear();
-        plan.essential_hi.clear();
         plan.order.clear();
         plan.by_essential = true;
         let present = (0..sb.len()).filter(|i| self.present[*i]);
@@ -4184,12 +4204,19 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// split term without whose high tier the rest cannot reach the
     /// threshold has that tier ANDed into the mask.
     #[inline(never)]
-    fn plan_tiered(&self, plan: &mut Plan, theta: Option<f32>, sb: &[f32], total: f64) {
+    fn plan_tiered(
+        &self,
+        plan: &mut Plan,
+        tp: &mut TierPlan,
+        theta: Option<f32>,
+        sb: &[f32],
+        total: f64,
+    ) {
         plan.required.clear();
         plan.essential.clear();
-        plan.hi_required.clear();
-        plan.essential_hi.clear();
-        plan.parts.clear();
+        tp.hi_required.clear();
+        tp.essential_hi.clear();
+        tp.parts.clear();
         plan.by_essential = true;
         let present = (0..sb.len()).filter(|i| self.present[*i]);
         let t = theta.map_or(0.0, f64::from);
@@ -4203,24 +4230,24 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let tier = &self.or_tier[i];
             let rest = total - f64::from(sb[i]);
             if tier.on && (rest + f64::from(tier.lo_bound)) * slack < t {
-                plan.hi_required.push(i);
+                tp.hi_required.push(i);
                 fixed += f64::from(sb[i]);
             } else if rest * slack < t {
                 plan.required.push(i);
                 fixed += f64::from(sb[i]);
             } else if sb[i] > 0.0 {
                 if tier.on {
-                    plan.parts.push((tier.lo_bound, i, false));
+                    tp.parts.push((tier.lo_bound, i, false));
                 }
-                plan.parts.push((sb[i], i, true));
+                tp.parts.push((sb[i], i, true));
             }
         }
         // Ascending, a term's low tier before its high one.
-        plan.parts
+        tp.parts
             .sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.2.cmp(&b.2)).then(a.1.cmp(&b.1)));
         let mut tail = fixed;
         let mut inessential = 0;
-        for &(bound, i, hi) in &plan.parts {
+        for &(bound, i, hi) in &tp.parts {
             let tier = &self.or_tier[i];
             let add = if hi && tier.on {
                 f64::from(bound) - f64::from(tier.lo_bound)
@@ -4235,24 +4262,24 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             inessential += 1;
         }
         plan.by_essential =
-            (plan.required.is_empty() && plan.hi_required.is_empty()) || inessential > 0;
+            (plan.required.is_empty() && tp.hi_required.is_empty()) || inessential > 0;
         // Marks left clear between groups.
-        if plan.lo_essential.len() < sb.len() {
-            plan.lo_essential.resize(sb.len(), false);
+        if tp.lo_essential.len() < sb.len() {
+            tp.lo_essential.resize(sb.len(), false);
         }
-        for k in inessential..plan.parts.len() {
-            let (_, i, hi) = plan.parts[k];
+        for k in inessential..tp.parts.len() {
+            let (_, i, hi) = tp.parts[k];
             if !hi {
-                plan.lo_essential[i] = true;
+                tp.lo_essential[i] = true;
                 plan.essential.push(i);
             } else if !self.or_tier[i].on {
                 plan.essential.push(i);
-            } else if !plan.lo_essential[i] {
-                plan.essential_hi.push(i);
+            } else if !tp.lo_essential[i] {
+                tp.essential_hi.push(i);
             }
         }
         for &i in &plan.essential {
-            plan.lo_essential[i] = false;
+            tp.lo_essential[i] = false;
         }
     }
 
@@ -4262,6 +4289,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// higher than the group's) and its high tier's row. A term whose low
     /// tier bounds as high as the group is weighed whole. Whether any term
     /// is split.
+    #[inline(never)]
     fn or_tiers(&mut self, sb: &[f32], words: usize) -> Result<bool> {
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
@@ -4334,6 +4362,56 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(any)
     }
 
+    /// The weighing's rows for a group with split terms (present terms'
+    /// bounds `sb`): per present term with a positive bound, its row at its
+    /// bound, and for a split term its row at its low tier's bound and its
+    /// high tier's after it (see [`Walk::or_group_in`]): `bounds` as a
+    /// word's sum adds them, `sub` as a member's, `row_terms` each row's
+    /// term (`usize::MAX` for a high tier's), `lo_rows` the split terms'
+    /// rows.
+    #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
+    fn or_tier_rows(
+        &self,
+        sb: &[f32],
+        terms: &mut Vec<usize>,
+        rows: &mut Vec<RowAt>,
+        bounds: &mut Vec<f32>,
+        sub: &mut Vec<f32>,
+        row_terms: &mut Vec<usize>,
+        lo_rows: &mut Vec<usize>,
+    ) {
+        let mut most = 0.0_f64;
+        for &i in &self.present_list {
+            if sb[i] > 0.0 {
+                most += f64::from(sb[i]);
+                if self.or_tier[i].on {
+                    most += f64::from(self.or_tier[i].lo_bound);
+                }
+            }
+        }
+        for &i in &self.present_list {
+            if sb[i] > 0.0 {
+                terms.push(i);
+                row_terms.push(i);
+                rows.push(self.row_state[i].at);
+                let tier = self.or_tier[i];
+                if tier.on {
+                    lo_rows.push(rows.len() - 1);
+                    bounds.push(tier.lo_bound);
+                    sub.push(tier.lo_bound);
+                    rows.push(tier.hi_at);
+                    bounds.push(tier_step(tier.lo_bound, sb[i], 2.0 * most));
+                    sub.push(sb[i]);
+                    row_terms.push(usize::MAX);
+                } else {
+                    bounds.push(sb[i]);
+                    sub.push(sb[i]);
+                }
+            }
+        }
+    }
+
     /// The posting index of member `local` of scoring term `i`'s row;
     /// members must be asked in increasing order.
     #[inline]
@@ -4359,9 +4437,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             r.advance(w);
             self.cand_words.push(r.at.word(w));
             self.cand_base.push(r.first + r.run);
-            let t = &self.or_tier[i];
-            self.cand_hi
-                .push(if t.on { t.hi_at.word(w) } else { u64::MAX });
+            if self.group_tiered {
+                let t = &self.or_tier[i];
+                self.cand_hi
+                    .push(if t.on { t.hi_at.word(w) } else { u64::MAX });
+            }
         }
     }
 
@@ -4501,7 +4581,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 debug_assert_eq!(Some(b), s.block_at(slot));
                 self.blocks[i] = b;
                 // A split term's low-tier member at its low pairs' bound.
-                let lo = self.cand_hi[p] >> bit & 1 == 0;
+                let lo = self.group_tiered && self.cand_hi[p] >> bit & 1 == 0;
                 self.held_lo[i] = lo;
                 let v = if lo {
                     self.or_tier[i].lo_bound
