@@ -413,11 +413,6 @@ fn varint_len(value: u64) -> usize {
 /// A varint of a directory checked when it was parsed.
 #[inline]
 fn get_checked(bytes: &[u8], at: &mut usize) -> u64 {
-    let b = bytes[*at];
-    if b < 0x80 {
-        *at += 1;
-        return u64::from(b);
-    }
     varint::get(bytes, at).expect("a frontier checked when parsed")
 }
 
