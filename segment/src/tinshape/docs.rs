@@ -41,7 +41,7 @@
 //!             (byte-aligned), by rank
 //! ```
 //!
-//! With the segment header's class flag (page layout 13), the DL sidecar
+//! With the segment header's class flag (page layout 14), the DL sidecar
 //! holds a class plane: each document's length class (0: shorter than
 //! `floor1`, 1: shorter than `floor2`, 2: shorter than `floor3`, 3: the
 //! rest), four to a byte, low bits first, by rank. A block's plane is 64

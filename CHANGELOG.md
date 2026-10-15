@@ -159,7 +159,7 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 - The DL sidecar of a segment in TIN's shape holds each document's length
   class, two bits by rank (shorter than 16, 64, 256 words, or longer;
-  page layout 13), and a ranked walk bounds a candidate at its class's
+  page layout 14), and a ranked walk bounds a candidate at its class's
   shortest length before it reads the exact one: a conjunction or phrase
   after its buckets, a disjunction before them. At 150 million rows the
   index grows 0.10% and queries read 73% to 84% fewer lengths; on x86-64
@@ -167,7 +167,23 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   3.6%, `full_score` disjunctions 8.0%, score disjunctions 0.8%; on
   aarch64 3.5%, 0.5% more, 8.3% and 1.3% fewer. Score disjunctions read
   10% more pages (a class for each candidate past its blocks); the
-  answers are the same. An index of layout 12 must be rebuilt.
+  answers are the same.
+- Segments in TIN's shape keep a grouped record's group directory as rows
+  of fixed width (page layout 14): the record's presence over the
+  segment's groups (a bitmap with each word's rank, or its group indexes),
+  then per group its container's kind, its largest bucket and its totals
+  as deltas from a base per 32 rows, so a walk finds a group's entry by
+  the group's rank and reads it in place, decoding nothing of the entries
+  before it (layout 11's skip points still decoded a run of 16). At 150
+  million rows the index grows 0.86%; on x86-64 conjunctions take 7.3%
+  fewer cycles, phrases 2.9%, `full_score` conjunctions 6.1% and phrases
+  3.2%, `full_score` disjunctions 0.4%; on aarch64 conjunctions retire 14.8%
+  fewer instructions and phrases 9.9%; the same answers. Score
+  disjunctions took 1.3% more cycles on x86-64, past the 1% a regression
+  may cost; the directory was kept for the conjunctions' gain and its
+  simpler code, and a disjunction's in-order read of the rows is the next
+  step. Layout 14 carries the length classes too: an index of layout 12
+  or 13 must be rebuilt.
 - Segments in TIN's shape store a group's postings list of at most 64
   members as its local slots in sorted `u16`s (page layout 11) rather than
   Elias-Fano, which decodes them one at a time below 16 members at every
@@ -319,17 +335,10 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   the buffer's usage count as `ReadBuffer`'s does.
   `stannum.share_buffer_hints` (on) switches back for comparison. Term
   directories and footers parse with less work per query (short varints
-  without a loop; a grouped record's directory, read in one window whose
-  length its header gives (page layout 10, 1.4 bytes a record), is copied
-  once when parsed, a page at a time, and its entries decoded as a walk
-  reaches them: a run of 16 from the skip point before it (page layout 11,
-  20 bytes per 16 entries, +0.3% of the index), the runs a walk seeks past
-  undecoded, eight runs at once for a walk that reads on,
-  or in one pass for a disjunction, which reaches them all, from a scan of
-  where its varints start, without a branch on their lengths: at 150M rows a
-  cheap conjunction decodes 33,000 entries where it decoded 119,000, and one
-  backend's median conjunction takes 1.20 times the layout 6 build's CPU
-  where it took 1.36), and
+  without a loop; a grouped record's directory is read in one window whose
+  length its header gives (page layout 10, 1.4 bytes a record), copied once
+  when parsed, a page at a time, and read in place: see the columnar
+  directory under Changed), and
   `EXPLAIN ANALYZE` counts records parsed, kept and forgotten and footers
   decoded and kept. Together, at eight clients, backend CPU per query falls
   17% (conjunction), 8% (disjunction) and 16% (phrase), for the same

@@ -154,6 +154,7 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
             // most as long), and its count must be its container's.
             let entries = match &found.postings.form {
                 super::postings::Form::Grouped(dir) => {
+                    dir.check_entries(&segment.docs.geometry.groups)?;
                     dir.entries(&segment.docs.geometry.groups)?
                 }
                 _ => Vec::new(),

@@ -1571,7 +1571,7 @@ fn run() -> Result<bool, String> {
     }
     println!(
         "\nterm metadata per query, mean (answer pass): records parsed / kept, footers decoded / kept, \
-         footer blocks decoded, reached, used, in the whole footers, footer KB parsed, in the whole footers; directories parsed, entries decoded, reached, \
+         footer blocks decoded, reached, used, in the whole footers, footer KB parsed, in the whole footers; directories parsed, entries read, reached, \
          loaded, directory KB parsed"
     );
     for style in &styles {

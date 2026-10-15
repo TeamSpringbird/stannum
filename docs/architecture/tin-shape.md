@@ -123,17 +123,24 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
                     (directory_len: the bytes of the payload before its
                     containers, layout 10)
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
-           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped),
-           | 0x20 when the directory ends in skip points (grouped, layout 11)
+           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped)
 lengths := base varint, width u8, (length - base) packed at width, by posting
 list    := Elias-Fano over the term's slots, universe = all slots
-directory := groups, (index gap, (count - 1) << 2 | kind, [len],
-                      group frontier)*, skip*: one entry per group the term
-                      occupies, then before every 16th entry past the first a
-                      skip point
-skip    := u32 LE each: the entry's offset from the first entry, the group
-           index after the entry before it, and the container bytes,
-           postings and TF bits before it
+directory := groups varint, widths u8 * 4, presence, base*, row*,
+             group frontier*                        (layout 14)
+widths  := bits of a row's deltas of postings, container bytes, TF bits and
+           frontier bytes (each at most 32; a row at most 120 bits)
+presence := more than one group in 16 held: a bitmap over the segment's
+            groups (u64 LE words, bit g of word g / 64), then per word the
+            groups held before it; else the groups' indexes, ascending
+            (indexes and ranks u16 LE, u32 past 65,536 groups)
+base    := u32 LE each: the postings, container bytes, TF bits and frontier
+           bytes before row 32k (one per block of 32 rows)
+row     := kind (2 bits), the frontier's largest bucket (4), then each
+           total's delta from its block's base at its width: groups + 1
+           rows in one bit string, the last (kind and bucket 0) holding the
+           record's totals; an entry's count and container length are the
+           next row's totals less its own
 group frontier := head u8 = (pairs - 1) << 4 | first bucket, first length
                   varint, then per pair ((length gap - 1) << 4 | bucket gap - 1)
                   varint: the group's impact frontier, its lengths rounded
@@ -199,13 +206,12 @@ footer entry per term and aligned 256-page group (its probes, rounds 2 and
 (bucket, shortest length) pairs no other posting of the group dominates (1
 to 16; 2.4 on average at 150M rows), and the group's buckets follow the
 groups before it in the TF tail, at the width the group's largest bucket
-needs. A walk reaches group `g`'s entry by its position in the directory
-(skimmed when the record is parsed, its entries decoded a block of 128 at a
-time as the walk reaches them: see [lazy group
-directories](#lazy-group-directories-layout-89)) and reads nothing of the
-groups before it but their entries; a group's bound is its frontier's best score, its floors per
-bucket come from the same pairs, and a group the term lacks bounds at
-zero. The frontier's lengths are rounded down to six significant bits
+needs. A walk finds group `g`'s entry by the group's rank in the record's
+presence (a popcount of its word) or among its group indexes, and reads its
+row and the next, nothing of the groups before it (see [the columnar
+directory](#the-columnar-directory-layout-14)); a group's bound is its
+frontier's best score, its floors per bucket come from the same pairs, and
+a group the term lacks bounds at zero. The frontier's lengths are rounded down to six significant bits
 (`round_length`, as TIN quantizes its lengths): a bound at the rounded
 length is a bound at the length, the frontier costs 3% less, and 0.1% more
 candidates pass (`Options::group_frontiers`, `Exact` keeps them whole).
@@ -267,7 +273,7 @@ a header read and a bit extraction; 8.3 bits per document here (TIN's
 probes: about 6 on shorter documents) against `STN3`'s 4-byte lengths plus
 1-byte classes, and 2.6 times the documents per page of `u16` lengths.
 
-Since page layout 13 (the header's flag bit 1) the sidecar also holds each
+Since page layout 14 (the header's flag bit 1) the sidecar also holds each
 document's **length class**, two bits by rank: class 0 below 16 words, 1
 below 64, 2 below 256, 3 the rest (the sidecar's prefix records the three
 floors). The classes are a plane of 64 bytes per block, a cache line's
@@ -1152,6 +1158,10 @@ lacking one, 8% of a conjunction's directory entries in the replay.
 
 ### Lazy group directories (layout 8/9)
 
+(History: since layout 14 a directory is rows of fixed width read in place,
+nothing decoded; see [the columnar
+directory](#the-columnar-directory-layout-14).)
+
 Since every directory entry carries its group's frontier (layout 8), an
 entry takes about 10 bytes (3 before), and decoding a common term's
 directory whole cost a cheap conjunction 1-3 ms at 150M rows: about 118,000
@@ -1214,6 +1224,9 @@ The skim was the floor while containers were found from the directory's
 end; layout 10 removed it (below). On x86-64 the scan has an SSSE3 body.
 
 ### Directory length in the header (layout 10)
+
+(The header still gives the directory's length; what follows here about
+skimming entries is history since layout 14.)
 
 A grouped record's header gives its directory's length (the bytes of its
 group count and entries, where its containers start) in the varint a
@@ -1316,6 +1329,9 @@ trace.
 
 ### Skip points in the directory (layout 11)
 
+(History: the columnar directory of layout 14 replaced the skip points; see
+[the columnar directory](#the-columnar-directory-layout-14).)
+
 An entry's totals (its container's offset, its first posting, its buckets'
 offset) count every entry before it, so a walk that asks a term for group
 `g` decoded every entry before `g`'s, whether it needed them or not. A
@@ -1390,6 +1406,105 @@ candidate, a cache and TLB miss as a rule), 14.5% to Elias-Fano decoding,
 directories and stitched containers, allocation), 7.0% to pins, 6.3% to
 group bounds and about 13% to candidates; a phrase's 51 M, 11.4% each to the
 directory and to filtering, 10.8% to decoding and 10.5% to pins.
+
+### The columnar directory (layout 14)
+
+Skip points left a directory's entries varints: an entry's totals (its
+container's offset, its first posting, its buckets' offset) still counted
+the entries before it, so reaching one decoded its run of 16 from the skip
+point before it, and seeking a group scanned or galloped over runs. At
+layout 12 the directory was 12.6% of a conjunction's cycles on Sapphire
+Rapids (`perf record`, `36d92ae`) and 13.7% of its M4 samples; a
+conjunction decoded about 65,000 entries a query to read about 31,000.
+TIN's footer entry locates its group's container directly (probes round 7,
+E1).
+
+So since layout 14 a grouped record's directory is columns of fixed width
+(`postings::Directory`):
+
+- **Presence**: a record held in more than one group in 16 has a bitmap
+  over the segment's groups, a bit a group, with each 64-bit word's rank
+  (the groups held before it) in two bytes; any other has its groups'
+  indexes, two bytes each (four in a segment of more than 65,536 groups).
+  At 150M rows 97.6% of entries are in records with a bitmap: presence
+  takes 24 MB.
+- **Rows**: per entry its container's kind (2 bits), its frontier's largest
+  bucket (4) and four totals (postings, container bytes, TF bits, frontier
+  bytes before it) as deltas from its block's bases, each column at the
+  width the record's largest delta needs; one more row holds the record's
+  totals, so an entry's count and container length are the next row's
+  totals less its own. A row is at most 120 bits (one 16-byte load at any
+  bit offset).
+- **Bases**: four `u32`s per block of 32 rows.
+- The **frontiers**, as before, after the rows.
+
+A seek of group `g` is the rank of `g` in the bitmap (its word's rank plus
+a popcount of the bits below it) or a gallop over the group indexes from
+the walk's hint; reading the entry is two row loads and their bases.
+Nothing of the entries before it is decoded, and nothing is decoded ahead
+of the walk. The parse checks the presence (every word's rank, the indexes
+rising) and the record's totals (the last row against the record's
+postings, containers, TF tail and the directory's length); an entry is
+checked as it is read (its count within its group, a grid's or an array's
+length its kind's, its buckets, container and frontier within the
+record's). An Elias-Fano container's exact length, and every frontier
+read whole, are the verifier's (`Directory::check_entries`); a reader
+checks that a list fits its bytes. The directory keeps the entry it read
+last and the row after it, which the record's clones share: a walk asks
+for a group's entry for its bound, then its container, then its buckets,
+and a walk in order reads one row an entry. A seek looks there first: a
+seek of that entry's group returns it, and one whose first held group is
+the next set bit after it returns the next entry, neither counting a rank
+(baseline x86-64 has no POPCNT; on Sapphire Rapids the rank's popcount was
+2.1% of a conjunction's cycles before). A record whose rows take at most
+57 bits (98% of them) reads a row as one `u64` from its first byte.
+
+This retires the skip points, the runs decoded as reached and read on, the
+SIMD varint scans (NEON, SSSE3) and the directory's slots of decoded
+entries: `postings.rs` is 345 lines and 20 `unsafe` blocks shorter, its new
+tests included.
+
+**Size** at 150M rows (`tnsreencode --from 12 --fresh`, every container
+encoded afresh, each segment verified and equal to its own merge with
+containers copied): directories 696 MB -> 1,015 MB, the index 37.25 GB ->
+37.56 GB (+0.86%). Most of it is the rows, about 7 bytes an entry where
+the varint entries took about 3.5 beside their frontiers.
+
+**Speed.** Replay with `--forget` against layout 12 (`bd8e53b`), each arm on
+its own dump; all outputs the same. On x86-64 (Sapphire Rapids,
+`m7i.4xlarge`, `838d1e7`; 3 rounds in alternating order, 100 queries a
+style, 60 for `full_score` disjunctions; `perf stat` user counters):
+conjunction cycles -7.3% (-8.4 / -5.9 / -7.6), instructions -12.2%, median
+query -8.5%, mean -10.0%; phrase cycles -2.9% (-2.8 / -3.0 / -2.8),
+instructions -8.3%; disjunction cycles +1.3% (+1.1 / +2.2 / +0.6),
+instructions +0.3%; under `full_score` conjunction -6.1%, phrase -3.2%,
+disjunction -0.4%. On the M4 (3 rounds, 150 queries a style,
+instructions): conjunction -14.8%, phrase -9.9%, disjunction -1.8%; under
+`full_score` -11.2%, -7.2%, -1.7%. A conjunction reads 34,900 entries a
+query where it decoded 61,100, a phrase 33,800 where 61,500.
+
+A disjunction reads each of its 99,800 entries a query once, where layout
+12 decoded them in one pass from a scan of their varints: that per-entry
+cost is what it gains back. The first cut (`deb40da`) took 9% more cycles
+there on x86-64: its walk found each entry's group by a select over the
+presence words, the entry read last was a call (a `full_score` walk asks
+for it per candidate and term), and every seek counted a rank. Its x86
+profile put 15.7% of a conjunction's cycles in the directory (layout 12:
+12.6%): the popcount 2.1%, the rows' `u128` shifts 3.4%; the seek near the
+entry read last and the `u64` row took those back.
+
+**Per-group cost order, tried again and not kept.** With an entry a rank
+and a row away, the conjunction looked up each required term after the
+lead in the group and intersected them cheapest first (a grid before any
+list, lists by members), the order `tinshape/conj-overhead` lost with
+decoded lookups (+14.6%). It loses here too, and not to lookups: the grid
+first loads a common term's grid in nearly every group the lead holds,
+where the rarest-first order ends nine groups in ten at the second term's
+short list. M4, 120 conjunctions: containers loaded 31.5 K a query against
+22.5 K, entries read 110 K against 32 K, instructions +50%. A presence
+check alone of every required term before the second is loaded (no row
+read) removed 124 container loads a query of 22,500 for +9.8%
+instructions. The rarest-first order stays.
 
 ### A disjunction's group bounds on x86-64 (branch `loop/c5-disj`)
 
@@ -2145,7 +2260,7 @@ of the whole trace is PostgreSQL's (1,253, 1,228 and 1,252 queries equal),
 and `--full` outputs are f0962a8's byte for byte; on x86 both layouts give
 the same outputs in every style and mode.
 
-## Length classes before the DL read at 150M rows (branch `loop/lenclass`, page layout 13)
+## Length classes before the DL read at 150M rows (branch `loop/lenclass`, page layout 13 there, 14 with the columnar directory)
 
 The gate (gates2's census over the layout-12 dump, the recorded θ
 trajectory): 93 to 97% of DL reads were for candidates whose buckets

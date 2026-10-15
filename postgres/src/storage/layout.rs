@@ -41,10 +41,11 @@ pub const MAGIC: u32 = 0x4c44_5032;
 /// (one slot per document on pages holding rows `1..=n`). Version 10:
 /// grouped records' headers give their directory's length. Version 11:
 /// grouped records' directories end in skip points. Version 12: short
-/// grouped lists as arrays of `u16` local slots. Version 13: each
-/// document's length class in the DL sidecar. An index of an earlier
-/// version must be rebuilt.
-pub const VERSION: u8 = 13;
+/// grouped lists as arrays of `u16` local slots. Version 14: each
+/// document's length class in the DL sidecar, and grouped records'
+/// directories as rows of fixed width, found by a group's rank. An index of
+/// an earlier version must be rebuilt.
+pub const VERSION: u8 = 14;
 pub const SPECIAL_SIZE: usize = 8;
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const PAGE_HEADER: usize = size_of::<pg_sys::PageHeaderData>();
