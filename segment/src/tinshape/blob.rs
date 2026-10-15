@@ -739,24 +739,6 @@ impl LazyBlob {
         }
     }
 
-    /// Whether `[from, to)` is read without pinning, loading or stitching:
-    /// within a span on one page it pinned already, else loaded.
-    #[inline]
-    fn resident(&self, from: usize, to: usize) -> bool {
-        if from >= to {
-            return true;
-        }
-        if self.spans.get() > 0 && self.page_len > 0 {
-            let n = self.page_len;
-            let page = from / n;
-            let known = self.pages[page % PAGE_MEMO].get();
-            return known.page == page
-                && known.span == self.span.get()
-                && to <= page * n + known.len;
-        }
-        self.has(from, to - from)
-    }
-
     #[inline(never)]
     fn get_slow(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         if from > to {
@@ -990,17 +972,6 @@ impl<'a> Bytes<'a> {
                 }
                 blob.get_kind(at + from, at + to, kind)
             }
-        }
-    }
-
-    /// Whether the range is read without pinning, loading or stitching
-    /// anything: in memory, on one page the open span pinned already, or
-    /// in loaded chunks.
-    #[inline]
-    pub fn resident(&self) -> bool {
-        match *self {
-            Self::Slice(_) => true,
-            Self::Lazy { blob, at, len, .. } => blob.resident(at, at + len),
         }
     }
 

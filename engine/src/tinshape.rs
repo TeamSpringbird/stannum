@@ -444,33 +444,6 @@ impl<'a> TermSet<'a> {
         None
     }
 
-    /// Asks for the lines of directory entry `i`'s container that the
-    /// group's `members` (local slots, ascending) probe, at most
-    /// `max_lines` of them, where the container is a grid in memory
-    /// already: a conjunction filters its lead's members by them.
-    #[inline]
-    fn prefetch_members(&self, i: usize, members: &[u32], max_lines: usize) {
-        let Some(entry) = self.dir.as_ref().and_then(|dir| dir.get_decoded(i)) else {
-            return;
-        };
-        if entry.kind != KIND_GRID {
-            return;
-        }
-        let bytes = self.postings.container(entry);
-        let (mut last, mut asked) = (usize::MAX, 0);
-        for &local in members {
-            let byte = local as usize / 8;
-            if byte / bits::LINE != last {
-                last = byte / bits::LINE;
-                bytes.prefetch(byte, 1);
-                asked += 1;
-                if asked == max_lines {
-                    break;
-                }
-            }
-        }
-    }
-
     /// The term's group `group`, if it holds it, looked for from `hint`
     /// forward (the hint is left at the first group at or after it).
     #[inline]
