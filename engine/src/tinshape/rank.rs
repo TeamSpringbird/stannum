@@ -75,6 +75,19 @@ const SIEVE_CHUNK: usize = 256;
 /// holds at least this many members.
 const OR_SIEVE_MIN: u64 = 128;
 
+/// A disjunction's candidate holding at least this many scoring terms
+/// reads its length class before its buckets ([`Walk::or_stage`]); one
+/// holding fewer reads it after them, only if they leave it in reach. A
+/// class read first saves a bucket read for each term it rules out, and
+/// costs a cache line of the class plane (64 bytes, 256 documents) that a
+/// sparse candidate shares with no other: at 150M rows a score
+/// disjunction's candidates (dense terms elided) hold few terms, its class
+/// reads first touched 11.2K distinct lines a query, two in three new;
+/// `full_score`'s hold many, and read first its candidates read 62% fewer
+/// buckets. At four, score disjunctions touch 42% fewer class lines for
+/// 0.35% more instructions, `full_score` ones 0.2% more.
+const CLASS_FIRST_TERMS: usize = 4;
+
 /// A scoring term's score metadata as a walk bounds by it: a sparse
 /// record's footer blocks, decoded a block at a time as the walk reaches
 /// them ([`LazyFooter`]); a grouped record's directory entries, one per
@@ -4192,9 +4205,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.buckets.fill(NO_BUCKET);
         let mut floor = 0u32;
         let mut reach = bound;
-        // Its length class first: its shortest length bounds every term it
-        // holds before any bucket is read.
-        if self.threshold().is_some() {
+        // Its length class first, for a candidate holding several terms: its
+        // shortest length bounds every term it holds before any bucket is
+        // read. One holding fewer reads its class only after its buckets,
+        // if they leave it in reach (see `CLASS_FIRST_TERMS`).
+        let class_first = self.held_list.len() >= CLASS_FIRST_TERMS;
+        if class_first && self.threshold().is_some() {
             let class = self.class_floor(g, local)?;
             if class > 0 {
                 floor = class;
@@ -4249,7 +4265,22 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // The length known, its buckets bound it at that length.
                 (self.reach(self.held_list.iter().copied(), length), length)
             }
-            None => (reach, u32::MAX),
+            None => {
+                // Its class after its buckets, if not read before them: at
+                // its class's shortest length where that is longer than its
+                // buckets' floor.
+                if !class_first && self.threshold().is_some() {
+                    let class = self.class_floor(g, local)?;
+                    if class > floor {
+                        reach = self.reach(self.held_list.iter().copied(), class);
+                        if self.cut(reach, tid) {
+                            self.answer.class_cuts += 1;
+                            return Ok(None);
+                        }
+                    }
+                }
+                (reach, u32::MAX)
+            }
         }))
     }
 
