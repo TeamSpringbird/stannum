@@ -150,6 +150,10 @@ pub struct Options {
     /// Whether a grouped record's frontiers hold exact lengths or lengths
     /// rounded down to six significant bits.
     pub group_frontiers: GroupFrontiers,
+    /// Whether the DL sidecar holds each document's length class
+    /// ([`super::docs::LENGTH_CLASSES`]), which a ranked walk bounds a
+    /// candidate by before it reads the exact length.
+    pub length_classes: bool,
 }
 
 /// [`Options::group_frontiers`].
@@ -189,6 +193,7 @@ impl Default for Options {
             inline_lengths_max_df: 64,
             inline_lengths_min_documents: 1 << 16,
             group_frontiers: GroupFrontiers::Rounded,
+            length_classes: true,
         }
     }
 }
@@ -4317,6 +4322,7 @@ mod tests {
                             } else {
                                 GroupFrontiers::Exact
                             },
+                            length_classes: grid_density == 0,
                         });
                     }
                 }

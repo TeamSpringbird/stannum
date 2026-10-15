@@ -3,14 +3,15 @@
 // See LICENSE in the repository root for license terms.
 
 //! Re-encodes dumped `TNS1` segments of page layout version 10, 9, 8 or 6
-//! to version 12, whose grouped records' directories end in skip points and
-//! hold short lists as arrays (or, with `--keep-records`, 10, whose grouped
-//! records' headers give their directory's length), and reports what that
-//! costs.
+//! to version 13, whose grouped records' directories end in skip points and
+//! hold short lists as arrays and whose DL sidecar holds length classes (or,
+//! with `--keep-records`, 10, whose grouped records' headers give their
+//! directory's length), and reports what that costs. From 12, only the DL
+//! sidecar is rewritten (step 5).
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--grid-share N] [--arrays N] \
+//!     [--from 12|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--grid-share N] [--arrays N] \
 //!     [--jobs N] [--check] [--check-merge] [--census] [--keep-records]
 //! ```
 //!
@@ -38,6 +39,11 @@
 //!    makes the Elias-Fano lists of at most `--arrays` members (default
 //!    `Options::array_max`) array containers and adds the directories' skip
 //!    points (version 12).
+//!
+//! 5. **Length classes** (from 12, the only step). The DL sidecar is
+//!    encoded again with its class plane and the header flags it; every
+//!    other area is copied, so the records are byte for byte layout 12's,
+//!    as a build of the same documents writes them.
 //!
 //! `--keep-records` skips step 4: each record keeps its encoding but for
 //! the header (with `--check-merge`, the merge must give the same bytes).
@@ -67,14 +73,14 @@ use segment::Tid;
 use segment::dead::DeadDocs;
 use segment::dictionary::{DictionaryBuilder, Extent, TermEntry};
 use segment::tinshape::bits::BitWriter;
-use segment::tinshape::docs::{GROUP_PAGES, Geometry, encode_docset};
+use segment::tinshape::docs::{GROUP_PAGES, Geometry, Lengths, encode_docset, encode_lengths};
 use segment::tinshape::ef;
 use segment::tinshape::merge::{Input, merge};
 use segment::tinshape::postings::{
     FORM_COMPACT, FORM_GROUPED, FORM_LENGTHS, FORM_ROUNDED, GroupEntry, GroupFrontiers, KIND_EF,
     KIND_GRID, KIND_PAGED, Options, for_each_local, group_frontier, put_group_frontier, tf_width,
 };
-use segment::tinshape::segment::{Area, Segment};
+use segment::tinshape::segment::{Area, FLAG_LENGTH_CLASSES, Segment};
 use segment::tinshape::verify::verify_segment;
 
 /// The segment crate's unsigned LEB128 integers.
@@ -125,7 +131,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsreencode --in DIR --out DIR [--from 10|9|8|6] [--exact] [--segment FILE] \
+        "usage: tnsreencode --in DIR --out DIR [--from 12|10|9|8|6] [--exact] [--segment FILE] \
          [--grid-density N] [--grid-share N] [--arrays N] [--jobs N] [--check] [--check-merge] [--census] \
          [--keep-records]"
     );
@@ -170,8 +176,8 @@ fn args() -> Args {
     }
     if a.input.as_os_str().is_empty()
         || a.output.as_os_str().is_empty()
-        || !matches!(a.from, 6 | 8 | 9 | 10)
-        || (a.keep_records && matches!(a.from, 6 | 10))
+        || !matches!(a.from, 6 | 8 | 9 | 10 | 12)
+        || (a.keep_records && matches!(a.from, 6 | 10 | 12))
         || a.jobs == 0
     {
         usage();
@@ -828,6 +834,41 @@ fn regrid(blob: &[u8]) -> Result<Vec<u8>, String> {
     Ok(out)
 }
 
+/// Step 5: `blob` (layout 12) with its DL sidecar's class plane; nothing
+/// else changes.
+fn add_length_classes(blob: &[u8]) -> Result<Vec<u8>, String> {
+    let (mut fields, header) = header_fields(blob)?;
+    if fields[3] & FLAG_LENGTH_CLASSES != 0 {
+        return Err("the DL sidecar holds length classes already".into());
+    }
+    let mut bounds = [header; 7];
+    for i in 0..6 {
+        bounds[i + 1] = bounds[i] + fields[4 + i] as usize;
+    }
+    if bounds[6] != blob.len() {
+        return Err("areas against the blob's length".into());
+    }
+    let documents = u32::try_from(fields[0]).map_err(|_| "document count")?;
+    let old =
+        Lengths::parse(&blob[bounds[4]..bounds[5]], documents, false).map_err(|e| e.to_string())?;
+    let lengths = (0..documents)
+        .map(|rank| old.get(rank))
+        .collect::<Result<Vec<u32>, _>>()
+        .map_err(|e| e.to_string())?;
+    let sidecar = encode_lengths(&lengths, true);
+    fields[3] |= FLAG_LENGTH_CLASSES;
+    fields[8] = sidecar.len() as u64;
+    let mut out = Vec::with_capacity(blob.len() + sidecar.len() - (bounds[5] - bounds[4]) + 8);
+    out.extend_from_slice(b"TNS1");
+    for f in &fields {
+        varint::put(&mut out, *f);
+    }
+    out.extend_from_slice(&blob[header..bounds[4]]);
+    out.extend_from_slice(&sidecar);
+    out.extend_from_slice(&blob[bounds[5]..]);
+    Ok(out)
+}
+
 /// Step 3: `blob` merged alone, every record encoded afresh over the grid
 /// of its documents.
 fn renumber(blob: &[u8], args: &Args) -> Result<Vec<u8>, String> {
@@ -861,12 +902,14 @@ fn one(args: &Args, name: &str, cost: &mut Cost) -> Result<(String, bool), Strin
     let before = area_sizes(&blob)?;
     let source = blob.len();
     let mut new = if args.from >= 9 { blob } else { regrid(&blob)? };
-    if args.from == 6 {
+    if args.from == 12 {
+        new = add_length_classes(&new)?;
+    } else if args.from == 6 {
         new = reencode_v6(&new, args.mode, cost)?;
     } else if args.from < 10 {
         new = add_directory_lengths(&new, cost)?;
     }
-    let new = if args.keep_records {
+    let new = if args.keep_records || args.from == 12 {
         new
     } else {
         renumber(&new, args)?
@@ -1106,7 +1149,7 @@ fn main() {
         "areas together {before} -> {after} ({:+.3}%)",
         100.0 * (after as f64 / before.max(1) as f64 - 1.0)
     );
-    if args.from != 6 {
+    if args.from < 12 && args.from != 6 {
         println!(
             "grouped records given a directory length: {}, headers +{} B ({:.2} B each)",
             cost.lengthened,

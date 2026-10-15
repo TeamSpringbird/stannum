@@ -42,10 +42,13 @@ pub struct Header {
     pub total_length: u64,
     pub block_size: u32,
     pub adaptive_tf: bool,
+    /// Whether the DL sidecar holds a class plane.
+    pub length_classes: bool,
     pub bounds: [u64; 8],
 }
 
 const FLAG_ADAPTIVE_TF: u64 = 1;
+use super::segment::FLAG_LENGTH_CLASSES;
 
 /// The longest header a blob can have: the magic and ten varints.
 pub const HEADER_MAX: usize = 4 + 10 * 10;
@@ -83,6 +86,7 @@ impl Header {
             total_length,
             block_size,
             adaptive_tf: flags & FLAG_ADAPTIVE_TF != 0,
+            length_classes: flags & FLAG_LENGTH_CLASSES != 0,
             bounds,
         })
     }
@@ -276,7 +280,8 @@ impl<S: Source> Reader<S> {
         let docs = self.docs()?;
         let tids = docs.tids();
         let sidecar = self.read(self.header.at(LENGTHS), self.header.len(LENGTHS))?;
-        let sidecar = SidecarLengths::parse(&*sidecar, self.header.documents)?;
+        let sidecar =
+            SidecarLengths::parse(&*sidecar, self.header.documents, self.header.length_classes)?;
         let mut lengths = Vec::with_capacity(tids.len() * 4);
         for rank in 0..self.header.documents {
             lengths.extend_from_slice(&sidecar.get(rank)?.to_le_bytes());
