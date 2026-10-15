@@ -1594,6 +1594,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let held = self.held.len();
         self.held
             .extend(self.sc.iter().filter_map(|s| s.footer.borrowed()));
+        // A directory copied a block at a time copies its next blocks from
+        // the pages it read last, or past them.
+        for set in self.terms.iter().flatten() {
+            if let Some(dir) = &set.dir {
+                self.held.extend(dir.reading().into_iter().flatten());
+            }
+        }
         // SAFETY: nothing read in place since the mark is used after but
         // what lies in `held` (see above): the members' slices were
         // dropped just now, and the footers' windows are held.

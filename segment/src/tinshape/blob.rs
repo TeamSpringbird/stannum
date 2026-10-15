@@ -333,6 +333,9 @@ pub struct LazyBlob {
     pinned: RefCell<Vec<usize>>,
     /// Pages [`Self::release_since`] keeps.
     keep: Cell<usize>,
+    /// The mark [`Self::release_since`] was last called with and the pages
+    /// it kept there because a reader holds them (see [`Self::over_keep`]).
+    held_kept: Cell<(usize, usize)>,
     /// Reads served from pinned pages so far, and per entry of
     /// [`Self::pages`] the read that last used it: the pages kept are the
     /// ones used last.
@@ -383,6 +386,7 @@ impl LazyBlob {
             pages: Box::new([const { Cell::new(NO_PAGE) }; PAGE_MEMO]),
             pinned: RefCell::default(),
             keep: Cell::new(KEEP_PINS),
+            held_kept: Cell::new((usize::MAX, 0)),
             clock: Cell::new(0),
             used: Box::new([const { Cell::new(0) }; PAGE_MEMO]),
             stitches: RefCell::default(),
@@ -452,6 +456,7 @@ impl LazyBlob {
             // The page memo's entries name the span: none is served after.
             self.stitches.borrow_mut().clear();
             self.pinned.borrow_mut().clear();
+            self.held_kept.set((usize::MAX, 0));
         }
         self.source.hold(false);
     }
@@ -476,13 +481,18 @@ impl LazyBlob {
     }
 
     /// Whether [`Self::release_since`] of `mark` would release anything:
-    /// more than half as many again as it keeps are pinned since, so a
-    /// release has some pages to release, rather than one per group read
-    /// at the cost of choosing it among those kept.
+    /// more than half as many again as it keeps are pinned since, besides
+    /// those its last call kept because a reader holds them, so a release
+    /// has some pages to release, rather than one per group read at the
+    /// cost of choosing it among those kept. (A walk whose readers hold a
+    /// dozen pages, several terms' directory and footer windows, otherwise
+    /// ran a release at every group: 14% more instructions a conjunction.)
     #[inline]
     pub fn over_keep(&self, mark: usize) -> bool {
         let keep = self.keep.get();
-        self.pinned_since(mark) > keep + keep / 2
+        let (at, held) = self.held_kept.get();
+        let held = if at == mark { held } else { 0 };
+        self.pinned_since(mark) > keep + keep / 2 + held
     }
 
     /// Sets the pages [`Self::release_since`] keeps ([`KEEP_PINS`] by
@@ -546,6 +556,7 @@ impl LazyBlob {
             }
         }
         pinned.drain(mark + kept..mark + cut);
+        self.held_kept.set((mark, kept));
     }
 
     /// Whether page `page` holds any byte of the ranges `held`.
@@ -1472,6 +1483,35 @@ mod tests {
         unsafe { blob.close_span() };
         assert!(state.pinned.borrow().is_empty());
         assert_eq!(blob.loaded(), 0);
+    }
+
+    /// Pages a release kept because a reader holds them do not count
+    /// towards the next: a walk whose readers hold many pages releases
+    /// once half as many again as it keeps are pinned past them, not at
+    /// every group.
+    #[test]
+    fn pages_kept_for_readers_do_not_trigger_the_next_release() {
+        let (_source, blob) = pinning(40 * 100, 100);
+        let bytes = blob.bytes();
+        blob.open_span();
+        let mark = blob.pin_mark();
+        blob.set_keep(2);
+        for page in 0..10 {
+            bytes.get(page * 100, page * 100 + 10).unwrap();
+        }
+        assert!(blob.over_keep(mark));
+        // Pages 0 to 3 held: kept with the two read last.
+        let held: Vec<(usize, usize)> = (0..4).map(|p| (p * 100, p * 100 + 1)).collect();
+        unsafe { blob.release_since(mark, &held) };
+        assert_eq!(blob.pinned_since(mark), 6);
+        // The bound is 2 + 1 past the 4 held: 7 pinned is not over it.
+        bytes.get(1000, 1010).unwrap();
+        assert!(!blob.over_keep(mark), "7 pinned, 4 of them held");
+        bytes.get(1100, 1110).unwrap();
+        assert!(blob.over_keep(mark));
+        // Another mark knows nothing of them.
+        assert!(blob.over_keep(mark + 1) == (blob.pinned_since(mark + 1) > 3));
+        unsafe { blob.close_span() };
     }
 
     /// Pages holding a held range move before the mark `hold_since`
