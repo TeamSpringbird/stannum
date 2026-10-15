@@ -217,7 +217,7 @@ a score it covers).
 
 A grid group (a dense term's) refines its frontier per **sub-range** of
 1,024 slots (page layout 13, `Options::sub_codes`; not TIN's measured
-structure, kept for a measured gain, see [sub-range
+structure, measured and not adopted, see [sub-range
 codes](#sub-range-codes-for-grid-groups-layout-13)): its container's words
 are followed by a byte per sub-range and frontier pair, the least rounded
 length code of the sub-range's postings whose bucket lies above the
@@ -1927,6 +1927,28 @@ a call through the level's dispatch even for three values. Every answer
 of the whole trace is PostgreSQL's (1,253, 1,228 and 1,252 queries equal),
 and `--full` outputs are f0962a8's byte for byte; on x86 both layouts give
 the same outputs in every style and mode.
+
+## Sub-range codes for grid groups (branch `loop/r10`, page layout 13)
+
+Not adopted: measured 2026-10-14 and left as a measured option. A grid container's words are followed by a byte
+per 1,024-slot sub-range and group-frontier pair (above), so a dense term's candidate is bounded by its sub-range,
+not its group's one frontier: +0.668% of the index at 150M rows (37,245,496,366 to 37,494,258,094 bytes), every
+segment verifying. Exact: `--full` outputs byte-identical to f0962a8's in every style, `--expect` 0 different over
+the whole trace.
+
+Against 36d92ae on aarch64 (`tnsreplay --forget`, two rounds; cycles, instructions in parentheses):
+
+| | conjunction | disjunction | phrase |
+| --- | --- | --- | --- |
+| tail trace, `full_score` | -24% (-21%) | -32% (-34%) | -22% (-23%) |
+| whole trace, `full_score` | +0.8 / +2.6% (+4.7%) | +16 to +18% (+15%) | +2.0 / +2.8% (+3.6%) |
+| score, 400 queries | +1.1% (+2.7%) | +8.5% (+11.8%) | -4.0 / +3.4% (+0.7%) |
+
+DL reads fell 65 / 54 / 45% over the whole trace and 76 / 76 / 65% on the tail, but the codes cost per (term,
+group) and per sub-range bounded: a disjunction bounds some 200K (term, group) entries a query, and the walk's code
+paths cost ~2.5% instructions even where no record has codes. On x86 (one round, latency): `full_score` -15 / +9 /
+-17%, score +21 / +8 / +11%, tail -30 / -41 / -31%. A frontier per sub-range pays only where a group's candidates
+reach the DL sidecar in bulk; a later attempt would need that bound at no cost per (term, group) elsewhere.
 
 ## Open
 
