@@ -116,6 +116,17 @@ pub trait Touch {
         _held: &[usize],
     ) {
     }
+
+    /// A lab oracle (off everywhere else): whether a led walk passes
+    /// group `g` unread, as a summary that rules it out would, before its
+    /// lead's container is loaded (`loaded` false) or once it is. The
+    /// oracle names only groups that end with no candidate, so answers
+    /// are unchanged; timing the walk with and without it measures what
+    /// those groups cost.
+    #[inline]
+    fn skip_group(&mut self, _g: u32, _loaded: bool) -> bool {
+        false
+    }
 }
 
 /// Reads recorded nowhere, for timing.

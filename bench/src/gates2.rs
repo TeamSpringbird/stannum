@@ -433,6 +433,21 @@ pub struct Census {
     /// query is modelled.
     pub or_every: usize,
     pub queries_seen: usize,
+    /// The last query's intersected groups: segment, group and the
+    /// combinations ([`combo`]) that rule it out, with [`DEAD`] when it
+    /// ended with no candidate (for the skip oracle, `--skips`).
+    pub skips: Vec<(u32, u32, u64)>,
+}
+
+/// The bit of [`Census::skips`] for a group that ended empty.
+pub const DEAD: u64 = 1 << 63;
+
+/// The bit of [`Census::skips`] for a scope, form and least member count.
+pub fn combo_bit(scope: &str, form: &str, min: u32) -> Option<u64> {
+    let scope = SCOPES.iter().position(|s| *s == scope)?;
+    let f = FORMS.iter().position(|s| *s == form)?;
+    let ti = THRESHOLDS.iter().position(|t| *t == min)?;
+    Some(1 << combo(scope, f, ti))
 }
 
 impl Census {
@@ -455,6 +470,7 @@ impl Census {
         segments: &[Segment<'static>],
     ) {
         self.queries_seen += 1;
+        self.skips.clear();
         let mut and_seen = false;
         let mut or_events: Vec<(usize, u32, Option<f32>, Vec<usize>)> = Vec::new();
         for e in events {
@@ -596,6 +612,9 @@ impl Census {
         st.intersected += 1;
         let empty_final = *left.last().expect("a lead") == 0;
         st.empty_final += u64::from(empty_final);
+        let skip = self.skips.len();
+        self.skips
+            .push((seg as u32, g, if empty_final { DEAD } else { 0 }));
         let lead = tg[0].expect("the lead holds the group");
         if req.len() < 2 {
             emit(&avoided);
@@ -649,6 +668,7 @@ impl Census {
                     }
                     st.masks_read[scope][f][ti] += read;
                     if absent || mask.iter().all(|w| *w == 0) {
+                        self.skips[skip].2 |= 1 << combo(scope, f, ti);
                         st.ruled[scope][f][ti] += 1;
                         if mask.iter().any(|w| *w != 0) {
                             st.presence_ruled[scope][f][ti] += 1;

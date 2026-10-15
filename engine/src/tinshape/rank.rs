@@ -1543,6 +1543,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.answer.windows_pruned += 1;
                 continue;
             }
+            if self.touch.skip_group(g, false) {
+                continue;
+            }
             if self.mems[lead].loaded != g + 1 {
                 let set = self.terms[lead].as_mut().expect("the lead");
                 load(
@@ -1676,6 +1679,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// probing its high bits in place, any other list by a merge. Then walks
     /// the candidates left.
     fn group_and(&mut self, g: u32) -> Result<bool> {
+        if self.touch.skip_group(g, true) {
+            return Ok(true);
+        }
         let mut cands = std::mem::take(&mut self.cands);
         cands.clear();
         let lead = &self.mems[self.req[0]];

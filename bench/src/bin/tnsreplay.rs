@@ -51,6 +51,12 @@
 //! N3(a)'s tallies and N3(c)'s DL reads go to DIR, tagged `score` or
 //! `full`; `--census-or-every N` models every Nth disjunction only;
 //! `--census-sizes` also writes the index-wide sizes and length histogram.
+//! With `--census`, `--skips-out FILE` writes each intersected group with
+//! the combinations that rule it out; `--skips FILE:VARIANT:pre|post`
+//! (with `--timed-walk`) times the walk with an oracle passing those groups
+//! unread (VARIANT `dead`, every group that ended empty, or
+//! `SCOPE/FORM/MIN`, e.g. `all/page256/16`), before its lead's container is
+//! loaded or once it is: what the groups a presence mask rules out cost.
 //!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
@@ -124,6 +130,10 @@ struct Args {
     census: Option<PathBuf>,
     census_or_every: usize,
     census_sizes: bool,
+    skips_out: Option<PathBuf>,
+    /// `--skips`: the file, the variant's bit, and whether a group is passed
+    /// once its lead is loaded.
+    skips: Option<(PathBuf, u64, bool)>,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -148,7 +158,8 @@ fn usage() -> ! {
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
          [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
-         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK]"
+         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK] [--census DIR [--census-or-every N] [--census-sizes] [--skips-out FILE]] \
+         [--skips FILE:VARIANT:pre|post]"
     );
     std::process::exit(2)
 }
@@ -184,6 +195,8 @@ fn args() -> Args {
         census: None,
         census_or_every: 1,
         census_sizes: false,
+        skips_out: None,
+        skips: None,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -247,6 +260,27 @@ fn args() -> Args {
                 a.census_or_every = value(&mut it).parse().unwrap_or_else(|_| usage());
             }
             "--census-sizes" => a.census_sizes = true,
+            "--skips-out" => a.skips_out = Some(value(&mut it).into()),
+            "--skips" => {
+                let v = value(&mut it);
+                let f: Vec<&str> = v.rsplitn(3, ':').collect();
+                let [at, variant, file] = f[..] else { usage() };
+                let bit = match variant {
+                    "dead" => bench::gates2::DEAD,
+                    _ => {
+                        let p: Vec<&str> = variant.split('/').collect();
+                        let [scope, form, min] = p[..] else { usage() };
+                        let min = min.parse().unwrap_or_else(|_| usage());
+                        bench::gates2::combo_bit(scope, form, min).unwrap_or_else(|| usage())
+                    }
+                };
+                let post = match at {
+                    "pre" => false,
+                    "post" => true,
+                    _ => usage(),
+                };
+                a.skips = Some((file.into(), bit, post));
+            }
             _ => usage(),
         }
     }
@@ -862,6 +896,7 @@ impl Reader {
         seed: Option<&[(f32, Tid)]>,
         order: SegmentOrder,
         answer: &[(f32, Tid)],
+        skips: Option<(&[Vec<u32>], bool)>,
     ) -> Option<Vec<(f32, Tid)>> {
         let mut names = Vec::new();
         let node = tin::lower(&scorer.query, &mut names)?;
@@ -873,8 +908,21 @@ impl Reader {
         let mut visibility = Unseeded(seed.unwrap_or(&[]).iter().map(|row| row.1).collect());
         for i in visit {
             self.segs[i]
-                .with(&names, |segment| {
-                    tin::top_k_into(
+                .with(&names, |segment| match skips {
+                    Some((lists, post)) => tin::top_k_into(
+                        segment,
+                        &node,
+                        &names,
+                        &scorer.terms,
+                        &mut top,
+                        &mut visibility,
+                        &mut Skips {
+                            groups: lists.get(i).map_or(&[], Vec::as_slice),
+                            at: 0,
+                            post,
+                        },
+                    ),
+                    None => tin::top_k_into(
                         segment,
                         &node,
                         &names,
@@ -882,7 +930,7 @@ impl Reader {
                         &mut top,
                         &mut visibility,
                         &mut NoTouch,
-                    )
+                    ),
                 })
                 .ok()?;
         }
@@ -1092,6 +1140,61 @@ impl tin::Touch for Offset<'_> {
             held: held.to_vec(),
         });
     }
+}
+
+/// The skip oracle (`--skips`): a segment's groups to pass unread, in
+/// order (a walk reaches its groups in order).
+struct Skips<'a> {
+    groups: &'a [u32],
+    at: usize,
+    post: bool,
+}
+
+impl tin::Touch for Skips<'_> {
+    #[inline]
+    fn touch(&mut self, _: Part, _: usize, _: usize) {}
+
+    #[inline]
+    fn skip_group(&mut self, g: u32, loaded: bool) -> bool {
+        if loaded != self.post {
+            return false;
+        }
+        while self.at < self.groups.len() && self.groups[self.at] < g {
+            self.at += 1;
+        }
+        self.groups.get(self.at) == Some(&g)
+    }
+}
+
+/// `--skips`' groups per query name, then per segment.
+fn read_skips(
+    path: &std::path::Path,
+    bit: u64,
+) -> Result<FxHashMap<String, Vec<Vec<u32>>>, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
+    let mut out: FxHashMap<String, Vec<Vec<u32>>> = FxHashMap::default();
+    for line in text.lines() {
+        let f: Vec<&str> = line.split('\t').collect();
+        let [name, seg, g, bits] = f[..] else {
+            return Err(format!("--skips: a bad line {line:?}"));
+        };
+        let bits = u64::from_str_radix(bits, 16).map_err(|e| e.to_string())?;
+        let lists = out.entry(name.to_owned()).or_default();
+        if bits & bit == 0 {
+            continue;
+        }
+        let seg: usize = seg.parse().map_err(|_| "--skips: a segment")?;
+        if lists.len() <= seg {
+            lists.resize(seg + 1, Vec::new());
+        }
+        lists[seg].push(g.parse().map_err(|_| "--skips: a group")?);
+    }
+    for lists in out.values_mut() {
+        for list in lists {
+            list.sort_unstable();
+        }
+    }
+    Ok(out)
 }
 
 trait Meta {
@@ -1318,6 +1421,12 @@ fn run() -> Result<bool, String> {
         Vec::new()
     };
     let mut census = bench::gates2::Census::new(args.census_or_every);
+    let mut skips_out = String::new();
+    let skips = match &args.skips {
+        Some((path, bit, _)) => Some(read_skips(path, *bit)?),
+        None => None,
+    };
+    let no_skips: Vec<Vec<u32>> = Vec::new();
     if let Some(dir) = &args.census
         && args.census_sizes
     {
@@ -1334,6 +1443,12 @@ fn run() -> Result<bool, String> {
     for (n, q) in trace.iter().enumerate() {
         reader.full.set(fulls[n]);
         let scorer = reader.scorer(&q.text)?;
+        let skip = skips.as_ref().map(|s| {
+            (
+                s.get(&q.name).unwrap_or(&no_skips).as_slice(),
+                args.skips.as_ref().is_some_and(|s| s.2),
+            )
+        });
         // Warm pass (also the answer, and what it decoded of the terms'
         // metadata), then timed passes.
         segment::tinshape::segment::reset_memo_counts();
@@ -1375,15 +1490,20 @@ fn run() -> Result<bool, String> {
                     Some(warm.0.as_slice()),
                     args.order,
                     &answer,
+                    skip,
                 ));
             } else if args.timed_walk {
-                std::hint::black_box(reader.walked(
+                let rows = std::hint::black_box(reader.walked(
                     &scorer,
                     args.k,
                     args.seed.then_some(answer.as_slice()),
                     args.order,
                     &answer,
+                    skip,
                 ));
+                if skip.is_some() && !args.seed && rows.as_ref() != Some(&answer) {
+                    return Err(format!("--skips changed the answer of {}", q.name));
+                }
             } else {
                 std::hint::black_box(reader.ranked(&scorer, args.k));
             }
@@ -1458,6 +1578,11 @@ fn run() -> Result<bool, String> {
                 &scorer.terms,
                 &census_segs,
             );
+            if args.skips_out.is_some() {
+                for &(seg, g, bits) in &census.skips {
+                    let _ = writeln!(skips_out, "{}\t{seg}\t{g}\t{bits:x}", q.name);
+                }
+            }
             if (n + 1) % 50 == 0 {
                 eprintln!("census: {} of {}", n + 1, trace.len());
             }
@@ -1488,6 +1613,9 @@ fn run() -> Result<bool, String> {
         census
             .write(dir, if args.full { "full" } else { "score" })
             .map_err(|e| e.to_string())?;
+    }
+    if let Some(path) = &args.skips_out {
+        std::fs::write(path, &skips_out).map_err(|e| e.to_string())?;
     }
     if let Some(path) = &args.warm {
         std::fs::write(path, &warm_out).map_err(|e| e.to_string())?;
