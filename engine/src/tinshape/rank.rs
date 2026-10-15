@@ -1689,11 +1689,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let lead = self.req[0];
         let set = self.terms[lead].as_ref().expect("the lead");
         let i = self.mems[lead].hint + 1;
-        set.prefetch_entry(i + 1, AHEAD_LINES);
+
         let Some(next) = set.prefetch_entry(i, AHEAD_LINES) else {
             return Ok(());
         };
-        let members = read_ahead(set, self.geometry, i, &mut self.ahead)?;
+        let members = false;
         for &t in &self.req[1..] {
             let set = self.terms[t].as_ref().expect("required");
             let mem = &mut self.mems[t];
