@@ -11,7 +11,8 @@
 //! cargo run -p bench --release --bin tnsreplay -- --dump DIR --trace trace.tsv \
 //!     [--expect pg.tsv] [--style S] [--k 10] [--repeat 3] [--limit N] \
 //!     [--keep] [--threads N] [--seconds S] [--per-query FILE] [--out FILE] \
-//!     [--per-segment FILE] [--order O] [--seed] [--warm FILE] [--timed-walk]
+//!     [--per-segment FILE] [--order O] [--seed] [--warm FILE] [--timed-walk] \
+//!     [--plan STYLE:MODE:N,...] [--perf-ctl CTL,ACK]
 //! ```
 //!
 //! Each segment is read from memory and kept across queries with its
@@ -36,6 +37,15 @@
 //! the first segment, scored as OR rows and kept as seeded rows are; FILE
 //! gets per query the threshold they give and the final one;
 //! `--warm-untimed` takes it before the timed walks (a free warm-up).
+//!
+//! `--plan conjunction:score:300,disjunction:full:200,...` replays several
+//! slices of the trace after one load (the first N queries of a style,
+//! ranked as `score` or as `full`), each reported as its own style (a full
+//! one as `STYLE+full`). The timed passes' instructions, cycles and branch
+//! misses are counted in the process (Linux: `perf_event_open`, user space
+//! only; macOS: `proc_pid_rusage`, no branch misses); `--perf-ctl CTL,ACK`
+//! turns an outside `perf stat` or `perf record` (`-D -1 --control
+//! fifo:CTL,ACK`) on around each timed pass only.
 //!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
@@ -100,6 +110,12 @@ struct Args {
     /// time only the walk it starts (what a free warm-up would save).
     warm_untimed: bool,
     out: Option<PathBuf>,
+    /// `--plan`: (style, full, queries) slices replayed after one load.
+    plan: Vec<(String, bool, usize)>,
+    /// `--perf-ctl CTL,ACK`: perf's control and ack FIFOs; counting is
+    /// enabled around each timed pass only (not the load, the answer's
+    /// pass or the instrumented one).
+    perf_ctl: Option<(PathBuf, PathBuf)>,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -123,7 +139,8 @@ fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
-         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE]"
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
+         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK]"
     );
     std::process::exit(2)
 }
@@ -154,6 +171,8 @@ fn args() -> Args {
         warm: None,
         warm_untimed: false,
         out: None,
+        plan: Vec::new(),
+        perf_ctl: None,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -194,6 +213,24 @@ fn args() -> Args {
                 }
             }
             "--out" => a.out = Some(value(&mut it).into()),
+            "--plan" => {
+                for slice in value(&mut it).split(',') {
+                    let f: Vec<&str> = slice.split(':').collect();
+                    let [style, mode, n] = f[..] else { usage() };
+                    let full = match mode {
+                        "score" => false,
+                        "full" => true,
+                        _ => usage(),
+                    };
+                    let n = n.parse().unwrap_or_else(|_| usage());
+                    a.plan.push((style.to_owned(), full, n));
+                }
+            }
+            "--perf-ctl" => {
+                let v = value(&mut it);
+                let (ctl, ack) = v.split_once(',').unwrap_or_else(|| usage());
+                a.perf_ctl = Some((ctl.into(), ack.into()));
+            }
             _ => usage(),
         }
     }
@@ -598,7 +635,8 @@ struct Reader {
     tokenizer: tokenizer::CompiledTokenizerPipeline,
     params: engine::bm25::Bm25Params,
     stop: Option<String>,
-    full: bool,
+    /// Rank as `full_score` (set per query with `--plan`).
+    full: std::cell::Cell<bool>,
     segs: Vec<Seg>,
 }
 
@@ -673,7 +711,7 @@ impl Reader {
             tokenizer,
             params: loaded.params,
             stop: loaded.stop_words.clone(),
-            full: args.full,
+            full: std::cell::Cell::new(args.full),
             segs,
         })
     }
@@ -693,7 +731,7 @@ impl Reader {
         let stop = self.stop.as_deref().and_then(ScoreStopWords::from_csv);
         let policy = ScoringPolicy {
             params: self.params,
-            full: self.full,
+            full: self.full.get(),
             dense: DenseRatio::new(Some(DenseRatio::DEFAULT)),
             edit: &edit,
             stop: stop.as_ref(),
@@ -1088,8 +1126,9 @@ struct Row {
     /// then walking it.
     scorer_allocs: Allocs,
     walk_allocs: Allocs,
-    /// Instructions and cycles of the timed passes, all of them.
-    timed: (u64, u64),
+    /// Instructions, cycles and branch misses of the timed passes, all of
+    /// them.
+    timed: [u64; 3],
     /// The instrumented pass, per segment in the order walked.
     segments: Vec<SegmentWork>,
 }
@@ -1177,6 +1216,22 @@ fn run() -> Result<bool, String> {
     if let Some(n) = args.limit {
         trace.truncate(n);
     }
+    let mut fulls = vec![args.full; trace.len()];
+    if !args.plan.is_empty() {
+        let mut sliced = Vec::new();
+        fulls.clear();
+        for (style, full, n) in &args.plan {
+            for q in trace.iter().filter(|q| &q.style == style).take(*n) {
+                let mut q = q.clone();
+                if *full {
+                    q.style.push_str("+full");
+                }
+                sliced.push(q);
+                fulls.push(*full);
+            }
+        }
+        trace = sliced;
+    }
     let loaded = load(&args.dump)?;
     if args.threads > 0 {
         throughput(&args, &loaded, &trace)?;
@@ -1189,6 +1244,7 @@ fn run() -> Result<bool, String> {
         reader.segs.len(),
         start.elapsed().as_secs_f64()
     );
+    let mut perf = PerfCtl::open(args.perf_ctl.as_ref()).map_err(|e| format!("--perf-ctl: {e}"))?;
     let mut rows = Vec::new();
     let mut warm_out = String::from(
         "name\tstyle\twarm_rows\ttheta_warm\ttheta_final\twarm_in_final\tand_examined\tand_scored\n",
@@ -1196,6 +1252,7 @@ fn run() -> Result<bool, String> {
     let mut unsupported = 0usize;
     let mut mismatched = 0usize;
     for (n, q) in trace.iter().enumerate() {
+        reader.full.set(fulls[n]);
         let scorer = reader.scorer(&q.text)?;
         // Warm pass (also the answer, and what it decoded of the terms'
         // metadata), then timed passes.
@@ -1220,6 +1277,7 @@ fn run() -> Result<bool, String> {
             if args.forget {
                 reader.forget();
             }
+            perf.send(b"enable\n");
             let at = Instant::now();
             let a0 = Allocs::now();
             let scorer = reader.scorer(&q.text)?;
@@ -1251,10 +1309,11 @@ fn run() -> Result<bool, String> {
             }
             let a2 = Allocs::now();
             times.push(at.elapsed().as_nanos() as u64);
+            perf.send(b"disable\n");
             (scorer_allocs, walk_allocs) = (a1.since(a0), a2.since(a1));
         }
         let counters1 = process_counters();
-        let timed = (counters1.0 - counters0.0, counters1.1 - counters0.1);
+        let timed: [u64; 3] = std::array::from_fn(|i| counters1[i] - counters0[i]);
         let mut pages = Pages::default();
         let pins0 = PINS.get();
         let hash0 = REFS.with_borrow_mut(|refs| {
@@ -1538,15 +1597,16 @@ fn run() -> Result<bool, String> {
         );
     }
     println!(
-        "\ninstructions and cycles of the timed passes, all queries (where the OS counts them)"
+        "\ninstructions, cycles and branch misses of the timed passes, all queries (where the OS counts them)"
     );
     for style in &styles {
         let of: Vec<&Row> = rows.iter().filter(|r| &r.style == style).collect();
         println!(
-            "{:<12} timed instructions {:.3}G cycles {:.3}G",
+            "{:<12} timed instructions {:.3}G cycles {:.3}G branch misses {:.3}M",
             style,
-            of.iter().map(|r| r.timed.0).sum::<u64>() as f64 / 1e9,
-            of.iter().map(|r| r.timed.1).sum::<u64>() as f64 / 1e9,
+            of.iter().map(|r| r.timed[0]).sum::<u64>() as f64 / 1e9,
+            of.iter().map(|r| r.timed[1]).sum::<u64>() as f64 / 1e9,
+            of.iter().map(|r| r.timed[2]).sum::<u64>() as f64 / 1e6,
         );
     }
     println!(
@@ -1662,6 +1722,31 @@ fn run() -> Result<bool, String> {
     Ok(differ == 0 && mismatched == 0)
 }
 
+/// perf's control FIFO (`--perf-ctl`): each command waits for perf's ack,
+/// so the counters are on exactly while a timed pass runs.
+struct PerfCtl(Option<(std::fs::File, std::fs::File)>);
+
+impl PerfCtl {
+    fn open(paths: Option<&(PathBuf, PathBuf)>) -> std::io::Result<Self> {
+        Ok(Self(match paths {
+            Some((ctl, ack)) => Some((
+                std::fs::OpenOptions::new().write(true).open(ctl)?,
+                std::fs::File::open(ack)?,
+            )),
+            None => None,
+        }))
+    }
+
+    fn send(&mut self, command: &[u8]) {
+        use std::io::{Read, Write};
+        if let Some((ctl, ack)) = &mut self.0 {
+            ctl.write_all(command).expect("perf control FIFO");
+            let mut reply = [0u8; 5];
+            ack.read_exact(&mut reply).expect("perf ack FIFO");
+        }
+    }
+}
+
 fn main() {
     match run() {
         Ok(true) => {}
@@ -1673,11 +1758,13 @@ fn main() {
     }
 }
 
-/// The process's instructions retired and cycles so far, where the OS
-/// counts them (macOS: `proc_pid_rusage`, as `time -l` reports them);
-/// zero elsewhere. Taken around the timed passes only, they leave out
-/// loading the dump and the instrumented pass.
-fn process_counters() -> (u64, u64) {
+/// Instructions, cycles and branch misses this thread ran so far in user
+/// space (Linux: a `perf_event_open` group opened on first use; macOS:
+/// `proc_pid_rusage`'s instructions and cycles, as `time -l` reports them,
+/// no branch misses); zero where neither counts them. Taken around the
+/// timed passes only, they leave out loading the dump and the
+/// instrumented pass.
+fn process_counters() -> [u64; 3] {
     #[cfg(target_os = "macos")]
     {
         unsafe extern "C" {
@@ -1689,10 +1776,84 @@ fn process_counters() -> (u64, u64) {
         let mut info = [0u64; 2 + 40];
         // SAFETY: RUSAGE_INFO_V4 (4) into a buffer larger than the struct.
         if unsafe { proc_pid_rusage(getpid(), 4, info.as_mut_ptr()) } == 0 {
-            return (info[2 + 29], info[2 + 30]);
+            return [info[2 + 29], info[2 + 30], 0];
         }
     }
-    (0, 0)
+    #[cfg(target_os = "linux")]
+    if let Some(counts) = linux_counters::counts() {
+        return counts;
+    }
+    [0; 3]
+}
+
+/// The Linux side of [`process_counters`]: this thread's hardware
+/// instructions (the group's leader), cycles and branch misses in user
+/// space, read together.
+#[cfg(target_os = "linux")]
+mod linux_counters {
+    use std::sync::OnceLock;
+
+    /// `struct perf_event_attr` up to `PERF_ATTR_SIZE_VER0` (64 bytes).
+    #[repr(C)]
+    #[derive(Default)]
+    struct Attr {
+        kind: u32,
+        size: u32,
+        config: u64,
+        sample_period: u64,
+        sample_type: u64,
+        read_format: u64,
+        flags: u64,
+        wakeup_events: u32,
+        bp_type: u32,
+        config1: u64,
+    }
+
+    unsafe extern "C" {
+        fn syscall(number: i64, ...) -> i64;
+        fn read(fd: i32, buffer: *mut u64, bytes: usize) -> isize;
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    const PERF_EVENT_OPEN: i64 = 298;
+    #[cfg(target_arch = "aarch64")]
+    const PERF_EVENT_OPEN: i64 = 241;
+    /// `PERF_COUNT_HW_INSTRUCTIONS`, `_CPU_CYCLES`, `_BRANCH_MISSES`.
+    const EVENTS: [u64; 3] = [1, 0, 5];
+    /// `exclude_kernel` and `exclude_hv`.
+    const USER_ONLY: u64 = 1 << 5 | 1 << 6;
+    /// `PERF_FORMAT_GROUP`.
+    const GROUP: u64 = 1 << 3;
+
+    fn open(config: u64, leader: i32) -> Option<i32> {
+        let attr = Attr {
+            size: std::mem::size_of::<Attr>() as u32,
+            config,
+            read_format: GROUP,
+            flags: USER_ONLY,
+            ..Attr::default() // kind 0: PERF_TYPE_HARDWARE
+        };
+        // SAFETY: perf_event_open(attr, this thread, any CPU, leader, 0)
+        // reads the attribute only during the call.
+        let fd = unsafe { syscall(PERF_EVENT_OPEN, &raw const attr, 0i32, -1i32, leader, 0u64) };
+        (fd >= 0).then_some(fd as i32)
+    }
+
+    pub(super) fn counts() -> Option<[u64; 3]> {
+        static LEADER: OnceLock<Option<i32>> = OnceLock::new();
+        let leader = (*LEADER.get_or_init(|| {
+            let leader = open(EVENTS[0], -1)?;
+            for config in &EVENTS[1..] {
+                open(*config, leader)?;
+            }
+            Some(leader)
+        }))?;
+        // `{ nr, values[nr] }`, in the order the events were opened.
+        let mut group = [0u64; 4];
+        // SAFETY: at most the buffer's 32 bytes.
+        let got = unsafe { read(leader, group.as_mut_ptr(), 32) };
+        (got == 32 && group[0] == 3).then(|| [group[1], group[2], group[3]])
+    }
 }
 
 /// The process's user and system CPU seconds so far (`getrusage`).
