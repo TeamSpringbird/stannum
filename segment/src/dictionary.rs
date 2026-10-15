@@ -415,7 +415,6 @@ impl<'a> Dictionary<'a> {
             reader: Reader::new(self.blocks.block(range)?),
             remaining_in_block: self.index.block_terms(block),
             term: Vec::new(),
-            previous: Vec::new(),
             payload_end: 0,
             ordinals_end: 0,
         })
@@ -519,11 +518,9 @@ struct Walker<'a> {
     block: usize,
     reader: Reader<'a>,
     remaining_in_block: usize,
+    /// The term at hand: the next one keeps its shared prefix in place and
+    /// replaces the rest by its suffix.
     term: Vec<u8>,
-    /// The term before `term`: its buffer swapped with `term`'s each step,
-    /// so a walk over a block reuses two buffers rather than allocating one
-    /// per entry.
-    previous: Vec<u8>,
     /// Where the previous entry's extents ended, for the gaps.
     payload_end: u64,
     ordinals_end: u64,
@@ -537,14 +534,20 @@ impl<'a> Walker<'a> {
         }
         let suffix_len = self.reader.varint_u32()? as usize;
         let suffix = self.reader.take(suffix_len)?;
-        std::mem::swap(&mut self.term, &mut self.previous);
-        self.term.clear();
-        self.term.extend_from_slice(&self.previous[..shared]);
-        self.term.extend_from_slice(suffix);
-        let previous = &self.previous;
-        if self.term.is_empty() || (!previous.is_empty() && *previous >= self.term) {
+        // Past the term before (any non-empty term at a block's start): with
+        // the prefix shared, exactly when the suffix is past the rest of the
+        // term before, which its first byte most often decides.
+        let rest = &self.term[shared..];
+        let after = match (suffix.first(), rest.first()) {
+            (Some(s), Some(r)) if s != r => s > r,
+            (Some(_), None) => true,
+            _ => suffix > rest,
+        };
+        if !after {
             return Err(Error::Corrupt("dictionary term order"));
         }
+        self.term.truncate(shared);
+        self.term.extend_from_slice(suffix);
         let df_bucket = self.reader.varint()?;
         let df = u32::try_from(df_bucket >> 4).map_err(|_| Error::Corrupt("dictionary df"))?;
         let max_tf_bucket = (df_bucket & 0xf) as u8;
@@ -713,6 +716,61 @@ mod tests {
         assert_eq!(tail, terms[298..]);
         assert_eq!(dictionary.prefix("zzz").count(), 0);
         assert_eq!(dictionary.iter_from("a").count(), 300);
+    }
+
+    /// One block of entries `(shared, suffix)` as written, whatever their
+    /// order, each with zero extents.
+    fn block_of(entries: &[(u64, &str)]) -> Vec<u8> {
+        let mut block = Vec::new();
+        for &(shared, suffix) in entries {
+            varint::put(&mut block, shared);
+            varint::put(&mut block, suffix.len() as u64);
+            block.extend_from_slice(suffix.as_bytes());
+            block.extend_from_slice(&[1 << 4, 0, 0, 0, 0]);
+        }
+        let first = &entries[0].1;
+        let mut index = Vec::new();
+        varint::put(&mut index, 0);
+        varint::put(&mut index, first.len() as u64);
+        index.extend_from_slice(first.as_bytes());
+        let mut out = Vec::new();
+        varint::put(&mut out, entries.len() as u64);
+        varint::put(&mut out, 1);
+        varint::put(&mut out, index.len() as u64);
+        out.extend_from_slice(&index);
+        out.extend_from_slice(&block);
+        out
+    }
+
+    /// A term must sort after the one before it however its prefix is
+    /// shared (a writer need not share the longest), and an entry that
+    /// does not is corrupt.
+    #[test]
+    fn walking_a_block_checks_each_term_follows_the_last() {
+        let terms = |entries: &[(u64, &str)]| -> Result<Vec<String>> {
+            let bytes = block_of(entries);
+            let owned = OwnedDictionary::parse(&bytes)?;
+            owned.view().iter().map(|r| r.map(|(t, _)| t)).collect()
+        };
+        assert_eq!(
+            terms(&[(0, "ab"), (1, "c"), (0, "acd"), (3, "e"), (4, "")]).ok(),
+            None,
+            "an empty suffix repeats the term"
+        );
+        assert_eq!(
+            terms(&[(0, "ab"), (1, "c"), (0, "acd"), (3, "e"), (2, "")]).ok(),
+            None,
+            "a prefix of the term before"
+        );
+        assert_eq!(
+            terms(&[(0, "ab"), (1, "c"), (0, "acd"), (3, "e"), (2, "e")]).unwrap(),
+            ["ab", "ac", "acd", "acde", "ace"]
+        );
+        assert!(terms(&[(0, "ab"), (0, "aa")]).is_err());
+        assert!(terms(&[(0, "ab"), (1, "b")]).is_err());
+        assert!(terms(&[(0, "ab"), (0, "ab")]).is_err());
+        assert!(terms(&[(0, "ab"), (0, "abc")]).is_ok());
+        assert!(terms(&[(0, "")]).is_err());
     }
 
     /// Samples searched by key (a term's first eight bytes): many samples,
