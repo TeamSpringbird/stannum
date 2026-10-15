@@ -3956,9 +3956,9 @@ mod tests {
         }
     }
 
-    /// A disjunction's candidate's unread terms are tracked in one word up
-    /// to 64 and in several past that (`rank::Unread`): with 70 words, most
-    /// in nearly every document, candidates hold more than 64, and the
+    /// Disjunctions of more than 64 words (as a pick of a candidate's
+    /// unread terms from a u64 mask would have to handle): with 70 words,
+    /// most in nearly every document, candidates hold more than 64, and the
     /// rows kept are a brute force's, bit for bit.
     #[test]
     fn disjunctions_of_more_than_64_words_keep_the_exact_top_rows() {

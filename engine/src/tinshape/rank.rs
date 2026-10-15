@@ -819,69 +819,6 @@ fn cut_by(bar: Option<(f32, Tid)>, bound: f32, from: impl FnOnce() -> Tid) -> bo
     }
 }
 
-/// A disjunction's candidate's held terms whose bucket is not read yet,
-/// by their places in [`Walk::held_list`] ([`Walk::or_reads`]): a `u64`
-/// for up to 64 terms, kept in a register, else a [`WideUnread`].
-trait Unread {
-    /// Calls `f` with each place, in order.
-    fn each(&self, f: impl FnMut(usize));
-    /// Whether place `p` is in it.
-    fn has(&self, p: usize) -> bool;
-    /// Takes place `p` out.
-    fn remove(&mut self, p: usize);
-}
-
-impl Unread for u64 {
-    #[inline(always)]
-    fn each(&self, mut f: impl FnMut(usize)) {
-        let mut rest = *self;
-        while rest != 0 {
-            f(rest.trailing_zeros() as usize);
-            rest &= rest - 1;
-        }
-    }
-
-    #[inline(always)]
-    fn has(&self, p: usize) -> bool {
-        *self >> p & 1 == 1
-    }
-
-    #[inline(always)]
-    fn remove(&mut self, p: usize) {
-        *self &= !(1 << p);
-    }
-}
-
-/// [`Unread`] for more than 64 terms: a `u64` a 64 places.
-struct WideUnread(Vec<u64>);
-
-impl WideUnread {
-    /// Places `0..n`.
-    fn all(n: usize) -> Self {
-        let mut words = vec![u64::MAX; n.div_ceil(64)];
-        if !n.is_multiple_of(64) {
-            words[n / 64] = (1 << (n % 64)) - 1;
-        }
-        WideUnread(words)
-    }
-}
-
-impl Unread for WideUnread {
-    fn each(&self, mut f: impl FnMut(usize)) {
-        for (w, word) in self.0.iter().enumerate() {
-            word.each(|p| f(w * 64 + p));
-        }
-    }
-
-    fn has(&self, p: usize) -> bool {
-        self.0[p / 64].has(p % 64)
-    }
-
-    fn remove(&mut self, p: usize) {
-        self.0[p / 64].remove(p % 64);
-    }
-}
-
 /// A scoring term a group's candidates are sieved by ([`Walk::sieve`]): a
 /// grouped term whose members in the group are a bitmap or a list.
 #[derive(Clone, Copy)]
@@ -1375,9 +1312,6 @@ struct Walk<'s, 'a, T: Touch> {
     /// candidate at hand holds, both in the scorer's order.
     present_list: Vec<usize>,
     held_list: Vec<usize>,
-    /// Room for a disjunction's candidate's held terms' places in
-    /// `present_list` (see [`Walk::or_stage`]).
-    held_places: Vec<usize>,
     /// A disjunction's word at hand (`usize::MAX` for none yet in the
     /// group): per present term (as `present_list` orders them), its word
     /// of members there and the posting index of the first.
@@ -3135,7 +3069,6 @@ pub(super) fn walk_into<'s, 'a>(
         present: vec![false; n],
         present_list: Vec::with_capacity(n),
         held_list: Vec::with_capacity(n),
-        held_places: vec![0; n],
         cand_w: usize::MAX,
         cand_words: Vec::with_capacity(n),
         cand_base: Vec::with_capacity(n),
@@ -4127,40 +4060,27 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.or_word(w);
         }
         let below = (1u64 << bit) - 1;
-        // The places of the present terms it holds, gathered without a
-        // branch on its bit: each place is stored, and kept by its bit.
-        let mut held = 0;
-        let places = &mut self.held_places[..];
-        for (p, word) in self.cand_words.iter().enumerate() {
-            places[held] = p;
-            held += (word >> bit & 1) as usize;
-        }
         self.held_list.clear();
-        // The first pick of `or_reads`, folded here (see `Walk::or_pick`).
-        let mut top = usize::MAX;
-        let mut best = f32::NEG_INFINITY;
-        for h in 0..held {
-            let p = self.held_places[h];
+        for p in 0..self.present_list.len() {
             let i = self.present_list[p];
             let word = self.cand_words[p];
-            self.held_list.push(i);
-            // A member's block is its posting index's: the footer is decoded
-            // whole (`Sc::decode_all`), and its blocks hold `block_size`
-            // postings each.
-            let index = self.cand_base[p] + (word & below).count_ones();
-            debug_assert_eq!(index, self.row_index(i, local));
-            self.held_index[i] = index;
-            let entry = self.row_state[i].entry;
-            let s = &mut self.sc[i];
-            let b = s.block_of(index, entry);
-            debug_assert_eq!(Some(b), s.block_at(slot));
-            self.blocks[i] = b;
-            let v = s.bound(b);
-            self.held_bound[i] = v;
-            bound += v;
-            let take = v > best;
-            best = if take { v } else { best };
-            top = if take { h } else { top };
+            if word >> bit & 1 == 1 {
+                self.held_list.push(i);
+                // A member's block is its posting index's: the footer is
+                // decoded whole (`Sc::decode_all`), and its blocks hold
+                // `block_size` postings each.
+                let index = self.cand_base[p] + (word & below).count_ones();
+                debug_assert_eq!(index, self.row_index(i, local));
+                self.held_index[i] = index;
+                let entry = self.row_state[i].entry;
+                let s = &mut self.sc[i];
+                let b = s.block_of(index, entry);
+                debug_assert_eq!(Some(b), s.block_at(slot));
+                self.blocks[i] = b;
+                let v = s.bound(b);
+                self.held_bound[i] = v;
+                bound += v;
+            }
         }
         if self.cut(bound, tid) {
             return Ok(None);
@@ -4179,60 +4099,27 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // threshold, before their TF is read. The bounds are summed in the
         // scorer's order, each no lower than its term's score, so the sum
         // bounds the candidate.
-        //
-        // The terms whose bucket is not read yet are a mask over their
-        // places in `held_list` (in a register, with no more than 64), the
-        // next one picked by its bound alone, with no test of a bucket stored
-        // a moment before (on x86-64, glibc's `memset` stores a short run
-        // with one AVX-512 masked store, which no load is forwarded from).
         self.buckets.fill(NO_BUCKET);
-        let held = self.held_list.len();
-        if held <= 64 {
-            let unread = u64::MAX.checked_shr(64 - held as u32).unwrap_or(0);
-            self.or_reads(unread, top, bound, tid)
-        } else {
-            self.or_reads_wide(top, bound, tid)
-        }
-    }
-
-    /// [`Walk::or_reads`] for more than 64 held terms, kept out of the
-    /// candidate step's code.
-    #[cold]
-    #[inline(never)]
-    fn or_reads_wide(
-        &mut self,
-        first: usize,
-        reach: f32,
-        tid: impl Fn() -> Tid + Copy,
-    ) -> Result<Option<(f32, u32)>> {
-        let unread = WideUnread::all(self.held_list.len());
-        self.or_reads(unread, first, reach, tid)
-    }
-
-    /// Reads the buckets of the candidate at hand's held terms (by their
-    /// places in [`Walk::held_list`], those in `unread`), the term bounding
-    /// it highest first, while it is left in reach: see [`Walk::or_stage`],
-    /// whose result this is, `reach` its bound before any bucket is read
-    /// and `first` [`Walk::or_pick`]'s first pick.
-    #[inline(always)]
-    fn or_reads<U: Unread>(
-        &mut self,
-        mut unread: U,
-        first: usize,
-        mut reach: f32,
-        tid: impl Fn() -> Tid + Copy,
-    ) -> Result<Option<(f32, u32)>> {
         let mut floor = 0u32;
-        let mut next = (first != usize::MAX).then_some(first);
-        while let Some(top) = next {
-            unread.remove(top);
-            let top = self.held_list[top];
-            let (f, bucket) = self.or_bucket_of(top)?;
+        let mut reach = bound;
+        loop {
+            let mut top = usize::MAX;
+            let mut best = f32::NEG_INFINITY;
+            for &h in &self.held_list {
+                if self.buckets[h] == NO_BUCKET && self.held_bound[h] > best {
+                    (best, top) = (self.held_bound[h], h);
+                }
+            }
+            if top == usize::MAX {
+                break;
+            }
+            let f = self.or_bucket_of(top)?;
             if f > floor {
                 floor = f;
-                reach = self.or_rebound(floor, &unread);
+                reach = self.or_rebound(floor);
             } else {
                 let s = &self.sc[top];
+                let bucket = TfBucket::new(self.buckets[top]).expect("a bucket read");
                 self.held_bound[top] = s.scorer.bound_through(bucket, floor);
                 reach = 0.0;
                 for &h in &self.held_list {
@@ -4242,7 +4129,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if self.cut(reach, tid) {
                 return Ok(None);
             }
-            next = self.or_pick(&unread);
         }
         let carrier = self.held_list.iter().copied().find(|i| {
             self.terms[self.sc[*i].term]
@@ -4264,42 +4150,26 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }))
     }
 
-    /// The place in [`Walk::held_list`] of the unread term bounding the
-    /// candidate at hand highest, the first in the scorer's order on a tie
-    /// (`None` for none above -inf), folded without a branch.
-    #[inline(always)]
-    fn or_pick(&self, unread: &impl Unread) -> Option<usize> {
-        let mut top = usize::MAX;
-        let mut best = f32::NEG_INFINITY;
-        unread.each(|p| {
-            let v = self.held_bound[self.held_list[p]];
-            let take = v > best;
-            best = if take { v } else { best };
-            top = if take { p } else { top };
-        });
-        (top != usize::MAX).then_some(top)
-    }
-
     /// Bounds each scoring term the candidate at hand holds at length
     /// `floor`, which its length is no shorter than, into
     /// [`Walk::held_bound`]: a term whose bucket is read by that bucket, any
-    /// other (its place in [`Walk::held_list`] in `unread`) by its block's
-    /// largest bucket (and no higher than it was). Returns their sum, in
-    /// the scorer's order.
+    /// other by its block's largest bucket (and no higher than it was).
+    /// Returns their sum, in the scorer's order.
     #[inline]
-    fn or_rebound(&mut self, floor: u32, unread: &impl Unread) -> f32 {
+    fn or_rebound(&mut self, floor: u32) -> f32 {
         let mut sum = 0.0_f32;
-        for (p, &h) in self.held_list.iter().enumerate() {
+        for &h in &self.held_list {
             let s = &self.sc[h];
-            let v = if unread.has(p) {
+            let read = self.buckets[h];
+            let v = if read == NO_BUCKET {
                 let most = TfBucket::new(s.max_bucket(self.blocks[h])).expect("a valid bucket");
                 // No higher than it was: one `minss` on x86-64, not
                 // `f32::min`'s NaN ordering (1.1% of a `full_score`
                 // disjunction's cycles there); never NaN, the same.
                 lower(self.held_bound[h], s.scorer.bound_through(most, floor))
             } else {
-                let read = TfBucket::new(self.buckets[h]).expect("a valid bucket");
-                s.scorer.bound_through(read, floor)
+                s.scorer
+                    .bound_through(TfBucket::new(read).expect("a valid bucket"), floor)
             };
             self.held_bound[h] = v;
             sum += v;
@@ -4310,10 +4180,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Reads into [`Walk::buckets`] the bucket of held scoring term `i`
     /// for the candidate at hand (its posting index in
     /// [`Walk::held_index`], its block in [`Walk::blocks`]); returns the
-    /// shortest length the block holds at that bucket or above, and the
-    /// bucket.
+    /// shortest length the block holds at that bucket or above.
     #[inline(always)]
-    fn or_bucket_of(&mut self, i: usize) -> Result<(u32, TfBucket)> {
+    fn or_bucket_of(&mut self, i: usize) -> Result<u32> {
         let index = self.held_index[i];
         let block = self.blocks[i];
         if self.row_state[i].tf.state == TfRun::UNSET {
@@ -4336,7 +4205,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         let floor = s.floor_at(block, bucket);
         self.buckets[i] = bucket;
-        Ok((floor, TfBucket::new(bucket).expect("a bucket read")))
+        Ok(floor)
     }
 
     /// Scoring term `i`'s [`TfRun`] in the group at hand, whose directory
