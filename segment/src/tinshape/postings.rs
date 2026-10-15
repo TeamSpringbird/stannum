@@ -1471,12 +1471,17 @@ pub struct Directory<'a> {
     source: Bytes<'a>,
     /// A bit per line of `bytes`: copied (or slack).
     copied: Box<[std::cell::Cell<u64>]>,
-    /// A bit per block: its rows (the next block's first too) and its
-    /// entries' frontiers copied, those at `fronts`.
-    blocks: Box<[std::cell::Cell<u64>]>,
+    /// Per block of entries, where its entries' frontiers lie once its
+    /// rows (the next block's first too) and frontiers are copied
+    /// ([`Self::fill`]); `(0, 0)` before (the frontiers follow the rows, so
+    /// a copied block's never end at zero).
     fronts: Box<[std::cell::Cell<(u32, u32)>]>,
     /// Every line copied ([`Self::fill_all`]).
     whole: std::cell::Cell<bool>,
+    /// The bytes the last block copied read, its rows' and its frontiers'
+    /// (offsets in the directory): a walk reads on from them
+    /// ([`Self::reading`]).
+    last_copied: std::cell::Cell<[(u32, u32); 2]>,
     end: usize,
     len: usize,
     presence: Presence,
@@ -1626,13 +1631,11 @@ impl<'a> Directory<'a> {
             bytes,
             source,
             copied,
-            blocks: (0..block_count.div_ceil(64))
-                .map(|_| std::cell::Cell::new(0))
-                .collect(),
             fronts: (0..block_count)
                 .map(|_| std::cell::Cell::new((0, 0)))
                 .collect(),
             whole: std::cell::Cell::new(false),
+            last_copied: std::cell::Cell::new([(0, 0); 2]),
             end,
             len,
             presence,
@@ -1659,7 +1662,8 @@ impl<'a> Directory<'a> {
         );
         // What the parse checks: the header, the presence and the bases,
         // and the totals' block.
-        dir.copy(0, rows)?;
+        let copied = dir.copy(0, rows)?;
+        super::segment::count_memo(|c| c.directory_copied += copied);
         dir.fill(len / DIRECTORY_BLOCK)?;
         super::dir_census::touch(dir.id(), 0, presence_at);
         // The presence: every group in the segment, ranks counting the
@@ -1726,12 +1730,10 @@ impl<'a> Directory<'a> {
     /// them reads as none.
     #[inline]
     pub fn frontier(&self, b: usize, entry: &GroupEntry, rounded: bool) -> GroupFrontier<'_> {
-        let k = b / DIRECTORY_BLOCK;
-        let (from, to) = if k < self.fronts.len() && self.is_filled(k) {
-            self.fronts[k].get()
-        } else {
-            (0, 0)
-        };
+        let (from, to) = self
+            .fronts
+            .get(b / DIRECTORY_BLOCK)
+            .map_or((0, 0), std::cell::Cell::get);
         let (from, to) = (from as usize, to as usize);
         let at = (entry.frontier as usize).wrapping_sub(from);
         // SAFETY: a filled block's frontiers are copied lines (`fill_block`).
@@ -1748,7 +1750,7 @@ impl<'a> Directory<'a> {
     /// Whether block `k`'s rows and frontiers are copied.
     #[inline(always)]
     fn is_filled(&self, k: usize) -> bool {
-        self.blocks[k / 64].get() >> (k % 64) & 1 != 0
+        self.fronts[k].get().1 != 0
     }
 
     /// Copies block `k`'s rows (from its first through the next block's
@@ -1769,10 +1771,11 @@ impl<'a> Directory<'a> {
             k * DIRECTORY_BLOCK,
             ((k + 1) * DIRECTORY_BLOCK).min(self.len),
         );
-        self.copy(
+        let rows = (
             self.rows + lo * rb / 8,
             (self.rows + hi * rb / 8 + 16).min(self.end),
-        )?;
+        );
+        let mut copied = self.copy(rows.0, rows.1)?;
         let frontiers = self.frontiers();
         let (from, to) = (
             frontiers + self.row(lo).1[FRONTIER] as usize,
@@ -1781,10 +1784,27 @@ impl<'a> Directory<'a> {
         if from > to || to > self.end {
             return Err(Error::Corrupt("group directory frontiers"));
         }
-        self.copy(from, to)?;
+        copied += self.copy(from, to)?;
         self.fronts[k].set((from as u32, to as u32));
-        self.blocks[k / 64].set(self.blocks[k / 64].get() | 1 << (k % 64));
+        self.last_copied
+            .set([(rows.0 as u32, rows.1 as u32), (from as u32, to as u32)]);
+        super::segment::count_memo(|c| c.directory_copied += copied);
         Ok(())
+    }
+
+    /// The blob's bytes the directory read last copying a block, as
+    /// `(from, to)` offsets (its rows', its frontiers'), none once it is
+    /// copied whole or when it is not read from a blob: a walk asking for
+    /// groups in order copies its next blocks from them or past them, so it
+    /// holds their pages pinned rather than pinning them again.
+    pub fn reading(&self) -> [Option<(usize, usize)>; 2] {
+        match self.source.offset() {
+            Some(at) if !self.whole.get() => self
+                .last_copied
+                .get()
+                .map(|(from, to)| (from < to).then(|| (at + from as usize, at + to as usize))),
+            _ => [None, None],
+        }
     }
 
     /// Copies every line, and so every block: for a walk that reads on
@@ -1794,15 +1814,13 @@ impl<'a> Directory<'a> {
         if self.whole.get() {
             return Ok(());
         }
-        self.copy(0, self.end)?;
+        let copied = self.copy(0, self.end)?;
+        super::segment::count_memo(|c| c.directory_copied += copied);
         self.whole.set(true);
         // Every block's frontiers lie within the directory's.
         let whole = (self.frontiers() as u32, self.end as u32);
         for f in &self.fronts {
             f.set(whole);
-        }
-        for w in &self.blocks {
-            w.set(u64::MAX);
         }
         Ok(())
     }
@@ -1816,18 +1834,24 @@ impl<'a> Directory<'a> {
     /// Copies the lines holding bytes `[from, to)` that are not, a page of
     /// the source at a time; a line is marked once its bytes are in place
     /// (a read that fails or unwinds marks none).
-    fn copy(&self, from: usize, to: usize) -> Result<()> {
-        let is_copied = |l: usize| self.copied[l / 64].get() >> (l % 64) & 1 != 0;
-        let (mut line, last) = (from / LINE, to.div_ceil(LINE));
+    fn copy(&self, from: usize, to: usize) -> Result<u64> {
+        let last = to.div_ceil(LINE);
+        let mut line = from / LINE;
+        let mut copied = 0;
         while line < last {
-            if is_copied(line) {
-                line += 1;
+            // From `line` to the end of its word: lines copied, then a run
+            // not copied.
+            let word = &self.copied[line / 64];
+            let bits = word.get() >> (line % 64);
+            let room = 64 - line % 64;
+            let done = bits.trailing_ones() as usize;
+            if done > 0 {
+                line += done.min(room);
                 continue;
             }
             let first = line;
-            while line < last && !is_copied(line) {
-                line += 1;
-            }
+            let run = (bits.trailing_zeros() as usize).min(room).min(last - line);
+            line += run;
             let (mut at, stop) = (first * LINE, (line * LINE).min(self.end));
             while at < stop {
                 let next = self.source.page_end(at).clamp(at + 1, stop);
@@ -1843,14 +1867,11 @@ impl<'a> Directory<'a> {
                 }
                 at = next;
             }
-            for l in first..line {
-                let w = &self.copied[l / 64];
-                w.set(w.get() | 1 << (l % 64));
-            }
-            let copied = (stop - first * LINE) as u64;
-            super::segment::count_memo(|c| c.directory_copied += copied);
+            let run_bits = if run == 64 { u64::MAX } else { (1 << run) - 1 };
+            word.set(word.get() | run_bits << (first % 64));
+            copied += (stop - first * LINE) as u64;
         }
-        Ok(())
+        Ok(copied)
     }
 
     /// The walk's role for its term, for the census
@@ -1868,7 +1889,7 @@ impl<'a> Directory<'a> {
 
     /// Bytes the parsed directory holds.
     pub fn held(&self) -> usize {
-        self.bytes.len() + 8 * (self.copied.len() + self.blocks.len() + self.fronts.len())
+        self.bytes.len() + 8 * (self.copied.len() + self.fronts.len())
     }
 
     /// Entries read since this was last called (for accounting).
