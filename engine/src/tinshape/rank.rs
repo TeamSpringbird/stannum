@@ -4191,8 +4191,22 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let unread = u64::MAX.checked_shr(64 - held as u32).unwrap_or(0);
             self.or_reads(unread, top, bound, tid)
         } else {
-            self.or_reads(WideUnread::all(held), top, bound, tid)
+            self.or_reads_wide(top, bound, tid)
         }
+    }
+
+    /// [`Walk::or_reads`] for more than 64 held terms, kept out of the
+    /// candidate step's code.
+    #[cold]
+    #[inline(never)]
+    fn or_reads_wide(
+        &mut self,
+        first: usize,
+        reach: f32,
+        tid: impl Fn() -> Tid + Copy,
+    ) -> Result<Option<(f32, u32)>> {
+        let unread = WideUnread::all(self.held_list.len());
+        self.or_reads(unread, first, reach, tid)
     }
 
     /// Reads the buckets of the candidate at hand's held terms (by their
