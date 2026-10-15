@@ -409,7 +409,10 @@ impl<'a> TermSet<'a> {
 
     /// The term's group `group`, if it holds it, looked for from `hint`
     /// forward (the hint is left at the first group at or after it).
-    #[inline]
+    /// Inlined: returned through memory, its group was stored a field at a
+    /// time and read back wider (on x86-64 a blocked store forward a
+    /// group loaded).
+    #[inline(always)]
     fn find(&self, group: u32, hint: &mut usize) -> Option<G<'a>> {
         if self.seek_index(group, hint)? != group {
             return None;
