@@ -54,6 +54,26 @@ const CHECKPOINT_TERMS: usize = 1024;
 pub fn merge(
     inputs: &[Input<'_>],
     options: Options,
+    checkpoint: impl FnMut() -> Result<()>,
+) -> Result<Option<Merged>> {
+    merge_in(inputs, options, true, checkpoint)
+}
+
+/// [`merge`], every record encoded afresh from its postings: no input's
+/// container is copied (a re-encoder's check that copying writes the
+/// bytes a fresh encoding does).
+pub fn merge_afresh(
+    inputs: &[Input<'_>],
+    options: Options,
+    checkpoint: impl FnMut() -> Result<()>,
+) -> Result<Option<Merged>> {
+    merge_in(inputs, options, false, checkpoint)
+}
+
+fn merge_in(
+    inputs: &[Input<'_>],
+    options: Options,
+    reuse: bool,
     mut checkpoint: impl FnMut() -> Result<()>,
 ) -> Result<Option<Merged>> {
     let segments = inputs
@@ -233,16 +253,20 @@ pub fn merge(
                 payload.push(&positions[p.2 as usize..(p.2 + p.3) as usize])?;
             }
             builder.add_term_reusing(&term, &ranks, &buckets, &payload.finish(), &mut |out| {
+                if !reuse {
+                    return None;
+                }
                 let (i, g) = owners[out]?;
                 let (postings, _) = records[i].as_ref()?;
                 let Form::Grouped(dir) = &postings.form else {
                     return None;
                 };
-                let entry = dir.find(g, &segments[i].docs.geometry.groups).ok()??;
+                let b = dir.find(g)?;
+                let entry = dir.entry_of(b, g, &segments[i].docs.geometry.groups).ok()?;
                 reused += 1;
                 Some(Reused {
                     kind: entry.kind,
-                    bytes: postings.container(entry).all().ok()?,
+                    bytes: postings.container(&entry).all().ok()?,
                 })
             })?;
             terms += 1;

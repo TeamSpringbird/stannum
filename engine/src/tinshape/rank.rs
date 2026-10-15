@@ -90,9 +90,9 @@ enum Bounds<'s, 'a> {
 }
 
 /// A grouped record's entries as a walk's blocks: the directory (shared
-/// with the parsed record, its entries decoded as the walk reaches them, its
-/// bytes the frontiers), and the segment's groups, which turn an entry's
-/// group index into the group's last slot.
+/// with the parsed record, read in place, its bytes the frontiers), and the
+/// segment's groups, which turn an entry's group index into the group's
+/// last slot.
 struct GroupBounds<'s> {
     dir: std::rc::Rc<Directory>,
     rounded: bool,
@@ -100,12 +100,23 @@ struct GroupBounds<'s> {
 }
 
 impl GroupBounds<'_> {
-    /// Entry `b` (decoded if it was not yet).
+    /// Entry `b` (as a rule the entry the directory read last).
     #[inline]
-    fn entry(&self, b: usize) -> &GroupEntry {
+    fn entry(&self, b: usize) -> GroupEntry {
         self.dir
             .get(b, self.groups)
             .unwrap_or_else(|e| corrupt_footer(e))
+    }
+
+    /// The entry of group `g`, if the record holds it, read now (the walk
+    /// bounds the group by it next).
+    #[inline]
+    fn find(&self, g: u32) -> Option<usize> {
+        let b = self.dir.find(g)?;
+        self.dir
+            .entry_of(b, g, self.groups)
+            .unwrap_or_else(|e| corrupt_footer(e));
+        Some(b)
     }
 
     /// Entry `b`'s group's first slot.
@@ -131,37 +142,15 @@ impl GroupBounds<'_> {
         )
     }
 
-    /// The first entry from `from` on whose group ends at `slot` or later:
-    /// a step or two forward as a rule (the walk's next group), else a
-    /// gallop and a binary search; the entry count when there is none.
+    /// The first entry from `from` on whose group ends at `slot` or later
+    /// (the first group so ending, sought); the entry count when there is
+    /// none.
     #[inline]
     fn first_reaching(&self, from: usize, slot: u32) -> usize {
-        let n = self.dir.len();
-        if from >= n || self.end(from) >= slot {
-            return from;
-        }
-        let (mut lo, mut step) = (from, 1);
-        let mut hi = loop {
-            let at = lo + step;
-            if at >= n {
-                break n;
-            }
-            if self.end(at) >= slot {
-                break at;
-            }
-            lo = at;
-            step *= 2;
-        };
-        // `lo` ends before `slot`; `hi` ends at or after it, or is `n`.
-        while hi - lo > 1 {
-            let mid = lo + (hi - lo) / 2;
-            if self.end(mid) >= slot {
-                hi = mid;
-            } else {
-                lo = mid;
-            }
-        }
-        hi
+        let g = self
+            .groups
+            .partition_point(|group| group.slot_base + group.slots() <= slot);
+        self.dir.seek(g as u32, from).0
     }
 }
 
@@ -516,12 +505,7 @@ impl<'s, 'a> Sc<'s, 'a> {
     fn decode_all(&mut self) {
         let f = match &mut self.footer {
             Bounds::Blocks(f) => f,
-            Bounds::Groups(g) => {
-                g.dir
-                    .decode_all(g.groups)
-                    .unwrap_or_else(|e| corrupt_footer(e));
-                return;
-            }
+            Bounds::Groups(_) => return,
         };
         let scorer = &self.scorer;
         self.bounds.clear();
@@ -560,11 +544,18 @@ impl<'s, 'a> Sc<'s, 'a> {
         higher(0.0, self.bound(b))
     }
 
-    /// The best bound of the blocks overlapping slots `from..=to`; ranges
-    /// must be asked in increasing order of `from`. Zero where a grouped
-    /// record's next entry lies past the range: the term has nothing there.
+    /// The best bound of the blocks overlapping slots `from..=to` of group
+    /// `g`; ranges must be asked in increasing order of `from`. A grouped
+    /// record's is its entry's for the group, zero where it does not hold
+    /// the group.
     #[inline]
-    fn range_bound(&mut self, from: u32, to: u32) -> f32 {
+    fn range_bound(&mut self, g: u32, from: u32, to: u32) -> f32 {
+        if let Bounds::Groups(groups) = &self.footer {
+            return match groups.find(g) {
+                Some(b) => higher(0.0, self.bound(b)),
+                None => 0.0,
+            };
+        }
         // The blocks from the first ending at `from` or later through the
         // first ending at `to` or later (or the last), in one pass,
         // decoding as far as the last of them when it is not yet.
@@ -588,10 +579,14 @@ impl<'s, 'a> Sc<'s, 'a> {
         best
     }
 
-    /// The block holding `slot`, if the term has a posting at or after it;
-    /// slots must be asked in increasing order.
+    /// The block holding `slot` (of group `g`), if the term has a posting
+    /// at or after it; slots must be asked in increasing order. A grouped
+    /// record's is its entry for the group, if it holds the group.
     #[inline]
-    fn block_at(&mut self, slot: u32) -> Option<usize> {
+    fn block_at(&mut self, g: u32, slot: u32) -> Option<usize> {
+        if let Bounds::Groups(groups) = &self.footer {
+            return groups.find(g);
+        }
         // As a rule a block decoded already: the candidate's, or one after.
         self.cb = self.first_reaching(self.cb, slot);
         (self.cb < self.footer.blocks()).then_some(self.cb)
@@ -673,7 +668,7 @@ impl<'s, 'a> Sc<'s, 'a> {
     #[inline]
     fn group_entry(&self, b: usize) -> Option<GroupEntry> {
         match &self.footer {
-            Bounds::Groups(g) => (b < g.dir.len()).then(|| *g.entry(b)),
+            Bounds::Groups(g) => (b < g.dir.len()).then(|| g.entry(b)),
             Bounds::Blocks(_) => None,
         }
     }
@@ -1006,7 +1001,7 @@ fn sieve_bits_buckets(
 /// group (as a rule `from` or one soon after) costs a probe or two rather
 /// than a binary search of every group.
 #[inline]
-fn group_from(geometry: &Geometry, from: usize, slot: u32) -> usize {
+pub(super) fn group_from(geometry: &Geometry, from: usize, slot: u32) -> usize {
     let groups = &geometry.groups;
     debug_assert!(groups[from].slot_base <= slot);
     // `lo` holds `slot` or comes before the group that does; `hi` is past it.
@@ -1350,6 +1345,9 @@ struct Walk<'s, 'a, T: Touch> {
     /// for a term that does not score).
     held_index: Vec<u32>,
     term_sc: Vec<usize>,
+    /// The length the candidate at hand's buckets bound it at (the longest
+    /// of their blocks' floors), set by [`Walk::read_buckets`].
+    cand_floor: u32,
     /// The window: the last slot of every scoring term's footer block at
     /// the slot it was set at, and its bound; per scoring term, its block's
     /// largest bucket ([`NO_BUCKET`] when it holds nothing from the slot
@@ -1446,13 +1444,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .filter_map(|s| self.terms[s.term].as_ref())
             .map(|set| (set.postings.footer.len() + set.postings.directory_bytes().len()) as u64)
             .sum();
-        let (mut reached, mut loaded) = (0u64, 0u64);
+        let (mut reached, mut loaded, mut read) = (0u64, 0u64, 0u64);
         for (set, mem) in self.terms.iter().zip(&self.mems) {
             if let Some(set) = set
-                && matches!(set.postings.form, Form::Grouped(_))
+                && let Some(dir) = &set.dir
             {
                 reached += (mem.hint + 1).min(set.group_count()) as u64;
                 loaded += u64::from(mem.used);
+                read += dir.take_read();
             }
         }
         segment::tinshape::segment::count_memo(|c| {
@@ -1462,6 +1461,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             c.footer_bytes_whole += bytes_whole;
             c.entries_reached += reached;
             c.entries_used += loaded;
+            c.directory_entries += read;
         });
     }
 
@@ -1617,7 +1617,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if !self.common_terms {
             let mut bound = 0.0_f32;
             for s in &mut self.sc {
-                bound += s.range_bound(base, end);
+                bound += s.range_bound(g, base, end);
                 if bound > theta {
                     return false;
                 }
@@ -1634,7 +1634,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let s = &mut self.sc[i];
             let v = match s.common_bound() {
                 Some(bound) => bound,
-                None => s.range_bound(base, end),
+                None => s.range_bound(g, base, end),
             };
             self.sub_bounds[i] = v;
             partial += v;
@@ -2420,9 +2420,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 .zip(&mut self.window_buckets)
                 .zip(&mut self.window_terms)
             {
-                let Some(b) = s.block_at(slot) else {
+                let Some(b) = s.block_at(g, slot) else {
                     *mb = NO_BUCKET;
                     *wt = 0.0;
+                    if s.grouped() {
+                        // It does not hold the group: the window ends with
+                        // the group.
+                        e = e.min(group_end);
+                    }
                     continue;
                 };
                 // A grouped term whose next entry lies past this group
@@ -2642,9 +2647,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             // they leave in reach: at 150 million rows two in three scored
             // candidates fell short on their buckets alone.
             None => {
-                let reach = self.read_buckets(g, local, tid)?;
+                let mut reach = self.read_buckets(g, local, tid)?;
                 if self.cut(reach, tid) || self.too_few() {
                     return Ok(None);
+                }
+                // Then at its length class's shortest length, where that
+                // is longer than its buckets' floor: at 150M rows most
+                // candidates the buckets leave in reach fall short at
+                // their exact length, and the class is a byte beside the
+                // ones its group's other candidates read.
+                if n > 0 {
+                    let Some(r) = self.class_bound(g, local, self.cand_floor, reach, tid)? else {
+                        return Ok(None);
+                    };
+                    reach = r;
                 }
                 (reach, u32::MAX)
             }
@@ -2766,6 +2782,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.buckets[i] = bucket;
             self.held_index[i] = index;
         }
+        self.cand_floor = floor;
         // Each term's own bound is at least the shared one: it prunes what
         // it can without a division per term, and is the shared one when
         // the terms' lengths agree.
@@ -2821,6 +2838,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             read = true;
         }
         if !common {
+            self.cand_floor = floor;
             // Each term's own bound is at least the shared one: it prunes
             // what it can without a division per term, and is the shared one
             // when the terms' lengths agree.
@@ -2851,6 +2869,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     _ => own += self.held_bound[i],
                 }
             }
+            self.cand_floor = floor;
             if low >= floor || self.cut(own, tid) {
                 return Ok(own);
             }
@@ -2905,6 +2924,65 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.repeats
             .iter()
             .any(|&(i, least)| self.buckets[i] < least)
+    }
+
+    /// Bounds the candidate at slot `local` of group `g`, its buckets read
+    /// and bounding it at `reach` at length `floor`, by its length class:
+    /// at the class's shortest length, where that is longer than `floor`.
+    /// `None` when that rules it out, else its bound. The class is read
+    /// only for a candidate the longest class's floor would rule out (one
+    /// it leaves in reach reads its length whatever its class).
+    #[inline]
+    fn class_bound(
+        &mut self,
+        g: u32,
+        local: u32,
+        floor: u32,
+        reach: f32,
+        tid: impl FnOnce() -> Tid + Copy,
+    ) -> Result<Option<f32>> {
+        let top = self.segment.lengths.floors()[3];
+        if top <= floor || self.threshold().is_none() {
+            return Ok(Some(reach));
+        }
+        let n = self.sc.len();
+        let at_top = self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), top);
+        if !self.cut(at_top, tid) {
+            return Ok(Some(reach));
+        }
+        let class = self.class_floor(g, local)?;
+        if class <= floor {
+            return Ok(Some(reach));
+        }
+        let bound = if class == top {
+            at_top
+        } else {
+            self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), class)
+        };
+        if self.cut(bound, tid) {
+            self.answer.class_cuts += 1;
+            return Ok(None);
+        }
+        Ok(Some(bound))
+    }
+
+    /// The shortest length of the length class of the document at slot
+    /// `local` of group `g` (0 when the segment has no classes): its length
+    /// is at least that.
+    #[inline]
+    fn class_floor(&mut self, g: u32, local: u32) -> Result<u32> {
+        let lengths = &self.segment.lengths;
+        if !lengths.has_classes() {
+            return Ok(0);
+        }
+        let rank = self
+            .segment
+            .docs
+            .rank_in(g as usize, local)
+            .ok_or(Error::Corrupt("a posting without a document"))?;
+        self.touch
+            .touch(Part::DlClasses, self.segment.class_at(rank), 1);
+        lengths.floor(rank)
     }
 
     /// The length of the document at slot `local` of group `g`, from the DL
@@ -3087,6 +3165,7 @@ pub(super) fn walk_into<'s, 'a>(
         buckets: vec![NO_BUCKET; n],
         held_index: vec![0; n],
         term_sc: Vec::new(),
+        cand_floor: 0,
         window_end: None,
         window_bound: 0.0,
         window_parts: (0.0, f64::INFINITY, f64::INFINITY),
@@ -3213,6 +3292,7 @@ pub(super) fn walk_into<'s, 'a>(
     answer.windows_pruned += done.windows_pruned;
     answer.candidates += done.candidates;
     answer.position_checks += done.position_checks;
+    answer.class_cuts += done.class_cuts;
     Ok(Some(walk.terms))
 }
 
@@ -3587,7 +3667,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 *bound = if s.grouped() {
                     s.entry_bound(self.mems[s.term].hint)
                 } else {
-                    s.range_bound(base, end)
+                    s.range_bound(g, base, end)
                 };
                 total += *bound;
             }
@@ -3785,7 +3865,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             let mut total = 0.0_f32;
                             for (&i, bound) in terms.iter().zip(sub.iter_mut()) {
                                 if !self.sc[i].grouped() {
-                                    *bound = self.sc[i].range_bound(from, to);
+                                    *bound = self.sc[i].range_bound(g, from, to);
                                 }
                                 total += *bound;
                             }
@@ -4075,7 +4155,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 let entry = self.row_state[i].entry;
                 let s = &mut self.sc[i];
                 let b = s.block_of(index, entry);
-                debug_assert_eq!(Some(b), s.block_at(slot));
+                debug_assert_eq!(Some(b), s.block_at(g, slot));
                 self.blocks[i] = b;
                 let v = s.bound(b);
                 self.held_bound[i] = v;
@@ -4102,6 +4182,19 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.buckets.fill(NO_BUCKET);
         let mut floor = 0u32;
         let mut reach = bound;
+        // Its length class first: its shortest length bounds every term it
+        // holds before any bucket is read.
+        if self.threshold().is_some() {
+            let class = self.class_floor(g, local)?;
+            if class > 0 {
+                floor = class;
+                reach = self.or_rebound(class);
+                if self.cut(reach, tid) {
+                    self.answer.class_cuts += 1;
+                    return Ok(None);
+                }
+            }
+        }
         loop {
             let mut top = usize::MAX;
             let mut best = f32::NEG_INFINITY;
@@ -4349,7 +4442,7 @@ mod tests {
             for g in 0..geometry.groups.len() {
                 let group = geometry.groups[g];
                 let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
-                let bound = sc.range_bound(base, end);
+                let bound = sc.range_bound(g as u32, base, end);
                 let mut any = false;
                 let mut shortest = [u32::MAX; 16];
                 for (r, tf) in &members {
@@ -4370,7 +4463,7 @@ mod tests {
                 if any {
                     held += 1;
                     // The window: the entry holding the group, ending with it.
-                    let b = sc.block_at(base).unwrap();
+                    let b = sc.block_at(g as u32, base).unwrap();
                     assert_eq!(sc.footer.last(b), end);
                     assert!(!sc.footer.starts_after(b, end));
                     assert_eq!(sc.bound(b).to_bits(), bound.to_bits());

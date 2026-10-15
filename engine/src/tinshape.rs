@@ -43,10 +43,12 @@ pub enum Part {
     DlSidecar,
     Positions,
     Liveness,
+    /// The DL sidecar's class plane (not one of TIN's areas).
+    DlClasses,
 }
 
 impl Part {
-    pub const ALL: [Part; 8] = [
+    pub const ALL: [Part; 9] = [
         Part::Metadata,
         Part::TermMap,
         Part::Footer,
@@ -55,6 +57,7 @@ impl Part {
         Part::DlSidecar,
         Part::Positions,
         Part::Liveness,
+        Part::DlClasses,
     ];
 
     pub fn name(self) -> &'static str {
@@ -67,6 +70,7 @@ impl Part {
             Part::DlSidecar => "DL Sidecar",
             Part::Positions => "Positions",
             Part::Liveness => "Liveness Bitmap",
+            Part::DlClasses => "DL Classes",
         }
     }
 }
@@ -349,18 +353,23 @@ impl<'a> TermSet<'a> {
         }
     }
 
-    /// A grouped term's directory entry `i` (decoded if it was not yet).
+    /// A grouped term's directory entry `i`, of group `index` when that is
+    /// known (else found from the directory's presence).
     #[inline]
-    fn entry(dir: &Directory, docs: &DocSet, i: usize) -> GroupEntry {
-        *dir.get(i, &docs.geometry.groups)
-            .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")))
+    fn entry(dir: &Directory, docs: &DocSet, i: usize, index: Option<u32>) -> GroupEntry {
+        let groups = &docs.geometry.groups;
+        match index {
+            Some(index) => dir.entry_of(i, index, groups),
+            None => dir.get(i, groups),
+        }
+        .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")))
     }
 
     /// The geometry index of the term's `i`th group.
     #[inline]
     fn group_index(&self, i: usize) -> u32 {
         match &self.dir {
-            Some(dir) => Self::entry(dir, &self.docs, i).index,
+            Some(dir) => dir.index(i),
             None => self.groups[i].index,
         }
     }
@@ -371,7 +380,7 @@ impl<'a> TermSet<'a> {
         let Some(dir) = &self.dir else {
             return self.groups[i];
         };
-        self.group_of_entry(Self::entry(dir, &self.docs, i))
+        self.group_of_entry(Self::entry(dir, &self.docs, i, None))
     }
 
     /// A grouped term's group of directory entry `entry`.
@@ -390,9 +399,10 @@ impl<'a> TermSet<'a> {
 
     /// Moves `hint` forward to the term's first group whose index is
     /// `group` or more (to the group count if none is), and gives that
-    /// group's index. A grouped term's directory is sought by its skip
-    /// points past the hint's run ([`Directory::seek`]): the entries of the
-    /// runs it passes over are not decoded.
+    /// group's index. A grouped term's directory finds it by the group's
+    /// rank in its presence, or galloping its group indexes from the hint
+    /// ([`Directory::seek`]), and reads its entry, which the walk asks for
+    /// next (its bound, its container).
     #[inline]
     fn seek_index(&self, group: u32, hint: &mut usize) -> Option<u32> {
         let Some(dir) = &self.dir else {
@@ -401,22 +411,27 @@ impl<'a> TermSet<'a> {
             }
             return self.groups.get(*hint).map(|g| g.index);
         };
-        *hint = dir
-            .seek(group, *hint, &self.docs.geometry.groups)
-            .unwrap_or_else(|e| crate::corrupt(format!("Stannum postings: {e}")));
-        (*hint < dir.len()).then(|| Self::entry(dir, &self.docs, *hint).index)
+        let (b, index) = dir.seek(group, *hint);
+        *hint = b;
+        if b == dir.len() {
+            return None;
+        }
+        Self::entry(dir, &self.docs, b, Some(index));
+        Some(index)
     }
 
     /// The term's group `group`, if it holds it, looked for from `hint`
     /// forward (the hint is left at the first group at or after it).
-    #[inline]
+    /// Inlined: returned through memory, its group was stored a field at a
+    /// time and read back wider (on x86-64 a blocked store forward a
+    /// group loaded).
+    #[inline(always)]
     fn find(&self, group: u32, hint: &mut usize) -> Option<G<'a>> {
         if self.seek_index(group, hint)? != group {
             return None;
         }
         Some(match &self.dir {
-            // Decoded: the seek reached it.
-            Some(dir) => self.group_of_entry(Self::entry(dir, &self.docs, *hint)),
+            Some(dir) => self.group_of_entry(Self::entry(dir, &self.docs, *hint, Some(group))),
             None => self.groups[*hint],
         })
     }
@@ -458,9 +473,25 @@ impl<'a> TermSet<'a> {
             let group = &geometry.groups[g.index as usize];
             let base = group.slot_base;
             if base + group.slots() <= target {
-                // Skip the groups wholly before the target: a gallop from
-                // the group at hand, then a binary search, so that a lazy
-                // directory decodes about as far as the target.
+                // Skip the groups wholly before the target: a grouped
+                // term's directory seeks the target's group; a single or
+                // sparse term's groups are galloped from the group at hand.
+                if self.dir.is_some() {
+                    let mut hint = self.gpos;
+                    if target >= geometry.slots
+                        || self
+                            .seek_index(
+                                rank::group_from(geometry, g.index as usize, target) as u32,
+                                &mut hint,
+                            )
+                            .is_none()
+                    {
+                        hint = self.group_count();
+                    }
+                    self.gpos = hint;
+                    self.loaded = Loaded::None;
+                    continue;
+                }
                 let count = self.group_count();
                 let ends_before = |i: usize| {
                     let group = &geometry.groups[self.group_index(i) as usize];
@@ -1499,6 +1530,9 @@ pub struct RankedAnswer {
     /// them), and those whose positions were checked.
     pub candidates: u64,
     pub position_checks: u64,
+    /// Candidates ruled out by their length class, before their length
+    /// was read.
+    pub class_cuts: u64,
 }
 
 /// The `k` best matches of `node` in `segment` by the summed scores of
@@ -2391,9 +2425,11 @@ mod tests {
         unsafe { pinned.close_span() };
         let got = got.unwrap();
         assert_eq!(got.rows, want.rows);
+        // The directory's pages, read when the term is opened, and a few of
+        // the walk's.
         let peak = source.0.peak.get();
         assert!(
-            peak < 12,
+            peak < footer_pages + 8,
             "{peak} pages held at once, of a {footer_pages}-page footer"
         );
     }
@@ -3196,6 +3232,107 @@ mod tests {
         // document. Best first, 20.5.
         let bytes = reads.bytes[Part::Positions as usize];
         assert!(bytes <= 13 * n as u64, "{bytes} bytes of positions read");
+    }
+
+    /// A candidate is bounded at its length class's shortest length before
+    /// its exact length is read. In each group after the first, one
+    /// one-word document sets the frontier (every posting has tf 1 or 2, so
+    /// the bucket bound is at length 1) and 299 documents of 300 words
+    /// follow it; the first group's 20 two-word documents set the
+    /// threshold. Without classes every long document is in reach until its
+    /// length is read (TIN's lists of 63 postings or more per group read DL
+    /// for each); with them, class 3 (256 words or more) rules them all out
+    /// unread, and the answers are the same.
+    #[test]
+    fn length_classes_rule_out_long_documents_before_their_length() {
+        let mut docs = Vec::new();
+        let mut lengths = Vec::new();
+        for i in 0..20u32 {
+            docs.push(Tid {
+                block: i / 10,
+                offset: (i % 10) as u16 + 1,
+            });
+            lengths.push(2);
+        }
+        for g in 1..5u32 {
+            for i in 0..300u32 {
+                docs.push(Tid {
+                    block: g * 256 + i / 10,
+                    offset: (i % 10) as u16 + 1,
+                });
+                lengths.push(if i == 0 { 1 } else { 300 });
+            }
+        }
+        let n = docs.len();
+        // Term t holds positions 0..tf: "t0 t1" needs t1 at 1, so tf 2.
+        let members = vec![
+            (0..n).map(|r| (r, 1)).collect::<Vec<_>>(),
+            (0..n).map(|r| (r, 2)).collect(),
+        ];
+        let all: Vec<usize> = (0..n).collect();
+        let names = vec!["t0".to_owned(), "t1".to_owned()];
+        let scorer = |df| {
+            TermScorer::from_statistics(100_000, df, 1.0, Bm25Params::default(), 20.0).unwrap()
+        };
+        let scorers = vec![
+            ("t0".to_owned(), scorer(n as u64)),
+            ("t1".to_owned(), scorer(n as u64)),
+        ];
+        let nodes = [
+            Node::And(vec![Node::Term(0), Node::Term(1)]),
+            Node::Or(vec![Node::Term(0), Node::Term(1)]),
+            Node::Span {
+                slots: vec![0, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+        ];
+        for node in &nodes {
+            let mut answers = Vec::new();
+            for length_classes in [false, true] {
+                let options = Options {
+                    grid_min_postings: 0,
+                    inline_lengths_min_documents: u32::MAX,
+                    length_classes,
+                    ..Options::default()
+                };
+                let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+                let segment = Segment::parse(&blob).unwrap();
+                let mut reads = AreaReads::default();
+                let got = top_k(&segment, node, &names, &scorers, 10, &mut reads).unwrap();
+                // A length is two reads (its block's header and its bits).
+                let lengths_read = reads.reads[Part::DlSidecar as usize] / 2;
+                if length_classes {
+                    // The first group's ten and the four one-word documents.
+                    assert!(
+                        lengths_read <= 20,
+                        "{node:?}: {lengths_read} lengths read with classes"
+                    );
+                } else {
+                    assert!(
+                        lengths_read >= 1_000,
+                        "{node:?}: {lengths_read} lengths read without classes"
+                    );
+                }
+                answers.push(
+                    got.rows
+                        .iter()
+                        .map(|(s, t)| (s.to_bits(), *t))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(answers[0], answers[1], "{node:?}");
+            let markers: Vec<Tid> = (1..5)
+                .map(|g| Tid {
+                    block: g * 256,
+                    offset: 1,
+                })
+                .collect();
+            assert!(
+                markers
+                    .iter()
+                    .all(|m| answers[1].iter().any(|(_, t)| t == m))
+            );
+        }
     }
 
     /// While the top k fill, a phrase's candidate is confirmed by its
