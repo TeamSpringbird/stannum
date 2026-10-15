@@ -2956,10 +2956,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     /// The shortest length of the length class of the document at slot
-    /// `local` of group `g`: its length is at least that.
+    /// `local` of group `g` (0 when the segment has no classes): its length
+    /// is at least that.
     #[inline]
     fn class_floor(&mut self, g: u32, local: u32) -> Result<u32> {
         let lengths = &self.segment.lengths;
+        if !lengths.has_classes() {
+            return Ok(0);
+        }
         let rank = self
             .segment
             .docs
