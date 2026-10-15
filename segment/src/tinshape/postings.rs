@@ -903,7 +903,7 @@ pub enum Form<'a> {
     Sparse(Ef<'a>),
     /// The group directory, shared by the clones of a parsed record and
     /// decoded as far as asked for.
-    Grouped(std::rc::Rc<Directory>),
+    Grouped(std::rc::Rc<Directory<'a>>),
 }
 
 /// A term's postings record, parsed.
@@ -1123,24 +1123,19 @@ impl<'a> Postings<'a> {
                 )?)
             }
             FORM_GROUPED => {
-                // The header gives the directory's length: its bytes are
-                // read in one window and copied ([`Directory`] reads its
-                // entries in place).
+                // The header gives the directory's length: [`Directory`]
+                // copies its bytes as they are first read.
                 let end = directory_len;
                 if end == 0 || end > payload.len() {
                     return Err(Error::Corrupt("postings directory length"));
                 }
-                // Copied a page at a time: a directory spanning pages is
-                // not stitched first (a second copy).
-                let mut copy = Vec::with_capacity(end + SLACK);
-                payload.copy_into(0, end, &mut copy)?;
                 super::segment::count_memo(|c| {
                     c.directories += 1;
                     c.directory_bytes += end as u64;
                 });
                 containers_at = end;
                 Form::Grouped(std::rc::Rc::new(Directory::parse(
-                    copy,
+                    payload.sub(0, end)?,
                     geometry.groups.len(),
                     df,
                     (payload.len() - end) as u64,
@@ -1167,21 +1162,30 @@ impl<'a> Postings<'a> {
 
     /// The impact frontier a grouped record's directory holds for a group.
     #[inline]
+    /// The directory is copied whole for it: a walk reads an entry's
+    /// frontier through [`Directory::frontier`].
     pub fn group_frontier(&self, entry: &GroupEntry) -> GroupFrontier<'_> {
         GroupFrontier::new(
-            self.directory_bytes(),
+            self.directory_bytes().unwrap_or_default(),
             entry.frontier as usize,
             self.rounded,
         )
     }
 
     /// A grouped record's directory's bytes (its entries carry their
-    /// groups' frontiers); none for another record.
-    #[inline]
-    pub fn directory_bytes(&self) -> &[u8] {
+    /// groups' frontiers), copied whole; none for another record.
+    pub fn directory_bytes(&self) -> Result<&[u8]> {
         match &self.form {
             Form::Grouped(dir) => dir.bytes(),
-            _ => &[],
+            _ => Ok(&[]),
+        }
+    }
+
+    /// The length of a grouped record's directory; zero for another record.
+    pub fn directory_len(&self) -> usize {
+        match &self.form {
+            Form::Grouped(dir) => dir.end,
+            _ => 0,
         }
     }
 
@@ -1436,9 +1440,16 @@ enum Presence {
     },
 }
 
-/// A grouped record's directory: its bytes, copied when the record is
-/// parsed (so the parsed record borrows nothing of the blob, and reading an
-/// entry reads no page of it), read in place.
+/// A grouped record's directory: its bytes, copied as they are first read
+/// (so the parsed record borrows nothing of the blob, and reading an entry
+/// again reads no page of it), read in place.
+///
+/// The parse copies the header, the presence and the blocks' bases, which
+/// it checks; the rows and frontiers of a block of [`DIRECTORY_BLOCK`]
+/// entries are copied when an entry of it is first read, a 64-byte line at
+/// a time ([`Self::fill`]): a walk asking a common term for a rare term's
+/// groups reads a few of its blocks. A walk that reads on through the
+/// entries copies them whole first ([`Self::fill_all`]).
 ///
 /// An entry is a row of fixed width: a seek finds the entry of a group by
 /// the group's rank in the record's presence bitmap (a popcount), or among
@@ -1451,10 +1462,21 @@ enum Presence {
 /// the directory is parsed; each entry is checked as it is read: its group
 /// holds its count, its container's length is its kind's, and its buckets
 /// and frontier lie within the record's.
-pub struct Directory {
-    /// The directory's bytes, from its group count on, and [`SLACK`] zero
-    /// bytes past them: entries' frontier offsets index them.
-    bytes: Box<[u8]>,
+pub struct Directory<'a> {
+    /// The directory's bytes, from its group count on, as far as copied,
+    /// and [`SLACK`] zero bytes past them: entries' frontier offsets index
+    /// them. Only lines marked in `copied` (and the slack) are read.
+    bytes: Lines,
+    /// Where they are copied from: the record's.
+    source: Bytes<'a>,
+    /// A bit per line of `bytes`: copied (or slack).
+    copied: Box<[std::cell::Cell<u64>]>,
+    /// A bit per block: its rows (the next block's first too) and its
+    /// entries' frontiers copied, those at `fronts`.
+    blocks: Box<[std::cell::Cell<u64>]>,
+    fronts: Box<[std::cell::Cell<(u32, u32)>]>,
+    /// Every line copied ([`Self::fill_all`]).
+    whole: std::cell::Cell<bool>,
     end: usize,
     len: usize,
     presence: Presence,
@@ -1482,7 +1504,40 @@ pub struct Directory {
     ahead: std::cell::Cell<(usize, u32, [u32; 4])>,
 }
 
-impl std::fmt::Debug for Directory {
+/// Bytes of a [`Lines`] line: what a directory copies at a time.
+const LINE: usize = 64;
+
+/// A line of a directory's copy, aligned as a cache line.
+#[derive(Clone, Copy)]
+#[repr(C, align(64))]
+struct Line([std::mem::MaybeUninit<u8>; LINE]);
+
+/// A directory's copy: lines of bytes, only those written read.
+struct Lines(Box<std::cell::UnsafeCell<[Line]>>);
+
+impl Lines {
+    /// `n` lines, none written.
+    fn new(n: usize) -> Self {
+        let lines = Box::<[Line]>::new_uninit_slice(n);
+        // SAFETY: a line of `MaybeUninit` bytes holds any bytes, and
+        // `UnsafeCell` is transparent.
+        Self(unsafe {
+            Box::from_raw(Box::into_raw(lines.assume_init()) as *mut std::cell::UnsafeCell<[Line]>)
+        })
+    }
+
+    #[inline(always)]
+    fn ptr(&self) -> *mut u8 {
+        self.0.get().cast::<u8>()
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.0.get().len() * LINE
+    }
+}
+
+impl std::fmt::Debug for Directory<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Directory")
             .field("len", &self.len)
@@ -1492,24 +1547,29 @@ impl std::fmt::Debug for Directory {
     }
 }
 
-impl Directory {
-    /// Parses a directory, `directory` its bytes from its group count on, of
-    /// a record of `df` postings, `containers` container bytes and `tf_len`
+impl<'a> Directory<'a> {
+    /// Parses a directory, `source` its bytes from its group count on, of a
+    /// record of `df` postings, `containers` container bytes and `tf_len`
     /// TF bytes, in a segment of `groups` groups.
     fn parse(
-        mut directory: Vec<u8>,
+        source: Bytes<'a>,
         groups: usize,
         df: u32,
         containers: u64,
         tf_len: u64,
     ) -> Result<Self> {
         let corrupt = || Error::Corrupt("postings directory");
+        let head = source.window(0, 10 + 4)?;
         let mut at = 0;
-        let len = varint::get_u32(&directory, &mut at)? as usize;
+        let len = varint::get_u32(head, &mut at)? as usize;
         if len == 0 || len > groups {
             return Err(Error::Corrupt("postings groups"));
         }
-        let widths = directory.get(at..at + 4).ok_or(Error::Truncated)?;
+        let widths: [u8; 4] = head
+            .get(at..at + 4)
+            .ok_or(Error::Truncated)?
+            .try_into()
+            .expect("four bytes");
         at += 4;
         let mut shift = [0u32; 4];
         let mut mask = [0u64; 4];
@@ -1544,13 +1604,35 @@ impl Directory {
         at += (len / DIRECTORY_BLOCK + 1) * BASE_BYTES;
         let rows = at;
         at += ((len + 1) * row_bits as usize).div_ceil(8);
-        if at > directory.len() {
+        let end = source.len();
+        if at > end {
             return Err(Error::Truncated);
         }
-        let end = directory.len();
-        directory.resize(end + SLACK, 0);
+        // The lines past the directory's hold no byte to copy: slack, zero,
+        // as is its last line's tail.
+        let lines = (end + SLACK).div_ceil(LINE);
+        let bytes = Lines::new(lines);
+        // SAFETY: within the lines, which nothing reads yet.
+        unsafe { std::ptr::write_bytes(bytes.ptr().add(end), 0, lines * LINE - end) };
+        let first_slack = end.div_ceil(LINE);
+        let copied = (0..lines.div_ceil(64))
+            .map(|w| {
+                let below = first_slack.saturating_sub(w * 64).min(64);
+                std::cell::Cell::new(if below == 64 { 0 } else { u64::MAX << below })
+            })
+            .collect();
+        let block_count = len / DIRECTORY_BLOCK + 1;
         let dir = Self {
-            bytes: directory.into_boxed_slice(),
+            bytes,
+            source,
+            copied,
+            blocks: (0..block_count.div_ceil(64))
+                .map(|_| std::cell::Cell::new(0))
+                .collect(),
+            fronts: (0..block_count)
+                .map(|_| std::cell::Cell::new((0, 0)))
+                .collect(),
+            whole: std::cell::Cell::new(false),
             end,
             len,
             presence,
@@ -1567,6 +1649,19 @@ impl Directory {
             last: std::cell::Cell::new((usize::MAX, GroupEntry::default())),
             ahead: std::cell::Cell::new((usize::MAX, 0, [0; 4])),
         };
+        let frontiers = rows + ((len + 1) * row_bits as usize).div_ceil(8);
+        super::dir_census::parse_begin(
+            dir.id(),
+            end,
+            [rows, frontiers - rows, end - frontiers],
+            len.div_ceil(DIRECTORY_BLOCK),
+            dir.source.offset(),
+        );
+        // What the parse checks: the header, the presence and the bases,
+        // and the totals' block.
+        dir.copy(0, rows)?;
+        dir.fill(len / DIRECTORY_BLOCK)?;
+        super::dir_census::touch(dir.id(), 0, presence_at);
         // The presence: every group in the segment, ranks counting the
         // words before (and so `len` groups), indexes rising.
         match presence {
@@ -1604,6 +1699,7 @@ impl Directory {
         {
             return Err(Error::Corrupt("postings directory totals"));
         }
+        super::dir_census::parse_end();
         Ok(dir)
     }
 
@@ -1618,15 +1714,159 @@ impl Directory {
         self.len == 0
     }
 
-    /// The directory's bytes, from its group count on.
+    /// The directory's bytes, from its group count on, copied whole.
+    pub fn bytes(&self) -> Result<&[u8]> {
+        self.fill_all()?;
+        // SAFETY: every line is copied.
+        Ok(unsafe { std::slice::from_raw_parts(self.bytes.ptr(), self.end) })
+    }
+
+    /// The frontier of entry `b`, `entry` (read, so its block is copied),
+    /// read within its block's frontiers: a corrupt entry's lying past
+    /// them reads as none.
     #[inline]
-    pub fn bytes(&self) -> &[u8] {
-        &self.bytes[..self.end]
+    pub fn frontier(&self, b: usize, entry: &GroupEntry, rounded: bool) -> GroupFrontier<'_> {
+        let k = b / DIRECTORY_BLOCK;
+        let (from, to) = if k < self.fronts.len() && self.is_filled(k) {
+            self.fronts[k].get()
+        } else {
+            (0, 0)
+        };
+        let (from, to) = (from as usize, to as usize);
+        let at = (entry.frontier as usize).wrapping_sub(from);
+        // SAFETY: a filled block's frontiers are copied lines (`fill_block`).
+        let bytes = unsafe { std::slice::from_raw_parts(self.bytes.ptr().add(from), to - from) };
+        if super::dir_census::BUILT {
+            let mut end = at;
+            if skip_group_frontier(bytes, &mut end).is_ok() {
+                super::dir_census::touch(self.id(), from + at, end - at);
+            }
+        }
+        GroupFrontier::new(bytes, at, rounded)
+    }
+
+    /// Whether block `k`'s rows and frontiers are copied.
+    #[inline(always)]
+    fn is_filled(&self, k: usize) -> bool {
+        self.blocks[k / 64].get() >> (k % 64) & 1 != 0
+    }
+
+    /// Copies block `k`'s rows (from its first through the next block's
+    /// first, each read as sixteen bytes) and its entries' frontiers,
+    /// unless they are.
+    #[inline(always)]
+    fn fill(&self, k: usize) -> Result<()> {
+        if self.is_filled(k) {
+            return Ok(());
+        }
+        self.fill_block(k)
+    }
+
+    #[inline(never)]
+    fn fill_block(&self, k: usize) -> Result<()> {
+        let rb = self.row_bits as usize;
+        let (lo, hi) = (
+            k * DIRECTORY_BLOCK,
+            ((k + 1) * DIRECTORY_BLOCK).min(self.len),
+        );
+        self.copy(
+            self.rows + lo * rb / 8,
+            (self.rows + hi * rb / 8 + 16).min(self.end),
+        )?;
+        let frontiers = self.frontiers();
+        let (from, to) = (
+            frontiers + self.row(lo).1[FRONTIER] as usize,
+            frontiers + self.row(hi).1[FRONTIER] as usize,
+        );
+        if from > to || to > self.end {
+            return Err(Error::Corrupt("group directory frontiers"));
+        }
+        self.copy(from, to)?;
+        self.fronts[k].set((from as u32, to as u32));
+        self.blocks[k / 64].set(self.blocks[k / 64].get() | 1 << (k % 64));
+        Ok(())
+    }
+
+    /// Copies every line, and so every block: for a walk that reads on
+    /// through the entries (one copy a page at a time, not a block at a
+    /// time).
+    pub fn fill_all(&self) -> Result<()> {
+        if self.whole.get() {
+            return Ok(());
+        }
+        self.copy(0, self.end)?;
+        self.whole.set(true);
+        // Every block's frontiers lie within the directory's.
+        let whole = (self.frontiers() as u32, self.end as u32);
+        for f in &self.fronts {
+            f.set(whole);
+        }
+        for w in &self.blocks {
+            w.set(u64::MAX);
+        }
+        Ok(())
+    }
+
+    /// Where the frontiers start.
+    #[inline(always)]
+    fn frontiers(&self) -> usize {
+        self.rows + ((self.len + 1) * self.row_bits as usize).div_ceil(8)
+    }
+
+    /// Copies the lines holding bytes `[from, to)` that are not, a page of
+    /// the source at a time; a line is marked once its bytes are in place
+    /// (a read that fails or unwinds marks none).
+    fn copy(&self, from: usize, to: usize) -> Result<()> {
+        let is_copied = |l: usize| self.copied[l / 64].get() >> (l % 64) & 1 != 0;
+        let (mut line, last) = (from / LINE, to.div_ceil(LINE));
+        while line < last {
+            if is_copied(line) {
+                line += 1;
+                continue;
+            }
+            let first = line;
+            while line < last && !is_copied(line) {
+                line += 1;
+            }
+            let (mut at, stop) = (first * LINE, (line * LINE).min(self.end));
+            while at < stop {
+                let next = self.source.page_end(at).clamp(at + 1, stop);
+                let read = self.source.get(at, next)?;
+                // SAFETY: within the lines (`stop` at most `end`), in lines
+                // not copied yet, which nothing reads.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        read.as_ptr(),
+                        self.bytes.ptr().add(at),
+                        read.len(),
+                    );
+                }
+                at = next;
+            }
+            for l in first..line {
+                let w = &self.copied[l / 64];
+                w.set(w.get() | 1 << (l % 64));
+            }
+        }
+        Ok(())
+    }
+
+    /// The walk's role for its term, for the census
+    /// ([`super::dir_census`]; nothing without it).
+    #[inline(always)]
+    pub fn census_role(&self, role: super::dir_census::Role) {
+        super::dir_census::role(self.id(), role);
+    }
+
+    /// The census's name for this directory: its copy's address.
+    #[inline(always)]
+    fn id(&self) -> usize {
+        self.bytes.ptr() as usize
     }
 
     /// Bytes the parsed directory holds.
     pub fn held(&self) -> usize {
-        self.bytes.len()
+        self.bytes.len() + 8 * (self.copied.len() + self.blocks.len() + self.fronts.len())
     }
 
     /// Entries read since this was last called (for accounting).
@@ -1650,8 +1890,16 @@ impl Directory {
     fn load<const N: usize>(&self, at: usize) -> [u8; N] {
         assert!(N <= SLACK);
         debug_assert!(at + N <= self.bytes.len());
-        // SAFETY: within the bytes, as above.
-        unsafe { std::ptr::read_unaligned(self.bytes.as_ptr().add(at).cast::<[u8; N]>()) }
+        debug_assert!(
+            (at / LINE..(at + N).div_ceil(LINE))
+                .all(|l| self.copied[l / 64].get() >> (l % 64) & 1 != 0),
+            "a load of lines not copied"
+        );
+        super::dir_census::touch(self.id(), at, N);
+        // SAFETY: within the bytes, as above, and copied: the parse copies
+        // the presence and the bases, and a row is read once its block is
+        // (`fill`).
+        unsafe { std::ptr::read_unaligned(self.bytes.ptr().add(at).cast::<[u8; N]>()) }
     }
 
     #[inline(always)]
@@ -1885,6 +2133,7 @@ impl Directory {
         if b >= self.len {
             return Err(Error::Corrupt("group directory entry"));
         }
+        self.fill(b / DIRECTORY_BLOCK)?;
         let (head, v) = match self.ahead.get() {
             (r, head, totals) if r == b => (head, totals),
             _ => self.row(b),
@@ -1926,7 +2175,8 @@ impl Directory {
             return Err(Error::Corrupt("group directory entry"));
         }
         self.read.set(self.read.get() + 1);
-        let frontiers = self.rows + ((self.len + 1) * self.row_bits as usize).div_ceil(8);
+        super::dir_census::block(self.id(), b / DIRECTORY_BLOCK);
+        let frontiers = self.frontiers();
         let entry = GroupEntry {
             index,
             count,
@@ -1984,6 +2234,7 @@ impl Directory {
                 hi = mid;
             }
         }
+        self.fill(lo)?;
         let (mut lo, mut hi) = (
             lo * DIRECTORY_BLOCK,
             ((lo + 1) * DIRECTORY_BLOCK).min(self.len),
@@ -2007,6 +2258,7 @@ impl Directory {
     /// Every entry, in order, its group index read from the presence in
     /// order (not sought).
     pub fn each(&self, groups: &[Group], mut visit: impl FnMut(&GroupEntry)) -> Result<()> {
+        self.fill_all()?;
         match self.presence {
             Presence::Indexes { .. } => {
                 for b in 0..self.len {
@@ -2048,7 +2300,7 @@ impl Directory {
                 return Err(Error::Corrupt("group container length"));
             }
             let mut at = e.frontier as usize;
-            let max = skip_group_frontier(self.bytes(), &mut at)?;
+            let max = skip_group_frontier(self.bytes()?, &mut at)?;
             let end = entries.get(i + 1).map_or(self.end, |n| n.frontier as usize);
             if max != e.max_bucket || at != end {
                 return Err(Error::Corrupt("group frontier"));
@@ -2287,7 +2539,7 @@ impl Footer {
             }
             super::segment::count_memo(|c| {
                 c.footer_blocks += entries.len() as u64;
-                c.footer_bytes += dir.bytes().len() as u64;
+                c.footer_bytes += dir.end as u64;
             });
             return Ok(footer);
         }
@@ -4110,7 +4362,7 @@ mod tests {
         };
         let entries = dir.entries(&geometry.groups).unwrap();
         assert_eq!(entries.len(), 2000);
-        let directory = dir.bytes().len();
+        let directory = dir.bytes().unwrap().len();
         assert!(
             directory > 2000 * 8,
             "entries of {} bytes",
@@ -4125,7 +4377,7 @@ mod tests {
         let Form::Grouped(read) = &parsed.form else {
             panic!("a grouped record");
         };
-        assert_eq!(read.bytes(), dir.bytes());
+        assert_eq!(read.bytes().unwrap(), dir.bytes().unwrap());
         assert_eq!(parsed.containers_at, whole.containers_at);
         assert_eq!(memo_counts().directories, 1, "the directory copied");
         assert_eq!(read.entries(&geometry.groups).unwrap(), entries);
@@ -4366,7 +4618,7 @@ mod tests {
 
     /// A grouped record of `groups` groups of `per` postings each over a
     /// grid of 256-page groups, its header's fields, and its geometry.
-    fn grouped_record(groups: u32, per: u32) -> (Vec<u8>, Geometry, u32) {
+    pub(super) fn grouped_record(groups: u32, per: u32) -> (Vec<u8>, Geometry, u32) {
         let tids: Vec<Tid> = (0..groups * 256)
             .map(|b| Tid {
                 block: b,
@@ -4408,7 +4660,7 @@ mod tests {
             let Form::Grouped(dir) = &parsed.form else {
                 panic!("a grouped record");
             };
-            assert_eq!(dir.bytes().len(), directory_len);
+            assert_eq!(dir.bytes().unwrap().len(), directory_len);
             assert_eq!(dir.len(), groups as usize);
             assert_eq!(
                 dir.entries(&geometry.groups).unwrap().len(),
@@ -5129,41 +5381,116 @@ mod directory_tests {
     }
 
     /// A directory parsed over pages read in place holds no page: once the
-    /// span closes (its pages released and poisoned), its entries read as
-    /// from memory, and reading them pins nothing.
+    /// span closes (its pages released and poisoned), the entries it copied
+    /// read as from memory, pinning nothing, and those it did not are
+    /// copied from the blob afresh, never from a released page.
     #[test]
     fn directories_read_no_page_after_the_parse() {
         let t = term(7, 900, 1);
         let record = encoded(&t, &options(false));
         let df = t.slots.len() as u32;
-        let whole = {
+        let (whole, fronts) = {
             let parsed = Postings::parse(&record, df, &t.geometry).unwrap();
             let Form::Grouped(dir) = &parsed.form else {
                 panic!("a grouped record");
             };
-            dir.entries(&t.geometry.groups).unwrap()
+            let entries = dir.entries(&t.geometry.groups).unwrap();
+            let fronts: Vec<Vec<(u8, u32)>> = entries
+                .iter()
+                .map(|e| parsed.group_frontier(e).collect())
+                .collect();
+            (entries, fronts)
         };
-        let source = PinningSource::new(record.clone(), 64);
-        let blob = LazyBlob::new(Box::new(source.clone()));
-        blob.set_keep(0);
-        blob.open_span();
-        let parsed = Postings::parse(blob.bytes(), df, &t.geometry).unwrap();
-        assert!(parsed.is_detached(), "a grouped record keeps no slice");
+        assert!(whole.len() > 2 * DIRECTORY_BLOCK, "{} entries", whole.len());
+        for copied in [false, true] {
+            let source = PinningSource::new(record.clone(), 64);
+            let blob = LazyBlob::new(Box::new(source.clone()));
+            blob.set_keep(0);
+            blob.open_span();
+            let parsed = Postings::parse(blob.bytes(), df, &t.geometry).unwrap();
+            assert!(parsed.is_detached(), "a grouped record keeps no slice");
+            let Form::Grouped(dir) = &parsed.form else {
+                panic!("a grouped record");
+            };
+            let dir = dir.clone();
+            // An entry of the first block read in the span; the others
+            // after it, or every one copied first.
+            assert_eq!(dir.get(1, &t.geometry.groups).unwrap(), whole[1]);
+            if copied {
+                dir.fill_all().unwrap();
+            }
+            let pins = source.0.pins.get();
+            let reads = source.0.reads.get();
+            // SAFETY: the parsed record keeps no slice of the span's pages.
+            unsafe { blob.close_span() };
+            assert!(
+                !source.0.released.borrow().is_empty(),
+                "pages released, poisoned"
+            );
+            for (b, e) in whole.iter().enumerate() {
+                assert_eq!(dir.get(b, &t.geometry.groups).unwrap(), *e);
+                let front: Vec<(u8, u32)> = dir.frontier(b, e, parsed.rounded).collect();
+                assert_eq!(front, fronts[b], "entry {b}'s frontier");
+            }
+            assert_eq!(dir.entries(&t.geometry.groups).unwrap(), whole);
+            assert_eq!(source.0.pins.get(), pins, "no page pinned to read");
+            if copied {
+                assert_eq!(source.0.reads.get(), reads, "no page read to read");
+            } else {
+                assert!(source.0.reads.get() > reads, "the rest read afresh");
+            }
+            drop(parsed);
+        }
+    }
+
+    /// A walk that seeks a few groups copies their blocks only: the rows and
+    /// frontiers of the blocks it reads, besides what the parse checks;
+    /// every entry and frontier reads as the whole directory's.
+    #[test]
+    fn directories_copy_the_blocks_read() {
+        let (out, geometry, df) = super::tests::grouped_record(40 * DIRECTORY_BLOCK as u32, 3);
+        let whole = Postings::parse(&out[..], df, &geometry).unwrap();
+        let Form::Grouped(full) = &whole.form else {
+            panic!("a grouped record");
+        };
+        let entries = full.entries(&geometry.groups).unwrap();
+        let fronts: Vec<Vec<(u8, u32)>> = entries
+            .iter()
+            .map(|e| whole.group_frontier(e).collect())
+            .collect();
+        let parsed = Postings::parse(&out[..], df, &geometry).unwrap();
         let Form::Grouped(dir) = &parsed.form else {
             panic!("a grouped record");
         };
-        let dir = dir.clone();
-        let pins = source.0.pins.get();
-        let reads = source.0.reads.get();
-        // SAFETY: the parsed record keeps no slice of the span's pages.
-        unsafe { blob.close_span() };
-        assert!(
-            !source.0.released.borrow().is_empty(),
-            "pages released, poisoned"
-        );
-        assert_eq!(dir.entries(&t.geometry.groups).unwrap(), whole);
-        assert_eq!(source.0.pins.get(), pins, "no page pinned to read");
-        assert_eq!(source.0.reads.get(), reads, "no page read to read");
-        drop(parsed);
+        let copied = |dir: &Directory<'_>| -> usize {
+            (0..dir.bytes.len() / LINE)
+                .filter(|l| dir.copied[l / 64].get() >> (l % 64) & 1 != 0)
+                .count()
+                * LINE
+        };
+        let at_parse = copied(dir);
+        assert!(at_parse < dir.end / 4, "{at_parse} of {} bytes", dir.end);
+        for b in [3, 700, 701, 1279] {
+            let index = entries[b].index;
+            let found = dir.find(index).unwrap();
+            assert_eq!(found, b);
+            let e = dir.entry_of(found, index, &geometry.groups).unwrap();
+            assert_eq!(e, entries[b]);
+            let front: Vec<(u8, u32)> = dir.frontier(b, &e, parsed.rounded).collect();
+            assert_eq!(front, fronts[b]);
+        }
+        let read = copied(dir);
+        assert!(read < dir.end / 2, "{read} of {} bytes", dir.end);
+        // A block's last entry reads the next block's first row.
+        let e = dir.get(DIRECTORY_BLOCK - 1, &geometry.groups).unwrap();
+        assert_eq!(e, entries[DIRECTORY_BLOCK - 1]);
+        for (b, e) in entries.iter().enumerate() {
+            assert_eq!(dir.get(b, &geometry.groups).unwrap(), *e);
+            let front: Vec<(u8, u32)> = dir.frontier(b, e, parsed.rounded).collect();
+            assert_eq!(front, fronts[b]);
+        }
+        assert!(!dir.whole.get(), "read a block at a time");
+        assert_eq!(dir.entries(&geometry.groups).unwrap(), entries);
+        assert_eq!(copied(dir), (dir.end + SLACK).div_ceil(LINE) * LINE);
     }
 }

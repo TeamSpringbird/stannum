@@ -86,20 +86,20 @@ enum Bounds<'s, 'a> {
     /// Boxed: a lazy footer is several vectors, a group's bounds a few
     /// words.
     Blocks(Box<LazyFooter<'a>>),
-    Groups(GroupBounds<'s>),
+    Groups(GroupBounds<'s, 'a>),
 }
 
 /// A grouped record's entries as a walk's blocks: the directory (shared
 /// with the parsed record, read in place, its bytes the frontiers), and the
 /// segment's groups, which turn an entry's group index into the group's
 /// last slot.
-struct GroupBounds<'s> {
-    dir: std::rc::Rc<Directory>,
+struct GroupBounds<'s, 'a> {
+    dir: std::rc::Rc<Directory<'a>>,
     rounded: bool,
     groups: &'s [Group],
 }
 
-impl GroupBounds<'_> {
+impl GroupBounds<'_, '_> {
     /// Entry `b` (as a rule the entry the directory read last).
     #[inline]
     fn entry(&self, b: usize) -> GroupEntry {
@@ -135,11 +135,7 @@ impl GroupBounds<'_> {
     /// The frontier of entry `b`.
     #[inline]
     fn frontier(&self, b: usize) -> GroupFrontier<'_> {
-        GroupFrontier::new(
-            self.dir.bytes(),
-            self.entry(b).frontier as usize,
-            self.rounded,
-        )
+        self.dir.frontier(b, &self.entry(b), self.rounded)
     }
 
     /// The first entry from `from` on whose group ends at `slot` or later
@@ -1442,7 +1438,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .sc
             .iter()
             .filter_map(|s| self.terms[s.term].as_ref())
-            .map(|set| (set.postings.footer.len() + set.postings.directory_bytes().len()) as u64)
+            .map(|set| (set.postings.footer.len() + set.postings.directory_len()) as u64)
             .sum();
         let (mut reached, mut loaded, mut read) = (0u64, 0u64, 0u64);
         for (set, mem) in self.terms.iter().zip(&self.mems) {
@@ -3132,6 +3128,7 @@ pub(super) fn walk_into<'s, 'a>(
     };
     let mut req: Vec<usize> = required.clone();
     req.sort_by_key(|t| terms[*t].as_ref().expect("checked").df);
+    copy_directories(&terms, &req);
     let n = sc.len();
     let bar = top.bar();
     let mut walk = Walk {
@@ -3294,6 +3291,31 @@ pub(super) fn walk_into<'s, 'a>(
     answer.position_checks += done.position_checks;
     answer.class_cuts += done.class_cuts;
     Ok(Some(walk.terms))
+}
+
+/// Copies whole the directories a walk reads on through, in group order:
+/// the lead's (`req`'s first, the rarest required term) and those of terms
+/// not required (a disjunction's), a page at a time. Another required
+/// term's is asked for the lead's groups only, and copies the blocks of
+/// entries they read as it reads them ([`Directory::fill`]).
+fn copy_directories(terms: &[Option<TermSet<'_>>], req: &[usize]) {
+    use segment::tinshape::dir_census::Role;
+    for (t, set) in terms.iter().enumerate() {
+        let Some(dir) = set.as_ref().and_then(|s| s.dir.as_ref()) else {
+            continue;
+        };
+        let role = if req.first() == Some(&t) {
+            Role::Lead
+        } else if req.contains(&t) {
+            Role::Probed
+        } else {
+            Role::Or
+        };
+        dir.census_role(role);
+        if role != Role::Probed {
+            dir.fill_all().unwrap_or_else(|e| corrupt_footer(e));
+        }
+    }
 }
 
 fn span_check<'a>(
