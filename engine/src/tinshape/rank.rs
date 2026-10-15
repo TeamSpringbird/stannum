@@ -2369,15 +2369,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             Kind::Grid(bytes) => bytes,
             _ => unreachable!("a grid"),
         };
-        // Sized, not cleared: the first grid, of the group's words, is
-        // loaded over every word.
         let words = &mut self.words;
-        let lead = grid(&self.mems[self.req[0]]);
+        words.clear();
         words.resize(group.words(), 0);
-        if lead.len() != 8 * words.len() {
-            words.fill(0);
-        }
-        kernels::load(words, lead);
+        kernels::load(words, grid(&self.mems[self.req[0]]));
         for &t in &self.req[1..] {
             kernels::and_bytes(words, grid(&self.mems[t]));
         }
@@ -3703,9 +3698,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut loaded = std::mem::take(&mut self.row_loaded);
         loaded.clear();
         loaded.resize(n, false);
-        // Sized, not cleared: every word is written below (a row is of the
-        // group's words).
         let mut mask = std::mem::take(&mut self.words);
+        mask.clear();
         mask.resize(words, 0);
         let filters = plan.required.len()
             + if plan.by_essential {
@@ -3716,21 +3710,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if filters == 0 {
             mask.fill(!0);
         }
-        // The essential terms ORed into the mask, the first loaded into it,
-        // then the required terms ANDed in; without essential terms the
-        // first required one is the mask to start from.
+        // The essential terms ORed into the mask, cleared above, then the
+        // required terms ANDed in; without essential terms the first
+        // required one is the mask to start from.
         let mut required = plan.required.iter();
         if plan.by_essential && !plan.essential.is_empty() {
             for e in 0..plan.essential.len() {
                 let i = plan.essential[e];
                 self.or_load(i, g, words)?;
                 loaded[i] = true;
-                let row = self.row_state[i].at.bytes();
-                if e == 0 {
-                    kernels::load(&mut mask, row);
-                } else {
-                    kernels::or_bytes(&mut mask, row);
-                }
+                kernels::or_bytes(&mut mask, self.row_state[i].at.bytes());
             }
         } else if let Some(&first) = required.next() {
             self.or_load(first, g, words)?;
