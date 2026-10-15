@@ -97,9 +97,11 @@ pub trait Touch {
 pub enum PhraseStep {
     /// Its positions are about to be checked apart (read untouched).
     Oracle,
-    /// Its staging begins; whether it holds the phrase.
+    /// Its staging begins; whether it holds the phrase, and whether the
+    /// walk has common terms.
     Stage {
         holds: bool,
+        common: bool,
     },
     /// Its common terms' buckets are read next: its rarer terms'
     /// buckets left it in reach.

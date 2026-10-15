@@ -24,6 +24,8 @@ use rustc_hash::FxHashMap;
 #[derive(Clone, Copy, Default)]
 struct Cand {
     holds: bool,
+    /// Whether its walk has common terms, and whether it read theirs.
+    walk: bool,
     common: bool,
     /// Its own positions check's verdict, when it had one.
     checked: Option<bool>,
@@ -35,8 +37,9 @@ struct Cand {
     check: u64,
 }
 
-/// Per class of candidate (whether it holds the phrase, whether it read
-/// its common terms' buckets): how many, and their times.
+/// Per class of candidate (whether it holds the phrase; whether its walk
+/// has common terms and whether it read their buckets): how many, and
+/// their times.
 #[derive(Clone, Copy, Default, Debug)]
 pub struct Class {
     pub count: u64,
@@ -55,8 +58,10 @@ pub struct Class {
 /// The census's tallies over every walk.
 #[derive(Default, Debug)]
 pub struct Tally {
-    /// `[holds][common]`.
-    pub classes: [[Class; 2]; 2],
+    /// `[holds][kind]`, kind 0 in a walk with no common term, 1 for a
+    /// candidate cut before its common terms' buckets, 2 for one that read
+    /// them.
+    pub classes: [[Class; 3]; 2],
     pub oracle_ns: u64,
     pub sieve_ns: u64,
     pub sieve_in: u64,
@@ -93,7 +98,8 @@ impl<'t> Census<'t> {
     }
 
     fn close(&mut self, c: Cand) {
-        let class = &mut self.tally.classes[usize::from(c.holds)][usize::from(c.common)];
+        let kind = usize::from(c.walk) + usize::from(c.common);
+        let class = &mut self.tally.classes[usize::from(c.holds)][kind];
         class.count += 1;
         class.pre += c.pre;
         class.post += c.post;
@@ -144,13 +150,14 @@ impl Touch for Census<'_> {
         self.tally.reads += 1;
         match step {
             PhraseStep::Oracle => self.oracle_at = now,
-            PhraseStep::Stage { holds } => {
+            PhraseStep::Stage { holds, common } => {
                 self.tally.oracle_ns += now - self.oracle_at;
                 if let Some((_, _, c)) = self.cur.take() {
                     self.close(c);
                 }
                 let c = Cand {
                     holds,
+                    walk: common,
                     at: now,
                     ..Cand::default()
                 };
@@ -270,8 +277,9 @@ impl Tally {
         // A part's time less the clock read it holds.
         let fix = |ns: u64, parts: u64| ns as f64 - parts as f64 * self.clock_ns;
         for holds in [false, true] {
-            for common in [false, true] {
-                let c = &self.classes[usize::from(holds)][usize::from(common)];
+            for kind in 0..3 {
+                let common = kind == 2;
+                let c = &self.classes[usize::from(holds)][kind];
                 let all = fix(c.pre, c.count)
                     + fix(c.post, if common { c.count } else { 0 })
                     + fix(c.finish, c.finished);
@@ -281,7 +289,7 @@ impl Tally {
                     format!(
                         "{}/{}",
                         if holds { "holds" } else { "not" },
-                        if common { "common" } else { "rare" }
+                        ["none", "cut", "common"][kind]
                     ),
                     c.count,
                     c.finished,
@@ -297,14 +305,14 @@ impl Tally {
             }
         }
         let not = &self.classes[0];
-        let wasted_common = fix(not[1].post, not[1].count) + fix(not[1].finish, not[1].finished);
-        let failed = (0..2).map(|h| self.classes[h][1].failed_ns).sum::<u64>() as f64;
+        let wasted_common = fix(not[2].post, not[2].count) + fix(not[2].finish, not[2].finished);
+        let failed = (0..2).map(|h| self.classes[h][2].failed_ns).sum::<u64>() as f64;
         let wasted_rare = fix(not[0].pre, not[0].count) + fix(not[0].finish, not[0].finished);
         let _ = writeln!(
             out,
             "not holding the phrase, from their common terms' buckets on: {:.1} ms ({:.1}% of \
              own); of it by those whose own check failed: {:.1} ms ({:.1}%); not holding, \
-             with no common term, staged and finished: {:.1} ms ({:.1}%)",
+             in walks with no common term, staged and finished: {:.1} ms ({:.1}%)",
             ms(wasted_common),
             100.0 * wasted_common / own,
             ms(failed),

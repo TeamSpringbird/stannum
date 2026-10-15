@@ -3076,8 +3076,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             index.push(found.expect("a candidate holds every span term"));
         }
         let holds = check.holds(&index, &mut NoTouch)?;
+        let common = self.common_terms;
         self.touch
-            .census_phrase(g, local, PhraseStep::Stage { holds });
+            .census_phrase(g, local, PhraseStep::Stage { holds, common });
         Ok(())
     }
 
