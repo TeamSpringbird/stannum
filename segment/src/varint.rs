@@ -21,16 +21,16 @@ pub fn put(out: &mut Vec<u8>, mut value: u64) {
 #[inline]
 pub fn get(bytes: &[u8], at: &mut usize) -> Result<u64> {
     // Directories and footers are runs of varints, most of one or two
-    // bytes, decoded per query: those take no loop and one bounds check.
+    // bytes, decoded per query: those take no loop and one bounds check,
+    // and are told apart without a branch (a run mixes them, a frontier's
+    // pairs as they come): `two` is all ones for two bytes, and the second
+    // byte (another varint's after a one-byte one) is kept only then.
     if let Some(pair) = bytes.get(*at..*at + 2) {
         let (b0, b1) = (pair[0], pair[1]);
-        if b0 & 0x80 == 0 {
-            *at += 1;
-            return Ok(u64::from(b0));
-        }
-        if b1 & 0x80 == 0 {
-            *at += 2;
-            return Ok(u64::from(b0 & 0x7f) | (u64::from(b1) << 7));
+        let two = u64::from(b0 >> 7);
+        if two & u64::from(b1 >> 7) == 0 {
+            *at += 1 + two as usize;
+            return Ok(u64::from(b0 & 0x7f) | (u64::from(b1) & two.wrapping_neg()) << 7);
         }
     }
     get_slow(bytes, at)
