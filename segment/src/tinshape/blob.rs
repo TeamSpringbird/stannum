@@ -198,6 +198,29 @@ const NO_PAGE: PageRef = PageRef {
     len: 0,
 };
 
+/// `ceil(2^64 / n)` for [`divide`]; zero for an `n` below 2 or of 2^32 or
+/// more.
+fn magic(n: usize) -> u64 {
+    match u32::try_from(n) {
+        Ok(n) if n >= 2 => u64::MAX / u64::from(n) + 1,
+        _ => 0,
+    }
+}
+
+/// `at / n` (`n` not zero), `magic` being [`magic`]`(n)`: for an `at` below
+/// 2^32 a multiply (Lemire, Kaser and Kurz, "Faster remainder by direct
+/// computation", 2019: exact for every 32-bit dividend and divisor), not a
+/// division, whose latency (12 cycles or more on x86-64) each read of a
+/// pinned page waited on to find the page's memo.
+#[inline(always)]
+fn divide(at: usize, n: usize, magic: u64) -> usize {
+    if (at as u64) >> 32 == 0 && magic != 0 {
+        ((u128::from(magic) * at as u128) >> 64) as usize
+    } else {
+        at / n
+    }
+}
+
 /// Pages pinned since a mark that [`LazyBlob::release_since`] keeps by
 /// default, those read last: a walk's next group most often reads on from
 /// the pages each of its streams (a term's containers and TF tail, the DL
@@ -322,6 +345,10 @@ pub struct LazyBlob {
     source: Box<dyn Source>,
     /// The source's bytes per page, zero when it pins none.
     page_len: usize,
+    /// `ceil(2^64 / page_len)`, which divides an offset below 2^32 by the
+    /// page length with a multiply ([`Self::page_of`]); zero where it
+    /// cannot (a page length below 2 or of 2^32 or more).
+    page_magic: u64,
     /// Open [`Self::open_span`]s.
     spans: Cell<u32>,
     /// The outermost span open or last opened, numbering them from 1.
@@ -378,6 +405,7 @@ impl LazyBlob {
             loaded: Cell::new(0),
             source,
             page_len,
+            page_magic: magic(page_len),
             spans: Cell::new(0),
             span: Cell::new(0),
             pages: Box::new([const { Cell::new(NO_PAGE) }; PAGE_MEMO]),
@@ -710,7 +738,7 @@ impl LazyBlob {
     fn get_kind(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         if self.spans.get() > 0 && from < to && self.page_len > 0 {
             let n = self.page_len;
-            let page = from / n;
+            let page = self.page_of(from);
             let known = self.pages[page % PAGE_MEMO].get();
             if known.page == page && known.span == self.span.get() && to <= page * n + known.len {
                 self.touch(page);
@@ -723,6 +751,12 @@ impl LazyBlob {
             }
         }
         self.get_slow(from, to, kind)
+    }
+
+    /// The page offset `at` lies on (the page length not zero).
+    #[inline(always)]
+    fn page_of(&self, at: usize) -> usize {
+        divide(at, self.page_len, self.page_magic)
     }
 
     #[inline(never)]
@@ -1174,6 +1208,25 @@ impl Source for PinningSource {
 mod tests {
     use super::*;
     use std::rc::Rc;
+
+    /// The multiply divides as the division does: for page lengths of
+    /// every kind, at offsets near each multiple of them, below 2^32 and
+    /// past it.
+    #[test]
+    fn divides_by_a_multiply() {
+        for n in [1usize, 2, 3, 7, 4096, 8192, 8136, 8160, 65521, 1 << 20, u32::MAX as usize] {
+            let m = magic(n);
+            let mut ats: Vec<usize> = (0..5000).collect();
+            for k in [1usize, 2, 3, 1000, 524_287, (u32::MAX as usize) / n] {
+                let at = k.saturating_mul(n);
+                ats.extend(at.saturating_sub(2)..=at.saturating_add(2));
+            }
+            ats.extend([u32::MAX as usize - 1, u32::MAX as usize, 1 << 32, (1 << 40) + 5]);
+            for at in ats {
+                assert_eq!(divide(at, n, m), at / n, "{at} / {n}");
+            }
+        }
+    }
 
     fn pinning(len: usize, page_len: usize) -> (PinningSource, LazyBlob) {
         let bytes: Vec<u8> = (0..len).map(|i| (i * 13 + 5) as u8).collect();
