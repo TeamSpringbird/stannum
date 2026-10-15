@@ -2161,7 +2161,7 @@ impl<'a> Directory<'a> {
         // block was copied, which holds the next row too unless that row
         // begins a block: a walk in order checks a block once.
         let (head, v) = match self.ahead.get() {
-            (r, head, totals) if r == b && b % DIRECTORY_BLOCK != 0 => (head, totals),
+            (r, head, totals) if r == b && !b.is_multiple_of(DIRECTORY_BLOCK) => (head, totals),
             _ => {
                 self.fill(b / DIRECTORY_BLOCK)?;
                 self.row(b)

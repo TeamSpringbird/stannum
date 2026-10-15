@@ -1198,6 +1198,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: a segment blob loaded on demand a chunk at a time for the ctid-native paths."
     },
+    "segment/src/tinshape/dir_census.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a lab census of the group directory bytes a query reads, built with the dir-census feature only."
+    },
     "segment/src/tinshape/docs.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the ctid grid, document set, DL sidecar and liveness bitmap of the ctid-addressed segment format."
