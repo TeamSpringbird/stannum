@@ -218,7 +218,7 @@ a score it covers).
 A grid group (a dense term's) refines its frontier per **sub-range** of
 1,024 slots (page layout 13, `Options::sub_codes`; not TIN's measured
 structure, measured and not adopted, see [sub-range
-codes](#sub-range-codes-for-grid-groups-layout-13)): its container's words
+codes](#sub-range-codes-for-grid-groups-branch-loopr10-page-layout-13)): its container's words
 are followed by a byte per sub-range and frontier pair, the least rounded
 length code of the sub-range's postings whose bucket lies above the
 previous pair's (`put_sub_codes`). A posting of the sub-range is then
