@@ -35,19 +35,21 @@ PAGE_SIZE = 8192
 PAGE_HEADER = 24
 SPECIAL_SIZE = 8
 MAGIC = 0x4C445032
-VERSION = 15
+VERSION = 16
 KIND_META = 1
 KIND_RUN = 3
 SPEC_BYTES = 8
 NONE = 0xFFFFFFFF
 FILE_BLOCKS = (1 << 30) // PAGE_SIZE
-# storage/layout.rs (page version 14; versions 7 to 14 changed segments, not
-# pages): a run is first, blocks, bytes and last
-# page; an entry is the segment's run, its page table's run, its dead list's
-# run, the dead list's stamp, documents, total length, generation and origin
-# (a byte padded to four).
+# storage/layout.rs (page version 16): a run is its first page, its pages,
+# its bytes and its last page. An entry is the segment's run (its bytes in 64
+# bits), its page table's run (no bytes: four a page of the segment), its
+# dead list's run (bytes in 32 bits), the dead list's stamp, documents, total
+# length, generation and origin (a byte padded to four).
+WIDE_RUN_BYTES = 20
+TABLE_BYTES = 12
 RUN_BYTES = 16
-ENTRY_BYTES = RUN_BYTES * 3 + 4 + 4 + 8 + 4 + 4
+ENTRY_BYTES = WIDE_RUN_BYTES + TABLE_BYTES + RUN_BYTES + 4 + 4 + 8 + 4 + 4
 # The meta page: identity, tokenizer settings, the write buffer's version,
 # epoch, head, tail, tail use, bytes and documents, then the next generation
 # and the segment, pending, sealed and retired counts.
@@ -85,8 +87,11 @@ class Relation:
             raise SystemExit(f"block {block}: not an LDP2 page")
         return kind, page[PAGE_HEADER:lower]
 
-    def run(self, first, blocks, nbytes):
-        out = bytearray()
+    def run(self, first, blocks, nbytes, out=None):
+        """The run's bytes, or written to the binary file `out` as they
+        are read (a segment can be 16 GiB), returning its first bytes."""
+        held = bytearray()
+        written = 0
         block = first
         for _ in range(blocks):
             if block == NONE:
@@ -95,10 +100,17 @@ class Relation:
             if kind != KIND_RUN:
                 raise SystemExit(f"block {block}: kind {kind} is not a run page")
             block, = struct.unpack_from("<I", payload, 0)
-            out += payload[4:4 + min(len(payload) - 4, nbytes - len(out))]
-        if len(out) != nbytes:
-            raise SystemExit(f"run: {len(out)} of {nbytes} bytes")
-        return bytes(out)
+            data = payload[4:4 + min(len(payload) - 4, nbytes - written)]
+            written += len(data)
+            if out is None:
+                held += data
+            else:
+                out.write(data)
+                if not held:
+                    held += data[:4]
+        if written != nbytes:
+            raise SystemExit(f"run: {written} of {nbytes} bytes")
+        return bytes(held)
 
 
 def reloptions(dbname, index):
@@ -141,21 +153,22 @@ def main():
     manifest.append(f"buffer_docs\t{buffer_docs}")
     total = 0
     for _ in range(segment_count):
-        first, blocks, nbytes, _last = struct.unpack_from("<IIII", meta, at)
-        dead_first, dead_blocks, dead_bytes, _dead_last = struct.unpack_from("<IIII", meta, at + 2 * RUN_BYTES)
-        docs, total_length, generation = struct.unpack_from("<IQI", meta, at + 3 * RUN_BYTES + 4)
+        first, blocks, nbytes, _last = struct.unpack_from("<IIQI", meta, at)
+        dead_at = at + WIDE_RUN_BYTES + TABLE_BYTES
+        dead_first, dead_blocks, dead_bytes, _dead_last = struct.unpack_from("<IIII", meta, dead_at)
+        docs, total_length, generation = struct.unpack_from("<IQI", meta, dead_at + RUN_BYTES + 4)
         at += ENTRY_BYTES
-        blob = relation.run(first, blocks, nbytes)
         path = out / f"gen{generation}.segment"
-        path.write_bytes(blob)
-        total += len(blob)
+        with path.open("wb") as file:
+            head = relation.run(first, blocks, nbytes, out=file)
+        total += nbytes
         dead_name = "-"
         if dead_first != NONE:
             dead_name = f"gen{generation}.dead"
             (out / dead_name).write_bytes(relation.run(dead_first, dead_blocks, dead_bytes))
         manifest.append(f"segment\t{generation}\t{docs}\t{path.name}\t{dead_name}")
-        print(f"{path}: {len(blob)} bytes in {blocks} pages, {docs} documents, "
-              f"{total_length} tokens, {blob[:4].decode('ascii', 'replace')}"
+        print(f"{path}: {nbytes} bytes in {blocks} pages, {docs} documents, "
+              f"{total_length} tokens, {head[:4].decode('ascii', 'replace')}"
               + (f", dead list of {dead_bytes} bytes" if dead_first != NONE else ""))
     (out / "manifest.tsv").write_text("\n".join(manifest) + "\n")
     if buffer_docs:

@@ -63,6 +63,8 @@ pub struct DictionaryBuilder {
     count: usize,
     index: Vec<u8>,
     blocks: Vec<u8>,
+    /// Bytes of blocks handed out by [`Self::take_blocks`], ahead of `blocks`.
+    taken: u64,
     last: Vec<u8>,
     /// Where the previous entry's extents ended, for the gaps.
     payload_end: u64,
@@ -82,7 +84,7 @@ impl DictionaryBuilder {
             return Err(Error::InvalidTfBucket);
         }
         let shared = if self.count.is_multiple_of(BLOCK_TERMS) {
-            varint::put(&mut self.index, self.blocks.len() as u64);
+            varint::put(&mut self.index, self.taken + self.blocks.len() as u64);
             varint::put(&mut self.index, term.len() as u64);
             self.index.extend_from_slice(term.as_bytes());
             self.payload_end = 0;
@@ -132,13 +134,35 @@ impl DictionaryBuilder {
         self.count == 0
     }
 
+    /// The blocks written since the last call, which the caller keeps in
+    /// order: [`Self::finish_parts`] then gives the stream's head and the
+    /// blocks after them.
+    pub fn take_blocks(&mut self) -> Vec<u8> {
+        self.taken += self.blocks.len() as u64;
+        std::mem::take(&mut self.blocks)
+    }
+
+    /// Bytes of blocks held, not yet taken.
+    pub fn held(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// The stream: its header and index, the blocks taken (`taken` bytes),
+    /// then the blocks returned here.
+    pub fn finish_parts(self) -> (Vec<u8>, u64, Vec<u8>) {
+        let mut head = Vec::with_capacity(self.index.len() + 16);
+        varint::put(&mut head, self.count as u64);
+        varint::put(&mut head, self.count.div_ceil(BLOCK_TERMS) as u64);
+        varint::put(&mut head, self.index.len() as u64);
+        head.extend_from_slice(&self.index);
+        (head, self.taken, self.blocks)
+    }
+
+    /// The stream, of a builder whose blocks were never taken.
     pub fn finish(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.index.len() + self.blocks.len() + 16);
-        varint::put(&mut out, self.count as u64);
-        varint::put(&mut out, self.count.div_ceil(BLOCK_TERMS) as u64);
-        varint::put(&mut out, self.index.len() as u64);
-        out.extend_from_slice(&self.index);
-        out.extend_from_slice(&self.blocks);
+        let (mut out, taken, blocks) = self.finish_parts();
+        assert_eq!(taken, 0, "finish() of a dictionary whose blocks were taken");
+        out.extend_from_slice(&blocks);
         out
     }
 }
@@ -274,8 +298,15 @@ impl<'a> DictionaryIndex<'a> {
         Some(block)
     }
 
-    fn block_terms(&self, block: usize) -> usize {
+    /// Terms in block `block`.
+    pub fn block_terms(&self, block: usize) -> usize {
         (self.count - block * BLOCK_TERMS).min(BLOCK_TERMS)
+    }
+
+    /// Byte range of block `block` within a blocks area of `blocks_len`
+    /// bytes, for a reader that fetches blocks one at a time.
+    pub fn block_extent(&self, block: usize, blocks_len: usize) -> Option<(usize, usize)> {
+        (block < self.blocks).then(|| self.block_range(block, blocks_len))
     }
 
     /// Byte range of block `block` within the blocks area.

@@ -64,11 +64,15 @@ would change scores midway through a ranked scan.
 | `stannum.deferred_merge_docs` | 262,144 | Input documents of the one merge an insert may run after promoting, outside the metadata lock |
 | `stannum.merge_tier_factor` | 8 | Segments per size tier before they merge |
 | `stannum.max_segments` | 96 | Soft bound on directory entries; 96 is the hard on-disk bound |
+| `stannum.initial_segment_count` | 4 | Segments an index build ends with (TIN's default build gives four) |
 
-An index may override three of these for itself with the TIN-named storage
+An index may override four of these for itself with the TIN-named storage
 options: `max_mutable_segment_size` (bytes) for `write_buffer_bytes`,
-`target_segment_count` for `max_segments`, and `max_merged_segment_size`
-(megabytes) for the merge input ceiling. `dead_percent_threshold` sets the dead
+`initial_segment_count` for the build's `initial_segment_count`,
+`target_segment_count` for `max_segments` (unset, an index that sets
+`initial_segment_count` aims for that, as TIN's target defaults to it), and
+`max_merged_segment_size` (megabytes) for the maintenance merge ceiling,
+2000 MB by default as TIN's. `dead_percent_threshold` sets the dead
 fraction at which VACUUM rewrites a segment, 0.5 by default.
 
 The next insert seals a nonempty buffer before appending a record that would
@@ -118,6 +122,20 @@ representable output. These format bounds do not impose a peak-memory cap.
 An unlocked merge's output is the same segment as a locked one's, byte for
 byte, so a build writes the same index either way.
 
+Every merge streams. It reads its inputs' runs a range at a time through
+their page tables, the term map, postings and positions of each through a
+window that moves forward with the term walk, and decodes only the header
+and the document set of each whole. What it builds term by term (the
+output's term map blocks, postings and positions) goes to temporary files
+(PostgreSQL's `BufFile`, removed with the transaction, counted against
+`temp_file_limit`) until the last term, since the term map comes first in
+the blob; the run is then written front to back, a page claimed as an empty
+run page when its predecessor needs the link. A merge holds a few bytes per
+document of its inputs and its output, the term maps' indexes and the term
+at hand's postings and positions, rather than its inputs' and output's
+bytes: an offline merge of whole blobs to four segments peaked at 56 GB at
+150M rows.
+
 PostgreSQL defers interrupts while the metadata buffer lock is held. Merge
 checkpoints respect that deferral; insert checks again immediately after
 publication releases the lock. That is why only the budgeted merges run
@@ -132,16 +150,24 @@ retired inputs cause a retry. Publication revalidates the complete entries and
 discards stale output. All-dead inputs have no successor. Oversized aggregate
 inputs fall back to rebuilding documents, as foreground merges do.
 
-A merge takes at most 3 GiB of input (`SEGMENT_BYTES_CAP`, or the index's
-`max_merged_segment_size` when smaller), dropping its largest members until it
-fits, because a run records its length in 32 bits; writing a longer segment is
-an error rather than a wrapped length.
+A maintenance merge (an insert's, VACUUM's or a worker's) takes at most the
+index's `max_merged_segment_size` of input, 2000 MB unless it sets one,
+dropping its largest members until it fits: the ceiling bounds how long one
+merge runs, and leaves the segments a build ends with, which are larger, as
+they are. No merge takes more than 16 GiB (`SEGMENT_BYTES_CAP`). A run's
+length has 64 bits on the meta page.
 
-An index build ends by compacting its directory: the smallest segments that
-fit one run together under the segment byte cap are merged, repeatedly, so
-the build leaves the fewest segments the cap allows rather than the leftovers
-of every tier. Every query pays a dictionary lookup and a stream head per
-term per segment, which is what the compaction buys back. The build then packs
+An index build ends by merging its directory into `initial_segment_count`
+segments (4 unless the index or `stannum.initial_segment_count` says
+otherwise) of about equal size: the entries are dealt, largest first, into
+that many groups, each the lightest so far, and each group is merged into
+one segment. A group stays within 16 GiB, so a larger index gets more
+segments; a smaller one gets fewer, each holding at least 1 GiB, down to
+one. Every query pays a dictionary lookup and a stream head per term per
+segment, which is what the final merges buy back: at 150M rows, four
+segments rather than fourteen take 2-7% fewer cycles per query, answers
+unchanged. The merges run one after another: an index being built is
+invisible to the maintenance workers. The build then packs
 its live runs into the lowest pages of the relation, marks the pages it reused
 as used in the free space map, and truncates the rest: tier merges retire
 about as many pages as they keep, and freed pages are reusable but never
@@ -373,9 +399,8 @@ the 150 million row Stack Exchange corpus the index is 47 GB, and
 disjunctions read no positions at all.
 
 Fewer segments mean fewer dictionary lookups and stream heads per query, which
-is why a build compacts its directory. Segments are bounded by the 3 GiB merge
-input cap and the 32-bit run length: a direct merge holds every input blob and
-its output in memory, so larger segments would need a streaming merge.
+is why a build ends with few. Merges stream their inputs and output, so a
+segment's size is bounded by the 16 GiB merge cap, not by memory.
 
 ## Reading an index
 

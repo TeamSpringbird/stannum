@@ -77,8 +77,8 @@ fn describe(tid: Tid) -> String {
 }
 
 /// How many pages a run of `bytes` bytes occupies when written by `write_run`.
-fn pages_for(bytes: u32) -> u32 {
-    bytes.div_ceil(CHAIN_CAPACITY as u32).max(1)
+fn pages_for(bytes: u64) -> u32 {
+    u32::try_from(bytes.div_ceil(CHAIN_CAPACITY as u64).max(1)).unwrap_or(u32::MAX)
 }
 
 /// A page read for the walk: its kind, chain link and data.
@@ -394,7 +394,7 @@ impl Checker {
             self.error(owner, "buffer state has no head page");
             return;
         }
-        let live_pages = pages_for(state.bytes) as usize;
+        let live_pages = pages_for(u64::from(state.bytes)) as usize;
         let mut stream = Vec::with_capacity(state.bytes as usize);
         let mut block = state.head;
         let mut pages = Vec::new();

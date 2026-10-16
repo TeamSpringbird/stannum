@@ -11,6 +11,10 @@ license.workspace = true
 description = "Stannum's query engine measured outside PostgreSQL: a replay of query traces over dumped segments, and kernel benchmarks"
 publish = false
 
+[features]
+# tnsreplay's window bounds census (STANNUM_WIN_CENSUS=1).
+census = ["engine/census"]
+
 [dependencies]
 boldi-vigna = { path = "../boldi-vigna" }
 engine = { path = "../engine", features = ["kernels", "stats"] }
