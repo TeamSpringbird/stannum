@@ -6,7 +6,7 @@
 # Trains the profile-guided optimization (PGO) profiles described in
 # docs/benchmarks.md#profile-guided-builds.
 #
-#   script/pgo-build image --data DIR --trace FILE [--image TAG [--no-build]] [--out FILE]
+#   script/pgo-build image --data DIR --trace FILE [--image TAG [--no-build]] [--target-cpu LEVEL] [--out FILE]
 #   script/pgo-build replay --dump DIR --trace FILE [--expect FILE] [--out FILE]
 #
 # image: the extension's profile, the one benchmarks/Dockerfile's
@@ -19,9 +19,16 @@
 # the server so that every backend writes its counts, and merges them into
 # FILE (default benchmarks/pgo/<arch>.profdata, <arch> as `uname -m` prints
 # it inside the image), with its 40 hottest functions beside it in
-# <arch>.hot.txt for script/pgo-check. Then rebuild the image with
-# STANNUM_PGO=1 and commit both files. --no-build uses TAG as already built
-# with `benchmarks/tin.py build-image --pgo generate`.
+# <arch>.hot.txt for script/pgo-check. On x86-64 a profile is one build's:
+# without --target-cpu the baseline's (the image is built with --target-cpu
+# x86-64, since the benchmark image's default is the loader with both
+# builds); --target-cpu x86-64-v4 trains the x86-64-v4 build the loader runs
+# on such CPUs instead (default FILE benchmarks/pgo/x86_64-v4.profdata; train
+# it on a CPU with AVX-512). Then rebuild the image with STANNUM_PGO=1 and
+# commit both files. --no-build uses TAG as already built with
+# `benchmarks/tin.py build-image --pgo generate [--target-cpu LEVEL]`; a
+# loader image is refused (its counts would be whichever build the CPU
+# picked).
 #
 # replay: the offline replay's own profile (bench --bin tnsreplay; its
 # generic walk is instantiated over another page type, so the extension
@@ -47,7 +54,7 @@ usage() {
 mode=${1:-}
 [ -n "$mode" ] || usage
 shift
-data='' dump='' trace='' expect='' out='' image=stannum-bench:pgo-generate build=1
+data='' dump='' trace='' expect='' out='' image=stannum-bench:pgo-generate build=1 target_cpu=''
 while [ $# -gt 0 ]; do
     case "$1" in
         --data) data=$(cd "${2:?--data needs a directory}" && pwd); shift 2 ;;
@@ -56,6 +63,7 @@ while [ $# -gt 0 ]; do
         --expect) expect=${2:?--expect needs a file}; shift 2 ;;
         --out) out=${2:?--out needs a file}; shift 2 ;;
         --image) image=${2:?--image needs a tag}; shift 2 ;;
+        --target-cpu) target_cpu=${2:?--target-cpu needs a level}; shift 2 ;;
         --no-build) build=0; shift ;;
         -h|--help) usage 0 ;;
         *) usage ;;
@@ -77,12 +85,24 @@ profdata="$(rustc --print sysroot)/lib/rustlib/$host/bin/llvm-profdata"
 case "$mode" in
 image)
     [ -n "$data" ] || usage
+    # One build per x86-64 profile: the baseline unless a level is asked for.
+    build_cpu=$target_cpu
+    [ -n "$build_cpu" ] || [ "$(uname -m)" != x86_64 ] || build_cpu=x86-64
     if [ "$build" = 1 ]; then
         python3 benchmarks/tin.py build-image --image "$image" --base "${STANNUM_PGO_BASE:-postgres:18-trixie}" \
-            --pgo generate --output "$(mktemp -d)/image"
+            --pgo generate ${build_cpu:+--target-cpu "$build_cpu"} --output "$(mktemp -d)/image"
     fi
     arch=$(docker run --rm --entrypoint uname "$image" -m)
-    out=${out:-benchmarks/pgo/$arch.profdata}
+    built=$(docker image inspect -f '{{index .Config.Labels "benchmark.stannum_target_cpu"}}' "$image")
+    if [ "$arch" = x86_64 ] && [ "$built" = loader ]; then
+        echo "$image is a loader image (both builds); build the generate image with --target-cpu x86-64 or x86-64-v4" >&2
+        exit 2
+    fi
+    case "$target_cpu" in
+        x86-64-v*) level=-${target_cpu#x86-64-} ;;
+        *) level='' ;;
+    esac
+    out=${out:-benchmarks/pgo/$arch$level.profdata}
     raw="$data/pgo-raw"
     rm -rf "$raw"
     name=stannum-pgo-train

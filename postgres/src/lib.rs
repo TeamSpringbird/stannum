@@ -4,7 +4,8 @@
 // See LICENSE in the repository root for license terms.
 
 use engine::bm25;
-use pgrx::pg_guard;
+use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, pg_guard};
+use std::ffi::{CStr, CString};
 
 ::pgrx::pg_module_magic!(name);
 
@@ -66,8 +67,52 @@ fn check_for_interrupts(site: &'static str) {
     pgrx::check_for_interrupts!();
 }
 
+/// The CPU level this library was compiled for, as `SHOW stannum.cpu_level`
+/// reports it: on x86-64 Linux, which of the loader's two builds runs
+/// (`x86-64` or `x86-64-v4`; postgres/loader/loader.c), and `x86-64-v2` or
+/// `-v3` for builds for those levels.
+pub const CPU_LEVEL: &CStr = if cfg!(target_arch = "aarch64") {
+    c"aarch64"
+} else if cfg!(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512cd",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl"
+)) {
+    c"x86-64-v4"
+} else if cfg!(all(
+    target_feature = "avx2",
+    target_feature = "bmi2",
+    target_feature = "fma",
+    target_feature = "movbe"
+)) {
+    c"x86-64-v3"
+} else if cfg!(all(
+    target_feature = "sse4.2",
+    target_feature = "popcnt",
+    target_feature = "cmpxchg16b"
+)) {
+    c"x86-64-v2"
+} else if cfg!(target_arch = "x86_64") {
+    c"x86-64"
+} else {
+    c"portable"
+};
+
+static CPU_LEVEL_SETTING: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(CPU_LEVEL));
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    GucRegistry::define_string_guc(
+        c"stannum.cpu_level",
+        c"The CPU level the loaded Stannum library was compiled for",
+        c"On x86-64 Linux, the loader runs the x86-64-v4 build on CPUs with all of x86-64-v4 and the baseline x86-64 build elsewhere; the word kernels choose AVX2 or AVX-512 at runtime in either.",
+        &CPU_LEVEL_SETTING,
+        GucContext::Internal,
+        GucFlags::default(),
+    );
     tinql::limits::set_stack_check(check_stack_depth);
     segment::set_interrupt_check(check_for_interrupts);
     engine::set_interrupt_check(|| {
@@ -117,6 +162,24 @@ mod tests {
     }
 
     #[pg_test]
+    fn cpu_level_names_the_build() {
+        let level = Spi::get_one::<String>("SHOW stannum.cpu_level").unwrap();
+        assert_eq!(level.as_deref(), crate::CPU_LEVEL.to_str().ok());
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(level.as_deref(), Some("aarch64"));
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "sse4.2")))]
+        assert_eq!(level.as_deref(), Some("x86-64"));
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512vl"))]
+        assert_eq!(level.as_deref(), Some("x86-64-v4"));
+        // Internal: reported, never set.
+        let context = Spi::get_one::<String>(
+            "SELECT context FROM pg_settings WHERE name = 'stannum.cpu_level'",
+        )
+        .unwrap();
+        assert_eq!(context.as_deref(), Some("internal"));
+    }
+
+    #[pg_test]
     fn bitmap_index_rechecks_heap_pages_without_preloading() {
         assert_eq!(
             Spi::get_one::<String>("SHOW shared_preload_libraries").unwrap(),
@@ -146,6 +209,161 @@ mod tests {
         assert_eq!(plan[0]["Plan"]["Node Type"], "Bitmap Heap Scan");
         assert_eq!(plan[0]["Plan"]["Lossy Heap Blocks"], 0);
         assert_eq!(plan[0]["Plan"]["Plans"][0]["Index Name"], "lite_search_idx");
+    }
+
+    #[pg_test]
+    fn a_build_ends_with_its_initial_segment_count() {
+        // Segments of 50 documents and no tier merges: each build writes 40
+        // segments, and its final merges make the count it asks for, of
+        // about equal size. The floor that keeps a small index whole is
+        // lifted.
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(Some(1));
+        Spi::run(
+            "CREATE TABLE counted(id int, body text);
+             INSERT INTO counted SELECT n, 'common ' || (SELECT string_agg('w' || (n * k % 997), ' ')
+             FROM generate_series(1, 12) k) FROM generate_series(1, 2000) n;
+             SET LOCAL stannum.build_segment_docs = 50;
+             SET LOCAL stannum.merge_tier_factor = 64;",
+        )
+        .unwrap();
+        for (index, options, count) in [
+            ("counted_default", "", 4),
+            ("counted_three", "WITH (initial_segment_count = 3)", 3),
+            ("counted_one", "WITH (initial_segment_count = 1)", 1),
+        ] {
+            Spi::run(&format!(
+                "CREATE INDEX {index} ON counted USING stannum(body) {options}"
+            ))
+            .unwrap();
+            let segments = format!(
+                "FROM stannum.segment_info('{index}') WHERE kind = 'immutable' AND source_state = 'current'"
+            );
+            assert_eq!(
+                value(&format!("SELECT count(*) {segments}")),
+                count,
+                "{index}"
+            );
+            assert_eq!(
+                value(&format!("SELECT sum(docs)::bigint {segments}")),
+                2000,
+                "{index}"
+            );
+            // About equal: dealt by bytes, so within a build segment or two.
+            assert!(
+                value(&format!(
+                    "SELECT (max(docs) - min(docs))::bigint {segments}"
+                )) <= 100,
+                "{index}"
+            );
+            assert_eq!(
+                value(&format!("SELECT count(*) {segments} AND origin = 'merge'")),
+                count,
+                "{index}: every segment is a merge of the build's"
+            );
+            assert_clean(index);
+            for query in ["common", "w5", "w5 AND w7", "\"w5 w10\""] {
+                agreed_ids("counted", index, query);
+            }
+            Spi::run(&format!("DROP INDEX {index}")).unwrap();
+        }
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(None);
+        // A small index ends whole whatever it asks for: each segment a
+        // build ends with holds at least 1 GiB.
+        Spi::run(
+            "SET LOCAL stannum.build_segment_docs = 50;
+             SET LOCAL stannum.merge_tier_factor = 64;
+             CREATE INDEX counted_small ON counted USING stannum(body) WITH (initial_segment_count = 3);",
+        )
+        .unwrap();
+        assert_eq!(
+            value(
+                "SELECT count(*) FROM stannum.segment_info('counted_small') WHERE kind = 'immutable'"
+            ),
+            1
+        );
+    }
+
+    #[pg_test]
+    fn maintenance_aims_for_initial_segment_count_when_no_target_is_set() {
+        // TIN's target_segment_count defaults to initial_segment_count:
+        // promotions past it merge back down to it (within the merge byte
+        // ceiling), where an index that sets neither keeps tiers alone.
+        Spi::run(
+            "CREATE TABLE aimed(id int, body text);
+             CREATE INDEX aimed_idx ON aimed USING stannum(body) WITH (initial_segment_count = 2);
+             SET LOCAL stannum.write_buffer_docs = 10;
+             SET LOCAL stannum.merge_tier_factor = 64;
+             INSERT INTO aimed SELECT n, 'needle w' || n FROM generate_series(1, 200) n;
+             SELECT stannum.promote('aimed_idx');",
+        )
+        .unwrap();
+        let segments = "SELECT count(*) FROM stannum.segment_info('aimed_idx')
+             WHERE kind = 'immutable' AND source_state = 'current'";
+        Spi::run("SELECT * FROM stannum.merge('aimed_idx')").unwrap();
+        assert_eq!(value(segments), 2);
+        assert_eq!(
+            value("SELECT count(*) FROM aimed WHERE body ==> 'needle'"),
+            200
+        );
+        assert_clean("aimed_idx");
+    }
+
+    #[pg_test]
+    fn maintenance_leaves_the_segments_over_its_byte_ceiling_be() {
+        // A build ends with two segments; maintenance's byte ceiling (the
+        // index's max_merged_segment_size, here below either) then merges
+        // what inserts add among themselves and never into the build's,
+        // although the directory stays over its target (two, the build's
+        // initial_segment_count).
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(Some(1));
+        Spi::run(
+            "CREATE TABLE ceiling(id int, body text);
+             INSERT INTO ceiling SELECT n, (SELECT string_agg('w' || (n * k % 997), ' ')
+             FROM generate_series(1, 40) k) FROM generate_series(1, 2000) n;
+             SET LOCAL stannum.build_segment_docs = 100;
+             SET LOCAL stannum.merge_tier_factor = 64;
+             CREATE INDEX ceiling_idx ON ceiling USING stannum(body) WITH (initial_segment_count = 2);",
+        )
+        .unwrap();
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(None);
+        let current = "FROM stannum.segment_info('ceiling_idx')
+             WHERE kind = 'immutable' AND source_state = 'current'";
+        assert_eq!(value(&format!("SELECT count(*) {current}")), 2);
+        let built = value(&format!("SELECT sum(generation)::bigint {current}"));
+        let pages = value(&format!("SELECT min(total_pages)::bigint {current}"));
+        assert!(pages > 8, "{pages}");
+        // Below the smallest build segment's bytes, above three small ones'.
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some((pages as u64 - 1) * 4096));
+        Spi::run(
+            "SET LOCAL stannum.write_buffer_docs = 10;
+             INSERT INTO ceiling SELECT n, 'needle w' || n FROM generate_series(2001, 2030) n;
+             SELECT stannum.promote('ceiling_idx');",
+        )
+        .unwrap();
+        Spi::run("SELECT * FROM stannum.merge('ceiling_idx')").unwrap();
+        let again = Spi::get_one::<String>(
+            "SELECT coalesce(no_op_reason, 'merged') FROM stannum.merge('ceiling_idx')",
+        )
+        .unwrap()
+        .unwrap();
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(None);
+        assert_eq!(
+            again,
+            "the smallest segments exceed max_merged_segment_size"
+        );
+        // The build's two, untouched, and one of what the inserts added.
+        assert_eq!(value(&format!("SELECT count(*) {current}")), 3);
+        assert_eq!(
+            value(&format!(
+                "SELECT sum(generation)::bigint {current} AND docs >= 500"
+            )),
+            built
+        );
+        assert_eq!(
+            value("SELECT count(*) FROM ceiling WHERE body ==> 'needle'"),
+            30
+        );
+        assert_clean("ceiling_idx");
     }
 
     #[pg_test]
@@ -5772,6 +5990,93 @@ mod tests {
     }
 
     #[pg_test]
+    fn a_merge_canceled_while_writing_its_output_leaves_only_orphans_and_runs_again() {
+        // A build ends with eight segments (the floor that keeps a small
+        // index whole is lifted); stannum.merge to one streams them and
+        // writes the merged run front to back, claiming a page at a time.
+        // A cancel at its third claim stops it with pages already written:
+        // they are referenced by nothing (VACUUM's orphans), its temporary
+        // files are gone, the directory is as it was, and the merge run
+        // again completes.
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(Some(1));
+        Spi::run(
+            "CREATE TABLE midwrite(id int, body text);
+             INSERT INTO midwrite SELECT n, (SELECT string_agg('w' || (n * k % 997), ' ')
+             FROM generate_series(1, 40) k) FROM generate_series(1, 2000) n;
+             SET LOCAL stannum.build_segment_docs = 100;
+             SET LOCAL stannum.merge_tier_factor = 64;
+             CREATE INDEX midwrite_idx ON midwrite USING stannum(body) WITH (initial_segment_count = 8);",
+        )
+        .unwrap();
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(None);
+        let segments = "SELECT count(*) FROM stannum.segment_info('midwrite_idx')
+             WHERE kind = 'immutable' AND source_state = 'current'";
+        assert_eq!(value(segments), 8);
+        assert_clean("midwrite_idx");
+        let own_temp_files = "SELECT count(*) FROM pg_ls_tmpdir()
+             WHERE name LIKE 'pgsql_tmp' || pg_backend_pid() || '.%'";
+        use std::{cell::Cell, rc::Rc};
+        let claims = Rc::new(Cell::new(0u32));
+        let holdoff = Rc::new(Cell::new(u32::MAX));
+        let built = Rc::new(Cell::new(false));
+        let (c, h, b) = (claims.clone(), holdoff.clone(), built.clone());
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "run:claimed" {
+                c.set(c.get() + 1);
+                if c.get() == 3 {
+                    unsafe {
+                        h.set(pg_sys::InterruptHoldoffCount);
+                        pg_sys::QueryCancelPending = 1;
+                        pg_sys::InterruptPending = 1;
+                    }
+                }
+            }
+            if name == "maintenance:built" {
+                b.set(true);
+            }
+        })));
+        Spi::run(
+            "DO $$BEGIN
+            PERFORM * FROM stannum.merge('midwrite_idx', 1);
+            RAISE EXCEPTION 'the merge was not canceled';
+            EXCEPTION WHEN query_canceled THEN NULL;
+        END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert_eq!(
+            (claims.get(), holdoff.get(), built.get()),
+            (3, 0, false),
+            "the merge stops at the claim that sees the cancel, its output under way"
+        );
+        assert_eq!(value(segments), 8);
+        assert_eq!(
+            value(own_temp_files),
+            0,
+            "the spill files close with the merge"
+        );
+        assert!(
+            !findings("midwrite_idx", true).is_empty(),
+            "the pages written before the cancel are orphans"
+        );
+        assert_only_orphans("midwrite_idx");
+        for query in ["w5", "w5 AND w7", "\"w5 w10\""] {
+            agreed_ids("midwrite", "midwrite_idx", query);
+        }
+        let index = unsafe { pgrx::PgRelation::open_with_name("midwrite_idx") }.unwrap();
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("midwrite_idx");
+        Spi::run("SELECT * FROM stannum.merge('midwrite_idx', 1)").unwrap();
+        assert_eq!(value(segments), 1);
+        assert_eq!(value(own_temp_files), 0);
+        assert_eq!(
+            value("SELECT count(*) FROM midwrite WHERE body ==> 'w5'"),
+            value("SELECT count(*) FROM midwrite WHERE ' ' || body || ' ' LIKE '% w5 %'")
+        );
+        assert_clean("midwrite_idx");
+    }
+
+    #[pg_test]
     fn a_canceled_insert_stops_the_directory_bound_merge_at_the_next_checkpoint() {
         // One segment per insert and no budgeted merges: 97 inserts leave the
         // on-disk directory full (96 entries) and one document buffered, so
@@ -5838,10 +6143,11 @@ mod tests {
     #[pg_test]
     fn index_builds_are_byte_for_byte_reproducible() {
         // Tier merges while the build writes its segments, trimmed to a small
-        // merge cap, then the compaction and packing that end a build: the
-        // segments, their bytes and their pages are those recorded here from
-        // the build that merged under the meta lock. The uncapped build
-        // compacts to one segment.
+        // merge cap, then the final merges and packing that end a build: the
+        // segments, their bytes and their pages are those recorded here. The
+        // uncapped build ends whole (the index is small), byte for byte the
+        // segment the build that merged whole blobs under the meta lock
+        // wrote; the capped one in three groups of about equal size.
         Spi::run(
             "CREATE TABLE reproducible(id int, body text);
              INSERT INTO reproducible SELECT n, 'common ' || (SELECT string_agg('w' || (n * k % 1009), ' ')
@@ -5855,8 +6161,9 @@ mod tests {
         Spi::run("CREATE INDEX reproducible_whole ON reproducible USING stannum(body)").unwrap();
         assert_eq!(
             build_digest("reproducible_capped"),
-            "26,2850,88350,21,47,52960e124952db4ff2c00a409421901f;\
-             2,3150,97650,23,49,3b201b722bcaed3b93d54693c34a778b size 393216"
+            "33,2250,69750,17,46,65600098aeba35c4e28782d08a6a4e4b;\
+             20,1500,46500,12,47,632086f117ba324fe5f612998867418c;\
+             2,2250,69750,17,48,9b28da87480a70525a600503080b821a size 417792"
         );
         assert_eq!(
             build_digest("reproducible_whole"),
@@ -6866,7 +7173,7 @@ mod tests {
         let index =
             unsafe { pgrx::PgRelation::with_lock(oid, pg_sys::ShareUpdateExclusiveLock as _) };
         let pending = || unsafe { crate::storage::testing::pending_entries(index.as_ptr()) };
-        assert_eq!(pending(), 48);
+        assert_eq!(pending(), crate::storage::layout::MAX_PENDING);
         assert_clean("drain_race_idx");
         // The next fold's merge finds the list full and drains every entry,
         // then fails before the meta page is written: the page still lists
@@ -6883,12 +7190,16 @@ mod tests {
         .unwrap();
         crate::storage::testing::set_race_hook(None);
         assert!(fired.get());
-        assert_eq!(pending(), 48);
+        assert_eq!(pending(), crate::storage::layout::MAX_PENDING);
         assert_only_orphans("drain_race_idx");
         // The list drains for real on the next insert, and nothing a later
         // run allocates is still listed.
         Spi::run("INSERT INTO drain_race VALUES (121, 'needle w121')").unwrap();
-        assert!(pending() < 48, "{}", pending());
+        assert!(
+            pending() < crate::storage::layout::MAX_PENDING,
+            "{}",
+            pending()
+        );
         assert_only_orphans("drain_race_idx");
         unsafe { crate::storage::cleanup(index.as_ptr()) };
         Spi::run(
@@ -7057,6 +7368,14 @@ mod tests {
                 }
             }
         })));
+    }
+
+    /// Lets this session's builds end with `initial_segment_count` segments
+    /// however small: replaces the 1 GiB a segment a build ends with holds
+    /// at least. Driven by postgres/tests/crash_before_publication.py.
+    #[pg_extern]
+    fn set_final_segment_floor(bytes: i64) {
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(Some(bytes.max(1) as u64));
     }
 
     /// The bytes of directory entry `ordinal` of the index.

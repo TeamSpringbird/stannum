@@ -456,6 +456,110 @@ fn get_frontier(bytes: &[u8], at: &mut usize) -> Option<u64> {
     v
 }
 
+/// [`GroupFrontier`]'s pairs at `at` folded by [`higher`] in a loop: what
+/// [`fold_group_frontier`] computes without one.
+fn fold_frontier_pairs(
+    bytes: &[u8],
+    at: usize,
+    rounded: bool,
+    bound: &mut impl FnMut(u8, u32) -> f32,
+) -> f32 {
+    GroupFrontier::new(bytes, at, rounded)
+        .map(|(bucket, length)| bound(bucket, length))
+        .fold(0.0_f32, higher)
+}
+
+/// Codes [`round_length`] gives: 0 to 895.
+const ROUNDED_CODES: usize = 896;
+
+/// [`rounded_length`] of each code, and `u32::MAX` (its value past them)
+/// last: one load per pair in [`fold_group_frontier`], where computing it
+/// took a dozen instructions on x86-64.
+static ROUNDED_LENGTHS: [u32; ROUNDED_CODES + 1] = {
+    let mut out = [0; ROUNDED_CODES + 1];
+    let mut code = 0;
+    while code <= ROUNDED_CODES {
+        out[code] = rounded_length(code as u32);
+        code += 1;
+    }
+    out
+};
+
+/// The best of `bound` over the pairs of the group frontier at `at` of
+/// `bytes`, 0 at least: [`GroupFrontier`]'s pairs folded by [`higher`],
+/// bit for bit. Each varint of one or two bytes is read without a branch
+/// on which (by its first byte's high bit): at 150M rows 88% of a score
+/// disjunction's frontiers have a delta of two bytes among their first
+/// four pairs, among deltas of one, and `GroupFrontier`'s branch on each
+/// varint's length mispredicted. A frontier with a longer varint is folded
+/// by `GroupFrontier` instead.
+#[inline(always)]
+pub fn fold_group_frontier(
+    bytes: &[u8],
+    at: usize,
+    rounded: bool,
+    bound: impl FnMut(u8, u32) -> f32,
+) -> f32 {
+    // A record's frontiers are all rounded or all exact: a fold for each,
+    // with no test of it per pair.
+    if rounded {
+        fold_frontier::<true>(bytes, at, bound)
+    } else {
+        fold_frontier::<false>(bytes, at, bound)
+    }
+}
+
+/// [`fold_group_frontier`] of a record whose frontiers are `ROUNDED`.
+#[inline(always)]
+fn fold_frontier<const ROUNDED: bool>(
+    bytes: &[u8],
+    at: usize,
+    mut bound: impl FnMut(u8, u32) -> f32,
+) -> f32 {
+    let length = |code: u32| {
+        if ROUNDED {
+            ROUNDED_LENGTHS[(code as usize).min(ROUNDED_CODES)]
+        } else {
+            code
+        }
+    };
+    // A varint of one or two bytes at `p` without a branch on which (by
+    // its first byte's high bit), and its end; `long` set by one of three
+    // or more, which sends the frontier to the loop of `GroupFrontier`.
+    let varint = |p: usize, long: &mut u32| {
+        let pair: [u8; 2] = bytes.get(p..p + 2)?.try_into().ok()?;
+        let (b0, b1) = (u32::from(pair[0]), u32::from(pair[1]));
+        let two = b0 >> 7;
+        *long |= two & (b1 >> 7);
+        Some((
+            (b0 & 0x7f) | (b1 & 0x7f & two.wrapping_neg()) << 7,
+            p + 1 + two as usize,
+        ))
+    };
+    let mut long = 0;
+    let fast = (|| {
+        // The head: the count less one, and the first bucket. Then the
+        // first length's code, and per pair after it its deltas (the
+        // code's less one, shifted by four, and the bucket's less one).
+        let head = *bytes.get(at)?;
+        let mut bucket = u32::from(head & 15);
+        let (mut code, mut p) = varint(at + 1, &mut long)?;
+        let mut best = higher(0.0, bound(bucket as u8, length(code)));
+        for _ in 0..head >> 4 {
+            let (d, next) = varint(p, &mut long)?;
+            p = next;
+            bucket = (bucket + 1 + (d & 15)) & 15;
+            code += 1 + (d >> 4);
+            best = higher(best, bound(bucket as u8, length(code)));
+        }
+        Some(best)
+    })();
+    match fast {
+        Some(best) if long == 0 => best,
+        _ => fold_frontier_pairs(bytes, at, ROUNDED, &mut bound),
+    }
+}
+
 /// A group container an input segment holds that a merge may copy: its
 /// kind and bytes (as [`Postings::container`] gives them).
 ///
@@ -1648,6 +1752,13 @@ impl Directory {
     #[inline]
     pub fn bytes(&self) -> &[u8] {
         &self.bytes[..self.end]
+    }
+
+    /// [`Self::bytes`] and the zero bytes past them, for
+    /// [`fold_group_frontier`], which reads two bytes per varint.
+    #[inline]
+    pub fn frontier_bytes(&self) -> &[u8] {
+        &self.bytes
     }
 
     /// Bytes the parsed directory holds.
@@ -3849,6 +3960,83 @@ mod tests {
         varint::put(&mut bytes, 0);
         let mut at = 0;
         assert!(skip_group_frontier(&bytes, &mut at).is_err());
+    }
+
+    #[test]
+    fn the_rounded_lengths_table_is_rounded_length() {
+        for code in 0..=ROUNDED_CODES as u32 + 40 {
+            let at = (code as usize).min(ROUNDED_CODES);
+            assert_eq!(ROUNDED_LENGTHS[at], rounded_length(code), "{code}");
+        }
+        assert_eq!(ROUNDED_LENGTHS[ROUNDED_CODES], u32::MAX);
+        assert_eq!(round_length(u32::MAX) as usize, ROUNDED_CODES - 1);
+    }
+
+    #[test]
+    fn a_folded_frontier_is_its_pairs_fold() {
+        // Frontiers of 1 to 16 pairs, their varints of one to four bytes,
+        // between other bytes and at the end (with the slack after it or
+        // without): the fold is the pairs' fold by `higher`, to the bit,
+        // under bounds that rise, fall or give NaN.
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let bounds: [fn(u8, u32) -> f32; 4] = [
+            |b, l| f32::from(b + 1) / (1.0 + l as f32),
+            |b, l| 1.0 / (f32::from(b) + 1.0 + (l % 7) as f32),
+            |b, l| {
+                if u32::from(b).wrapping_add(l) % 3 == 0 {
+                    f32::NAN
+                } else {
+                    f32::from(b)
+                }
+            },
+            |_, _| 0.0,
+        ];
+        for round in 0..4000 {
+            let count = 1 + (next() % 16) as usize;
+            // Lengths and steps whose varints take one byte, one or two,
+            // or up to four.
+            let (first, step) = [(100, 8), (4000, 300), (1 << 24, 1 << 20)][(next() % 3) as usize];
+            let mut buckets: Vec<u8> = (0..16).collect();
+            for i in (1..16).rev() {
+                buckets.swap(i, (next() % (i as u64 + 1)) as usize);
+            }
+            buckets.truncate(count);
+            buckets.sort_unstable();
+            let mut length = (next() % first) as u32;
+            let pairs: Vec<(u8, u32)> = buckets
+                .iter()
+                .map(|&b| {
+                    length += 1 + (next() % step) as u32;
+                    (b, length)
+                })
+                .collect();
+            let lead = (next() % 5) as usize;
+            let mut bytes: Vec<u8> = (0..lead).map(|_| next() as u8).collect();
+            put_group_frontier(&mut bytes, &pairs);
+            let end = round % 3 == 0;
+            if !end {
+                bytes.extend((0..next() % 12).map(|_| next() as u8));
+            }
+            let slack = round % 2 == 0;
+            if slack {
+                bytes.extend([0; SLACK]);
+            }
+            for rounded in [false, true] {
+                for bound in bounds {
+                    let want = GroupFrontier::new(&bytes, lead, rounded)
+                        .map(|(b, l)| bound(b, l))
+                        .fold(0.0_f32, higher);
+                    let got = fold_group_frontier(&bytes, lead, rounded, bound);
+                    assert_eq!(got.to_bits(), want.to_bits(), "{pairs:?} {rounded}");
+                }
+            }
+        }
     }
 
     /// The footer decoded a block at a time agrees with the whole one:

@@ -22,6 +22,8 @@ import tempfile
 from foreground_writes import positive
 from vacuum_cleanup import add_workload_arguments
 
+LOADER_MARKER = b'stannum: the loader has not loaded a build'
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -44,6 +46,12 @@ def main():
     library = args.installed_library.resolve(strict=True)
     if library in binaries.values():
         parser.error('source libraries must be retained copies, not the installed library')
+    contents = {name: path.read_bytes() for name, path in binaries.items()}
+    if contents['baseline'] != contents['integrated'] and any(LOADER_MARKER in c for c in contents.values()):
+        # The x86-64 loader (postgres/loader/loader.c) loads the builds installed
+        # beside it, whichever loader is swapped in.
+        parser.error('a library is the x86-64 loader, which runs the builds installed beside it: '
+                     'compare builds (stannum-x86-64*.so, or STANNUM_LEVELS=x86-64 installs)')
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
     harness = Path(__file__).resolve().with_name('contention.py' if args.workload == 'contention' else 'vacuum_cleanup.py')

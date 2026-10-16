@@ -13,6 +13,19 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Added
 
+- x86-64 Linux packages ship two builds, the baseline and one compiled for
+  x86-64-v4, and a small loader installed as `stannum.so` that loads the v4
+  build on CPUs with all of x86-64-v4 (and an OS that saves the AVX-512
+  registers) and the baseline elsewhere: 1.7% more queries per core on
+  Sapphire Rapids (4.7% for `full_score` disjunctions), and the same
+  answers.
+  `script/install-release` builds and installs the three files (what
+  `script/test-all install` runs, and what the x86-64 benchmark image
+  builds by default, so a campaign measures what ships; `--target-cpu
+  x86-64` builds the baseline alone, and `script/pgo-build image` trains
+  each build's profile from its own image); `STANNUM_LOADER_LEVEL` forces a build
+  and `SHOW stannum.cpu_level` reports the running one. aarch64 is
+  unchanged.
 - On x86-64, the word kernels of segments in TIN's shape (grid AND, OR and
   AND NOT, popcount, AND-popcount, masked counts) run AVX-512 or AVX2 bodies
   chosen once at runtime, as PostgreSQL's `pg_popcount` does, so baseline
@@ -114,12 +127,14 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   need the `MAINTAIN` privilege. `stannum.segment_info` has TIN's columns
   (`npostings`, `source_state`, `origin`, `sequence` among them) in TIN's
   order, lists sealed segments, and adds `generation`.
-- The TIN-named index options `target_segment_count`,
-  `max_mutable_segment_size`, `max_merged_segment_size` and
-  `dead_percent_threshold` shape maintenance for the index that sets them,
-  within TIN's domains (1..4096, at least 131,072 bytes, at least 100 MB);
-  other values fail with SQLSTATE 22023. Unset, the `stannum.*` settings
-  apply. `initial_segment_count` is accepted and ignored with a warning.
+- The TIN-named index options `initial_segment_count`,
+  `target_segment_count`, `max_mutable_segment_size`,
+  `max_merged_segment_size` and `dead_percent_threshold` shape the build
+  and maintenance of the index that sets them, within TIN's domains
+  (1..4096, at least 131,072 bytes, at least 100 MB); other values fail
+  with SQLSTATE 22023. Unset, the `stannum.*` settings apply; an unset
+  `target_segment_count` follows `initial_segment_count` when the index
+  sets it, as TIN's does.
 - Hot-standby index reads when the extension is preloaded on the primary and
   standby, through removal-horizon WAL records from a custom resource manager.
 - The [TIN conformance suite](conformance/README.md): engine-agnostic,
@@ -156,6 +171,32 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   `build-image --base` builds a native image for local runs.
 
 ### Changed
+
+- A term lookup searches the term map's block index by each sampled block's
+  first eight bytes, held in a dense array, comparing a term's bytes only
+  among samples of its key; it read the probed samples' terms, a cache line
+  apart, and nearly every step missed the cache in a `memcmp`. A block's
+  entries are read forward once from their sample, and each next term keeps
+  its shared prefix in place, its order checked from its first byte past
+  it. On Sapphire Rapids, one core's two hyperthreads answer 1.1-2.7% more
+  queries per cycle in every style (1.9% over the six).
+- A group frontier's first pairs are decoded, then bounded, without a
+  branch on how many it holds or on each varint's length, its rounded
+  lengths looked up, and bounded by the score bucket only when the scorer
+  rises: on Sapphire Rapids, 2.1% more `score` disjunctions per core cycle
+  and 0.9% more `full_score` ones.
+- An index build ends with `initial_segment_count` segments of about equal
+  size (`stannum.initial_segment_count`, 4, as TIN's default build gives),
+  each at most 16 GiB and, for a small index, fewer so that each holds at
+  least 1 GiB: at 150M rows four segments rather than fourteen take 2-7%
+  fewer cycles per query. Every merge streams its inputs a range at a time
+  and spills what it builds to temporary files, so its memory is a few
+  bytes per document rather than its segments' bytes, and a run records
+  its length in 64 bits (page layout 16). Maintenance merges (inserts',
+  VACUUM's, the workers') take at most `max_merged_segment_size`, 2000 MB
+  unset as TIN's, and leave a build's larger segments be. VACUUM reads a
+  segment's documents without reading the segment. The pending-free list
+  holds 40 runs.
 
 - A segment in TIN's shape bit-packs its positions per block of 32 entries
   at the block's own widths (page layout 15), as TIN packs its position
@@ -464,14 +505,12 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   dictionary samples, page tables and decoded dead lists are bounded by
   `stannum.reader_cache_mb` (384 MiB), and each captured view drops those of
   segment generations a merge retired. A view releases the meta page before it loads segment readers.
-- The on-disk directory holds 96 entries and the pending-free list 48.
+- The on-disk directory holds 96 entries.
   `stannum.max_segments` is a soft bound enforced within the insert merge
   budget; only the 96-entry bound forces an unbudgeted merge.
-- An index build compacts its directory to the fewest segments the 3 GiB
-  merge cap allows, then packs its live runs into the lowest pages and
-  truncates the relation.
-- A merge takes at most 3 GiB of input, dropping its largest members until it
-  fits; writing a segment longer than a run's 32-bit length is an error.
+- An index build packs its live runs into the lowest pages and truncates
+  the relation.
+- A merge drops its largest members until its input fits its byte ceiling.
 - Inserts free at most `stannum.reclaim_pages` pages of retired runs at a
   time, and each run records its last page, so retiring a run no longer walks
   it under the meta lock.

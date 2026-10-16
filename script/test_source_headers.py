@@ -27,6 +27,13 @@ class SourceHeadersTest(unittest.TestCase):
                 self.assertEqual(prefix + body.removeprefix(notice(path, "mixed")), content)
                 self.assertEqual(rewrite(path, updated, "mixed"), updated)
 
+    def test_c_sources_take_line_comments(self):
+        for path in ("loader.c", "cpu_level.h"):
+            with self.subTest(path=path):
+                updated = rewrite(path, b"#include <stdint.h>\n", "ben")
+                self.assertTrue(updated.startswith(b"// Copyright (C) 2026 Ben Weis"))
+                self.assertTrue(updated.endswith(b"\n\n#include <stdint.h>\n"))
+
     def test_reclassification_replaces_only_our_header(self):
         content = b"fn main() {}\n"
         inherited = rewrite("main.rs", content, "planetscale")

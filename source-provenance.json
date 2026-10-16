@@ -64,6 +64,18 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: a census of a dumped TNS1 segment's records by form and df band (footer, directory, container, TF and inline-length bytes)."
     },
+    "bench/src/bin/tnsmerge.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: merges a dump's TNS1 segments into fewer with the segment crate's merge, in memory or streamed as the extension merges, to weigh what the segment count costs a query."
+    },
+    "engine/src/tinshape/census.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a census of window bounds over a ranked walk's groups, behind the engine's census feature, for the replay's window study."
+    },
+    "postgres/src/storage/streaming.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a merge's inputs read by range through their page tables, its spill in PostgreSQL temporary files, and its run written front to back."
+    },
     "bench/src/bin/tnsreencode.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: re-encodes a page layout version 6 dump's grouped records to version 8 (frontiers in the directory, TF tail per group) and reports the cost."
@@ -1576,6 +1588,22 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for kernel changes over layout 9: tests at every level, tnsef, exactness and the replay A/B."
     },
+    "benchmarks/aws/devbox-seg4-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of 14 segments against the same dump merged into 4 on the box."
+    },
+    "benchmarks/aws/devbox-htpair-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for the hyperthread-paired replay A/B of several builds (one core's two hyperthreads at once, beside one alone)."
+    },
+    "benchmarks/aws/htpair_gate.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the paired-core keep gate over a hyperthread-paired replay run (median of per-round paired throughput ratios per style, geomean and targeted-style rules)."
+    },
+    "benchmarks/aws/htpair_summary.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the summary of a hyperthread-paired replay run (pair vs single per arm, paired-core throughput per compared pair)."
+    },
     "benchmarks/aws/devbox-replay-ab.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of two trees under perf stat."
@@ -1595,6 +1623,38 @@
     "script/bolt-build": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: optimizes a built ELF's code layout with LLVM BOLT from a training run."
+    },
+    "postgres/loader/cpu_level.h": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the x86-64 loader's choice between the baseline and x86-64-v4 builds by CPUID and XCR0."
+    },
+    "postgres/loader/cpu_probe.c": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the x86-64 loader's CPU choice as a command, for tests and hosts."
+    },
+    "postgres/loader/loader.c": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the x86-64 Linux loader that loads the baseline or x86-64-v4 build and forwards its symbols."
+    },
+    "postgres/tests/loader_shim.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a private-cluster test of the installed x86-64 loader under each of its settings."
+    },
+    "postgres/tests/test_loader.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: unit tests of the x86-64 loader's CPU choice against hand-built CPUs and rustc's feature list."
+    },
+    "script/install-release": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: builds and installs the release extension, on x86-64 Linux the loader with its two builds."
+    },
+    "benchmarks/aws/devbox-loader.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file that builds the x86-64 loader with both builds and tests it on real hardware."
+    },
+    "script/rustc-cpu-level": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the RUSTC_WORKSPACE_WRAPPER that compiles the workspace's crates for an x86-64 CPU level."
     }
   }
 }

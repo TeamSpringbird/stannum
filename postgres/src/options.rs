@@ -3,7 +3,7 @@
 //
 // See LICENSE in the repository root for license terms.
 
-use pgrx::{PgList, pg_guard, pg_sys};
+use pgrx::{pg_guard, pg_sys};
 use std::ffi::CStr;
 use std::sync::atomic::{AtomicU32, Ordering};
 use tokenizer::{
@@ -97,22 +97,19 @@ pub fn init() {
     let lock = pg_sys::ShareUpdateExclusiveLock as pg_sys::LOCKMODE;
     unsafe {
         let kind = pg_sys::add_reloption_kind();
-        pg_sys::add_int_reloption(
-            kind,
-            c"initial_segment_count".as_ptr(),
-            c"Ignored Stannum segment-count compatibility option".as_ptr(),
-            1,
-            1,
-            4096,
-            lock,
-        );
         // TIN's domains. The default, zero, lies outside them: PostgreSQL
         // checks only values a statement sets, so zero means unset and
         // leaves the matching `stannum.*` setting in charge.
         for (name, description, minimum, maximum) in [
             (
+                c"initial_segment_count",
+                c"Segments a build ends with; unset uses stannum.initial_segment_count",
+                1,
+                4096,
+            ),
+            (
                 c"target_segment_count",
-                c"Soft bound on segments; unset uses stannum.max_segments",
+                c"Soft bound on segments; unset uses initial_segment_count, else stannum.max_segments",
                 1,
                 4096,
             ),
@@ -124,7 +121,7 @@ pub fn init() {
             ),
             (
                 c"max_merged_segment_size",
-                c"Most input megabytes a merge takes; unset uses the 3 GiB format ceiling",
+                c"Most input megabytes a maintenance merge takes; unset uses TIN's 2000",
                 100,
                 i32::MAX,
             ),
@@ -384,17 +381,6 @@ pub unsafe extern "C-unwind" fn amoptions(
                     tokenizer::TokenizerPipelineSpecError::StemmerRequiresCaseFolding
                 );
             }
-            for option in
-                PgList::<pg_sys::DefElem>::from_pg(pg_sys::untransformRelOptions(reloptions))
-                    .iter_ptr()
-            {
-                let name = CStr::from_ptr((*option).defname).to_string_lossy();
-                if name == "initial_segment_count" {
-                    pgrx::warning!(
-                        "Stannum accepts {name} for TIN compatibility but ignores it; Stannum's storage and maintenance settings apply"
-                    );
-                }
-            }
         }
         options.cast()
     }
@@ -405,6 +391,12 @@ unsafe fn parsed(index: pg_sys::Relation) -> Option<&'static IndexOptions> {
         return None;
     }
     unsafe { (*index).rd_options.cast::<IndexOptions>().as_ref() }
+}
+
+/// The segments the index's build ends with, when it sets them.
+pub unsafe fn initial_segment_count(index: pg_sys::Relation) -> Option<usize> {
+    let count = unsafe { parsed(index) }?.initial_segment_count;
+    (count > 0).then_some(count as usize)
 }
 
 /// The index's soft bound on directory entries, when it sets one.

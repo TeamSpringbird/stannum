@@ -19,6 +19,11 @@ benchmarks/aws/devbox.sh --branch my-branch --dump --cmd 'cargo build --release 
 benchmarks/aws/devbox.sh --branch base --branch candidate --dump --cmd-file benchmarks/aws/devbox-replay-ab.sh
 # build options of one tree: plain, PGO, x86-64-v3/v4 + PGO, PGO + BOLT (an hour: on-demand)
 benchmarks/aws/devbox.sh --branch my-branch --dump --on-demand --cmd-file benchmarks/aws/devbox-bolt-variants.sh
+# the x86-64 loader with both builds: PostgreSQL from PGDG, its tests, conformance under each build
+benchmarks/aws/devbox.sh --branch my-branch --type c7i.2xlarge --cmd-file benchmarks/aws/devbox-loader.sh
+# builds gated on one core's two hyperthreads at once (docs/benchmarks.md#the-hyperthread-paired-replay)
+benchmarks/aws/devbox.sh --branch base --branch candidate --dump --type m7i.4xlarge --spot-only \
+  --env ARMS=A:1:dump150m,B:2:dump150m --env COMPARE=B:A --cmd-file benchmarks/aws/devbox-htpair-ab.sh
 benchmarks/aws/devbox.sh --list                # live devboxes
 benchmarks/aws/devbox.sh --terminate ID|all    # kill one, or every devbox
 benchmarks/aws/devbox.sh --ledger              # instance-hours and cost so far
@@ -66,7 +71,10 @@ settings took 3 minutes of box time ($0.01); the dump sync takes 75 s and a
 two-tree replay A/B (`devbox-replay-ab.sh`: builds, tnsef, 10 replays) 23
 minutes ($0.07 with the volume). `devbox-bolt-variants.sh` (five builds,
 three PGO trainings, a BOLT training, 15 replays) took 62 minutes ($0.59
-on-demand with the volume).
+on-demand with the volume). `devbox-loader.sh` (PostgreSQL 18 and cargo-pgrx, the
+loader's two PGO builds, its tests, conformance under each build, the v4
+build's kernel tests at three levels) took 12 minutes of an m7i.4xlarge
+(about $0.06).
 
 On these VM sizes perf sees the core events (instructions, cycles,
 branches, branch-misses, L1 cache events); `machine.txt` records which
