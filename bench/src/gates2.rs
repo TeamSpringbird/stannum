@@ -440,7 +440,8 @@ pub struct Census {
     /// Each of [`Self::skips`]' groups' features, tab-separated: required
     /// terms; the lead's kind and count; the second term's kind (`A`
     /// absent, `S` sparse), count and container bytes; the candidates left
-    /// after each term, comma-separated.
+    /// after each term, comma-separated; the first required term that
+    /// does not hold the group (0 when all do).
     pub feats: Vec<String>,
 }
 
@@ -632,8 +633,10 @@ impl Census {
             None => ("-".to_owned(), 0, 0),
         };
         let left_s: Vec<String> = left.iter().map(u32::to_string).collect();
+        // The first required term that does not hold the group (0: all do).
+        let absent = tg.iter().position(Option::is_none).unwrap_or(0);
         self.feats.push(format!(
-            "{}\t{}\t{}\t{k2}\t{c2}\t{l2}\t{}",
+            "{}\t{}\t{}\t{k2}\t{c2}\t{l2}\t{}\t{absent}",
             req.len(),
             kind(lead),
             lead.count,
