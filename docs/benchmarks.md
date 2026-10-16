@@ -155,8 +155,9 @@ credentials out of Git.
 `build-image --pgo 1` (the Dockerfile's `STANNUM_PGO=1`) compiles the
 extension with `-C profile-use` and the committed profile for the image's
 architecture, `benchmarks/pgo/<arch>.profdata` (`uname -m`: `aarch64` and
-`x86_64`). An architecture without a profile builds as without PGO,
-with a warning. `--pgo strict` fails instead, and also fails on a stale
+`x86_64`; an x86-64-v4 build takes `x86_64-v4.profdata` when there is one,
+else `x86_64.profdata`). An architecture without a profile builds as
+without PGO, with a warning. `--pgo strict` fails instead, and also fails on a stale
 profile (below). Without `--pgo`, builds are as before. A profile changes
 code layout, inlining and branch weights only; answers and formats do not
 change.
@@ -228,9 +229,12 @@ Two more build-only options were measured on x86-64, both without source
 changes, on the 150M offline replay: post-link layout with LLVM BOLT
 (`script/bolt-build`), and builds for the x86-64-v3 and x86-64-v4 CPU levels
 (which would ship as one source and a small loader choosing the library).
-**Neither is worth adopting:** BOLT gains nothing beyond PGO, and v3 and v4
-gain 1.4% and 2.9% beyond PGO, below the 5% that a loader and three libraries
-would need to pay for.
+BOLT gains nothing beyond PGO and is not used. v3 and v4 gained 1.4% and
+2.9% beyond PGO in single-thread cycles, first judged below what a loader
+and three libraries would cost. The hyperthread-paired gate later measured
+v4 at +3.0% of a core's throughput (2026-10-16), and x86-64 Linux now ships
+the baseline and v4 with the loader ([releasing](RELEASING.md#x86-64-builds-and-the-loader));
+v3 is not built.
 
 Measured on 2026-10-12 at 1e01d81 on one r7i.2xlarge (Xeon 8488C, Sapphire Rapids), with
 `benchmarks/aws/devbox-bolt-variants.sh` (`devbox.sh --dump --on-demand`;
@@ -283,18 +287,42 @@ run 6 to 8% fewer instructions at a lower IPC. The +13.5% that v4 once
 showed was the branchy f32 select that `or_zero` has since fixed for every
 level. In the server, a quarter to a third of the cycles are PostgreSQL's
 and the kernel's, which these builds do not change, so v4 would gain about
-2% there. A loader would make that portable: `stannum.so` as a small C library
-that, in `_PG_init`, reads CPUID, `dlopen`s `stannum_v1.so`, `stannum_v3.so`
-or `stannum_v4.so` (the same crate built three times), and calls that
-library's `_PG_init`. It would export `Pg_magic_func` and a trampoline for
-each symbol PostgreSQL resolves by name: every `#[pg_extern]` function
-(the access method handler among them) with its `pg_finfo_*`, and the
-background workers' entry points (their `bgw_library_name` is `stannum`, so they load
-the loader too). The trampolines can be generated from the variant's
-`nm -D` list. pgrx itself would not change, but packaging would: three
-builds and three PGO trainings per architecture and PostgreSQL version,
-three times the library size, and a symbol list to keep in step. That is
-not worth 2%.
+2% there. A loader makes that portable, and was first judged not worth 2%. The
+paired gate (two hyperthreads of one core busy, as a server's backends
+are) measured v4 at +3.0% (five of six styles at +2% or more), and so the
+loader now ships, with two builds rather than three: `stannum.so` is a
+small C library that reads CPUID in `_PG_init`, `dlopen`s
+`stannum-x86-64-v4.so` or `stannum-x86-64.so` and calls its `_PG_init`,
+and forwards by trampoline every symbol PostgreSQL resolves by name
+(generated from the build's `nm -D`). See
+[releasing](RELEASING.md#x86-64-builds-and-the-loader).
+
+Measured again on 2026-10-16 with the paired gate (one m7i.4xlarge, Xeon
+8488C, the layout-15 dump, three rotated rounds, non-PGO on every side; run
+`20261016-030601-575d`, $0.20 with the loader's checks). The v4 build as
+shipped compiles the workspace's crates for v4 and leaves the dependencies'
+own code at the baseline; a build of every crate for v4 was measured
+beside it:
+
+| style | v4 build (shipped) | every crate v4 | instructions |
+| --- | ---: | ---: | ---: |
+| conjunction | +0.1% | +0.4% | -2.1% |
+| phrase | +0.9% | +1.2% | -3.2% |
+| disjunction | +0.4% | +1.9% | -5.6% |
+| conjunction, full | +2.3% | +2.8% | -5.2% |
+| phrase, full | +2.1% | +2.3% | -5.1% |
+| disjunction, full | +4.7% | +6.0% | -9.6% |
+| geomean | **+1.7%** | +2.4% | |
+
+Paired queries per gigacycle against the baseline build, the median of the
+per-round ratios. The two v4 builds run the same instructions on every
+style, so the 0.65 points between them are code layout, not the
+dependencies' code. The shipped arm was built through a
+`RUSTC_WORKSPACE_WRAPPER`, which renames every function (see
+[releasing](RELEASING.md#x86-64-builds-and-the-loader)); the release
+build's `RUSTC_WRAPPER` compiles the same crates for v4 under the
+baseline's names, and so lays them out otherwise again. In the server, the
+build is also profile-guided, which decides the layout of the hot code.
 
 ## Matching TIN v1.0.6's published setup
 

@@ -187,8 +187,10 @@ step() {
             echo "== note: a pg_test build is installed; 'script/test-all install' restores the release build" ;;
         install)
             need_pg install || finish
-            run install cargo pgrx install --release --package stannum --no-default-features \
-                --features "$(features)" --pg-config "$PG_CONFIG" || finish ;;
+            # On x86-64 Linux, the loader and its x86-64 and x86-64-v4 builds
+            # (STANNUM_LEVELS=x86-64 builds the baseline alone); elsewhere
+            # `cargo pgrx install --release`.
+            run install script/install-release --features "$(features)" --pg-config "$PG_CONFIG" || finish ;;
         cluster)
             run extension-upgrade python3 postgres/tests/extension_upgrade.py
             run postings-lifecycle python3 postgres/tests/postings_lifecycle.py
@@ -196,6 +198,7 @@ step() {
             run maintenance-workers python3 postgres/tests/maintenance_workers.py
             run ranked-fuzz-smoke python3 postgres/tests/ranked_fuzz.py --smoke
             run vacuum-cleanup-pins python3 postgres/tests/vacuum_cleanup_pins.py
+            run loader-shim python3 postgres/tests/loader_shim.py
             run mutation-targets python3 benchmarks/mutation_targets.py ;;
         conformance)
             run conformance conformance_check ;;
