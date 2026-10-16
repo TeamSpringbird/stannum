@@ -4184,6 +4184,96 @@ mod tests {
         }
     }
 
+    /// Two dense words neither of whose buckets alone rules a candidate out
+    /// but whose common counts together do, with the final rows kept from
+    /// the start: `t1`, the rarer, counts ten in documents `t0` lacks, so its
+    /// bound over a group reaches the bar with `t0`'s common count; the bar
+    /// is a document counting `t0` twice and `t1` once. A group's candidates
+    /// are still sieved, both words' buckets read a chunk at a time, and the
+    /// rows kept are a brute force's.
+    #[test]
+    fn dense_words_sieved_together_read_their_buckets_a_chunk_at_a_time() {
+        let n = 6_000;
+        let (docs, lengths, _) = dense_words(n, &[], 11);
+        let members: Vec<Vec<(usize, u32)>> = vec![
+            (0..n)
+                .filter(|r| r % 20 != 0)
+                .map(|r| (r, if r % 50 == 1 { 2 } else { 1 }))
+                .collect(),
+            (0..n)
+                .filter(|r| r % 3 != 0 || r % 20 == 0)
+                .map(|r| (r, if r % 20 == 0 { 10 } else { 1 }))
+                .collect(),
+        ];
+        let all: Vec<usize> = (0..n).collect();
+        let options = Options {
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+        let segment = Segment::parse(&blob).unwrap();
+        let names: Vec<String> = (0..2).map(|t| format!("t{t}")).collect();
+        let node = Node::And(vec![Node::Term(0), Node::Term(1)]);
+        let scorers: Vec<(String, TermScorer)> = (0..2)
+            .map(|t| {
+                let df = members[t].len() as u64;
+                let scorer =
+                    TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 20.0)
+                        .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let k = 10;
+        let mut want: Vec<(f32, Tid)> = (0..n)
+            .filter(|r| eval(&node, &members, *r))
+            .map(|r| {
+                let mut total = 0.0_f32;
+                for (t, (_, scorer)) in scorers.iter().enumerate() {
+                    if let Some(tf) = holds(&members, t, r) {
+                        total += scorer.score_bucket(TfBucket::from_count(tf), lengths[r]);
+                    }
+                }
+                (total, docs[r])
+            })
+            .collect();
+        want.sort_by(crate::walk::rank);
+        want.truncate(k);
+        let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+        let bits = |rows: &[(f32, Tid)]| {
+            rows.iter()
+                .map(|(s, t)| (s.to_bits(), *t))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(bits(&got.rows), bits(&want));
+        let mut seeded = crate::walk::TopRows::new(k, false);
+        for row in &got.rows {
+            seeded.push(crate::walk::Ranked(row.0, row.1));
+        }
+        let mut reads = TfReads::default();
+        let walked = top_k_into(
+            &segment,
+            &node,
+            &names,
+            &scorers,
+            &mut seeded,
+            &mut AllVisible,
+            &mut reads,
+        )
+        .unwrap();
+        assert!(
+            walked.candidates > 1_000,
+            "{} candidates",
+            walked.candidates
+        );
+        assert!(
+            reads.0 * 4 < walked.candidates,
+            "{} TF reads for {} candidates",
+            reads.0,
+            walked.candidates
+        );
+    }
+
     struct AllVisible;
 
     impl crate::walk::Visibility for AllVisible {
