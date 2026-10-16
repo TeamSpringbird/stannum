@@ -1592,6 +1592,14 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of 14 segments against the same dump merged into 4 on the box."
     },
+    "benchmarks/aws/devbox-htpair-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for the hyperthread-paired replay A/B of several builds (one core's two hyperthreads at once, beside one alone)."
+    },
+    "benchmarks/aws/htpair_summary.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the summary of a hyperthread-paired replay run (pair vs single per arm, paired-core throughput per compared pair)."
+    },
     "benchmarks/aws/devbox-replay-ab.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of two trees under perf stat."

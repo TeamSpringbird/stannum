@@ -21,6 +21,9 @@ benchmarks/aws/devbox.sh --branch base --branch candidate --dump --cmd-file benc
 benchmarks/aws/devbox.sh --branch my-branch --dump --on-demand --cmd-file benchmarks/aws/devbox-bolt-variants.sh
 # the x86-64 loader with both builds: PostgreSQL from PGDG, its tests, conformance under each build
 benchmarks/aws/devbox.sh --branch my-branch --type c7i.2xlarge --cmd-file benchmarks/aws/devbox-loader.sh
+# builds gated on one core's two hyperthreads at once (docs/benchmarks.md#the-hyperthread-paired-replay)
+benchmarks/aws/devbox.sh --branch base --branch candidate --dump --type m7i.4xlarge --spot-only \
+  --env ARMS=A:1:dump150m,B:2:dump150m --env COMPARE=B:A --cmd-file benchmarks/aws/devbox-htpair-ab.sh
 benchmarks/aws/devbox.sh --list                # live devboxes
 benchmarks/aws/devbox.sh --terminate ID|all    # kill one, or every devbox
 benchmarks/aws/devbox.sh --ledger              # instance-hours and cost so far
