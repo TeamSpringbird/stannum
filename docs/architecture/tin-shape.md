@@ -246,23 +246,23 @@ per group rather than per byte-aligned block saved 46 MB of 1.7 GB at
 
 ### Positions
 
-`STN3`'s positions stream (`segment::tinshape::positions`): per term,
-entries in posting order with a skip table every 32, its head
-(`count << 2 | masks << 1 | subs`) flagging two tables. Subs, for a term in
-at least one document in 16 (and 4,096 postings): a `u16` offset of every
-8th entry from its 32-entry block's start, `0xffff` past 64 KiB. Masks,
-where they save bytes: per block a `u32` naming the entries holding one
-position, whose count is then left out (a byte saved on most postings, at
-a bit each: 28.6 MB at 1M rows). A posting's index (its
-rank in slot order, which is ctid order, which was `STN3`'s ordinal order)
-addresses it. A phrase checks a common word's positions for candidates far
-apart in its posting order: from a skip it decoded up to 31 entries to
-reach one, from a sub at most 7 (`Positions::skip_entries`: a block's mask
-read once, a run of masked entries skipped as one run of varints).
-`Builder::add_term` takes the
-`segment::payload` stream; `Positions::payload` gives it back.
-`Positions::skip(index, at)` and `read_entry(index, at, out)` take the
-entry's index (for its mask bit).
+`STN3`'s positions stream (`segment::tinshape::positions`, page layout
+15): per term, entries in posting order in blocks of 32 with a `u32` skip
+to each block after the first. A block is bit-packed at its own widths (a
+`u16` of widths, TIN's per-block bit-packing): its entries' counts less one
+as bit planes (bit `i` of plane `b` is bit `b` of entry `i`'s), their first
+positions, then their later positions as `delta - 1`, entry after entry. A
+posting's index (its rank in slot order, which is ctid order, which was
+`STN3`'s ordinal order) addresses it. A phrase checks a common word's
+positions for candidates far apart in its posting order, and nothing of
+another entry is decoded to reach one: its count is its bits of the planes,
+its gaps start at the planes' population counts below it, its first
+position is one read at `i * width` (`Positions::block`, `entry`). The
+engine unpacks an entry of 8 gaps or more with the Elias-Fano low-part
+kernels (`kernels::positions_decode`). 150M rows: positions 18.40 ->
+16.89 GB (-8.2%; the index -4.0%) against layout 14's varints with
+masks and subs. `Builder::add_term`
+takes the `segment::payload` stream; `Positions::payload` gives it back.
 
 ### DL sidecar
 
@@ -448,11 +448,15 @@ again (2.5% fewer cycles in the full_score replay).
   document so rules out the common words' blocks, bounded by their short
   documents, before their TF is read: at 150M rows, scoring every term
   (`full_score`), a candidate past its blocks reads 60% fewer buckets and
-  a disjunction 38% fewer TF pages. Before any bucket, the candidate's
-  length class bounds it: its class's shortest length is the shared
-  length the buckets' floors then raise, so a long document falls short
-  before the common words' TF is read (see [length
-  classes](#length-classes-before-the-dl-read-at-150m-rows-branch-looplenclass-page-layout-13)).
+  a disjunction 38% fewer TF pages. Before any bucket, a candidate
+  holding four or more scoring terms is bounded by its length class: its
+  class's shortest length is the shared length the buckets' floors then
+  raise, so a long document falls short before the common words' TF is
+  read (see [length
+  classes](#length-classes-before-the-dl-read-at-150m-rows-branch-looplenclass-page-layout-13));
+  one holding fewer reads its class after its buckets, if they leave it
+  in reach (see [the disjunction's directories in
+  order](#a-disjunctions-directories-in-order-and-its-classes-by-the-terms-a-candidate-holds-branch-loopordisj14)).
   A flat disjunction's
   candidates left in reach are scored best bound first at the group's end,
   as a phrase's are, so the best of a group raise the threshold over the
@@ -651,7 +655,8 @@ asked rather than copying the directory per query; `TermSet::find` returns
 the entry by value. Added: `ef::Ef::retain_members(&mut Vec<u32>)` (keep
 the values a list holds, its highs passed a word at a time and only the
 lows of the values' buckets read) and `ef::EfCursor::list`;
-`positions::Positions::skip_entries(from, at, to)`;
+`positions::Positions::skip_entries(from, at, to)` (gone with page layout
+15);
 `boldi_vigna::PhrasePlan::leaves`.
 
 Added for Elias-Fano decoding (branch `tinshape/ef-simd`):
@@ -1457,7 +1462,11 @@ seek of that entry's group returns it, and one whose first held group is
 the next set bit after it returns the next entry, neither counting a rank
 (baseline x86-64 has no POPCNT; on Sapphire Rapids the rank's popcount was
 2.1% of a conjunction's cycles before). A record whose rows take at most
-57 bits (98% of them) reads a row as one `u64` from its first byte.
+57 bits (98% of them) reads a row as one `u64` from its first byte. A
+disjunction, which asks each grouped term for every group it holds in
+order, reads the entries with no seek at all (`Directory::step`, since
+`loop/ordisj14`): the presence's next bit, the row after the one before,
+a block's bases only as a row starts it.
 
 This retires the skip points, the runs decoded as reached and read on, the
 SIMD varint scans (NEON, SSSE3) and the directory's slots of decoded
@@ -2313,7 +2322,9 @@ than reading it for every such candidate, the same cuts). A disjunction's
 candidate past its blocks reads its class before any bucket
 (`Walk::or_stage`): the class floor is the shared length the buckets'
 floors then raise, so a long document is ruled out before the common
-words' TF is read. Exact by construction: a class's floor is a lower bound
+words' TF is read. (Since `loop/ordisj14`, only a candidate holding four
+or more scoring terms; see the section after this one.) Exact by
+construction: a class's floor is a lower bound
 on the length, and the answers are bit-identical (whole trace: 1,228,
 1,253 and 1,252 queries equal to PostgreSQL's; `--full` outputs f0962a8's
 byte for byte; on x86 every arm's outputs equal the base's in every style
@@ -2374,6 +2385,134 @@ x86: a conjunction's cycles there do not move.
   segment without classes. Mean latency on the first
   devbox (a slower host) moved 5 to 20%, where its counters moved 0 to 5.
 
+## A disjunction's directories in order, and its classes by the terms a candidate holds (branch `loop/ordisj14`)
+
+At layout 14 every style but score disjunctions gained 6-10% on x86-64;
+score disjunctions took 1.2% more cycles. Two causes, both measured.
+
+**The directory.** A disjunction asks each grouped term for every group
+it holds, in order: ~99.8K entries a query. Layout 14 found each by a
+seek from the entry read last (a check of the presence's next bit
+against the group asked) and read its row and the next. Layout 12 had
+decoded them in one pass. `Directory::step` reads the next entry with
+nothing sought: the presence's next bit from the word left after the
+entry before (or the next group index), the entry's totals the next
+row's that the step before decoded, the row after it from a running
+block base read only as a row starts a block, and every read's checks.
+The walk keeps one cursor (`InOrder`) per scoring term; conjunctions
+and phrases, which skip, keep their seeks. The directory's share of a
+score disjunction's samples on the M4 went from 6.2% to 4.1%.
+
+**The classes.** A disjunction read a candidate's class before any
+bucket. That pays where a candidate holds many terms: `full_score`'s
+candidates, holding the dense words, read 62% fewer buckets. A score
+disjunction elides its dense words, so its candidates hold few terms
+and lie far apart, and a class is a byte in a 64-byte line of the plane
+(256 documents) that no other candidate reads: 11.2K distinct lines a
+query on 17.2K class reads, 1,631 class pages. Counted by line (a lab
+build mapping each class line to its own page), on the M4, 100 queries,
+against reading every class first:
+
+| when a class is read | score: lines, pages pinned, instructions | `full_score`: lines, pages pinned, instructions |
+| --- | --- | --- |
+| first, always (layout 14) | 11,249, 6,293, 0 | 38,893, 16,723, 0 |
+| after the buckets, always | 2,156, 5,406, +1.9% | 4,316, 17,610, +7.2% |
+| first when the group's mask has ≥ 2 members per 256 slots | 7,244, 5,769, +0.3% | 28,685, 16,660, +0.6% |
+| first when the candidate before lies within 256 slots | 4,596, 5,607, +1.5% | 20,968, 17,863, +3.2% |
+| first when it holds ≥ 3 scoring terms | 8,153, 5,958, +0.0% | 35,088, 16,565, +0.2% |
+| **first when it holds ≥ 4 scoring terms** | **6,521, 5,734, +0.4%** | **32,830, 16,472, +0.2%** |
+| first when it holds ≥ 5 scoring terms | 4,099, 5,534, +1.0% | 28,700, 16,421, +0.6% |
+
+A candidate holding fewer than four terms (`CLASS_FIRST_TERMS`) reads its
+class after its buckets, only if they leave it in reach, at its class's
+shortest length where that is longer than the buckets' floor (a
+conjunction's tier, without its check at the longest class: read for
+every such candidate, the class's tighter bound orders the staged
+candidates, as the class read first did; checked first, 2% more
+candidates were scored). Read first, a class saves a bucket read per
+term it rules out; read after, a sparse candidate the buckets rule out
+touches no line. `full_score`'s class lines cost little: read in rank
+order within a group, one in two shares a line with the class before.
+
+Exact: whole trace `--expect` 1,228, 1,253 and 1,252 queries equal to
+PostgreSQL's, `--full` outputs f0962a8's byte for byte, every x86 output
+the base's. Against `perf-integrate14` (`a908527`) on Sapphire Rapids
+(`m7i.4xlarge` spot, one layout-14 dump re-encoded from version 6 on the
+box for both arms, three rounds in alternating order, 300 queries score
+and 200 `full_score`, `--forget`, perf user counters less a load-only
+run), both changes (`0614d33`):
+
+| against layout 14 | cycles (rounds) | instructions | pages pinned |
+| --- | --- | --- | --- |
+| score disjunction | -6.0% (-5.9/-6.1/-5.9) | -3.4% | -9.3% |
+| full disjunction | -2.7% (-2.8/-2.4/-2.8) | -3.1% | -1.5% |
+| score conjunction | -0.7% (+0.4/-1.1/-1.2) | -0.6% | 0 |
+| score phrase | -1.2% (-2.0/-0.0/-1.4) | -0.4% | 0 |
+| full conjunction | -0.3% (-0.3/-0.1/-0.5) | -0.3% | 0 |
+| full phrase | -0.3% (-0.1/-0.4/-0.4) | -0.2% | 0 |
+
+On the M4 (100 queries, two rounds): instructions -2.6% score
+disjunctions, -2.1% `full_score`, -0.3% to -0.5% conjunctions and
+phrases (their seeks share the read's checks, with the frontiers' offset
+now kept); pages -8.1% and -1.6%. Score disjunctions, 1.2% slower than
+layout 12 at `a908527`, come out about 5% faster than it (the two
+sessions' ratios multiplied); `full_score` disjunctions keep layout 14's
+7.5% and add 2.7%.
+
+## Layout 15 integrated (branch `tinshape/perf-integrate15`)
+
+`perf-integrate14` (`a908527`, layout 14) with the disjunction's
+directories in order and its classes by terms (`loop/ordisj14`), the
+directory frontier's decoder state in registers (`loop/branchfree2`; its
+positions skip is gone with the old positions), positions bit-packed per
+block (`loop/positions`, layout 15) and the directory entry's
+kind-dependent length by lookup (`loop/orbound`, its own commit). The
+150M dump `--from 14`: positions 18.40 -> 16.89 GB, the index 37.60 ->
+36.09 GB (-4.0%), every segment verified and equal to its own merge;
+the same bytes as `loop/positions`' encoder wrote. Answers: whole trace
+`--expect` 1,228, 1,253 and 1,252 equal; `--full` outputs f0962a8's byte
+for byte.
+
+Replay on one Sapphire Rapids host (`m7i.4xlarge` spot, the version-6
+dump re-encoded on the box: layout 14 by `a908527`'s tool, 15 from it by
+this branch's `--from 14`), four rounds in rotated order, each arm one
+process replaying every slice after one load (`tnsreplay --plan`, 300
+queries score and 200 `full_score`, `--repeat 3 --forget`, user-space
+counters of the timed passes), every output the same as `a908527`'s. Arms:
+`a908527` (with the `--plan` tooling), this branch without positions
+(layout 14), this branch, and this branch without the kind lookup. The
+median of the rounds' cycles:
+
+| | against `a908527` (rounds) | instructions | pages | positions only | kind only |
+| --- | --- | --- | --- | --- | --- |
+| score conjunction | -4.9% (+0.1/-5.7/-3.7/-4.2) | -2.3% | -0.1% | +1.0% | +0.2% |
+| score phrase | -6.4% (-3.3/-6.8/-9.0/-5.1) | -2.8% | -3.2% | -3.1% | -0.7% |
+| score disjunction | -9.1% (-6.9/-9.1/-8.6/-9.3) | -5.2% | -8.5% | -0.0% | -0.7% |
+| full conjunction | -2.5% (-0.3/-3.5/-1.7/-1.3) | -2.4% | -0.1% | -1.3% | -1.0% |
+| full phrase | -2.0% (-1.1/-3.4/-0.7/-1.5) | -2.0% | -2.0% | -2.1% | -0.3% |
+| full disjunction | -4.8% (-4.2/-5.4/-4.7/-5.7) | -4.7% | -1.6% | +0.7% | +0.3% |
+
+**Positions and the other styles.** `loop/positions` saw conjunctions and
+disjunctions move (score disjunctions +4.1% cycles, `full_score`
+conjunctions +1.5%) with identical instructions, across two spot hosts:
+noise, or the shift of every postings byte past a smaller term map. Here
+the two arms that differ only in positions, side by side on one host,
+retire the same instructions over the same pages in those styles; their
+cycles differ by -1.3% to +1.0% with rounds of both signs, and per query
+(median ratio of the rounds) by 0.989 to 1.006, while whole runs move
+together by up to 6% from round to round (the host's drift). No layout
+effect stands out of that; the phrase gain holds (-3.1% score, -2.1%
+`full_score`, positions pages -23% and -25%).
+
+The 150M database built afresh at layout 15 (the v2 profile, as layout
+14's): index 36.28 GB against 37.76 (-3.9%), 13 segments where layout 14
+merged to 14 (smaller segments merge further at the same size limits);
+import 15.6 and index build 166.5 minutes against 12.5 and 147.1, on a
+host busy with other work throughout, so not a measure of the build.
+The PGO profiles were retrained on it (`d07348e` aarch64, `b6cef80`
+x86-64, 40 of 40 hot functions each; every training answer equal to
+PostgreSQL's).
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
@@ -2388,11 +2527,11 @@ x86: a conjunction's cycles there do not move.
   synthetic probes measured 0.14 per posting at tf 1, on documents of one
   to three words). At 150M rows (18.4 GB of positions, 2.7 bytes per
   posting, 71% of postings at tf 1) bit-packing each block's counts, first
-  positions and gaps at the block's widths would save about a tenth
-  (1.8 to 2.2 GB, 5 to 6% of the index) and 8 to 15% of a phrase's
-  positions pages: a first position or a gap takes 9 bits on average in
-  these documents, against a one- or two-byte varint now. Not worth a
-  format change alone.
+  positions and gaps at the block's widths was estimated to save about a
+  tenth (1.8 to 2.2 GB, 5 to 6% of the index) and 8 to 15% of a phrase's
+  positions pages. Layout 15 does it (with the phrase's decode of up to
+  31 entries gone): 18.40 -> 16.89 GB (-8.2%, the index -4.0%) and 23%
+  fewer positions pages a phrase.
 - Per-block counts in the footer (TIN answers single-term counts from its
   footer): a single-term count is the dictionary's `df` here already; the
   group directory's per-group counts settle groups one term holds.

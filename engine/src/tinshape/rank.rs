@@ -24,15 +24,16 @@
 
 use boldi_vigna::{PhrasePlan, SpanQuery, SpanSolver};
 use segment::Tid;
+use segment::payload::SKIP_INTERVAL;
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
 use segment::tinshape::blob::{Bytes, LazyBlob};
 use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
-use segment::tinshape::positions::Positions;
+use segment::tinshape::positions::{Block, Positions};
 use segment::tinshape::postings::{
-    Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
-    array_bytes, higher, lower,
+    Directory, Form, GroupEntry, GroupFrontier, InOrder, KIND_ARRAY, KIND_EF, KIND_GRID,
+    LazyFooter, array_bytes, higher, lower,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -74,6 +75,19 @@ const SIEVE_CHUNK: usize = 256;
 /// A disjunction's group is sieved ([`Walk::or_sieve`]) when its mask
 /// holds at least this many members.
 const OR_SIEVE_MIN: u64 = 128;
+
+/// A disjunction's candidate holding at least this many scoring terms
+/// reads its length class before its buckets ([`Walk::or_stage`]); one
+/// holding fewer reads it after them, only if they leave it in reach. A
+/// class read first saves a bucket read for each term it rules out, and
+/// costs a cache line of the class plane (64 bytes, 256 documents) that a
+/// sparse candidate shares with no other: at 150M rows a score
+/// disjunction's candidates (dense terms elided) hold few terms, its class
+/// reads first touched 11.2K distinct lines a query, two in three new;
+/// `full_score`'s hold many, and read first its candidates read 62% fewer
+/// buckets. At four, score disjunctions touch 42% fewer class lines for
+/// 0.35% more instructions, `full_score` ones 0.2% more.
+const CLASS_FIRST_TERMS: usize = 4;
 
 /// A scoring term's score metadata as a walk bounds by it: a sparse
 /// record's footer blocks, decoded a block at a time as the walk reaches
@@ -500,8 +514,8 @@ impl<'s, 'a> Sc<'s, 'a> {
     /// [`Walk::group_done`]). Each block is bounded as it is decoded, and
     /// its frontier is not kept as pairs ([`LazyFooter::decode_bounds`]):
     /// most blocks' are never read again. A grouped record's entries are
-    /// decoded in one pass ([`Directory::decode_all`]) and bounded as its
-    /// groups are visited.
+    /// read in order as its groups are visited ([`Directory::step`]) and
+    /// bounded then.
     fn decode_all(&mut self) {
         let f = match &mut self.footer {
             Bounds::Blocks(f) => f,
@@ -1148,24 +1162,24 @@ fn load<'a>(
     Ok(true)
 }
 
-/// A term's positions read by posting index, forward from the last entry
-/// read where that is nearer than the entry its tables locate.
+/// A term's positions read by posting index: each entry located in its
+/// block, which is kept for the next read (a rare word's candidates often
+/// share one).
 pub(super) struct PosCursor<'a> {
     positions: Positions<'a>,
     at: usize,
-    /// Entry `next` starts at byte `next_at`.
-    next: u32,
-    next_at: usize,
+    block: Option<Block>,
 }
+
+/// Bytes past an entry's gaps read with them for the vector bodies' loads.
+const GAP_SLACK: usize = 32;
 
 impl<'a> PosCursor<'a> {
     pub(super) fn new(stream: (segment::tinshape::blob::Bytes<'a>, usize)) -> Result<Self> {
-        let positions = Positions::parse(stream.0)?;
         Ok(Self {
-            next: 0,
-            next_at: positions.data_at,
-            positions,
+            positions: Positions::parse(stream.0)?,
             at: stream.1,
+            block: None,
         })
     }
 
@@ -1176,28 +1190,35 @@ impl<'a> PosCursor<'a> {
         out: &mut Vec<u32>,
         touch: &mut impl Touch,
     ) -> Result<()> {
-        let (entry, entry_at, reads) = self.positions.locate(index)?;
-        if index < self.next || entry > self.next {
-            for (at, len) in reads {
-                if len > 0 {
-                    touch.touch(Part::Positions, self.at + at, len);
+        let block = match self.block {
+            Some(b) if b.index == index / SKIP_INTERVAL => b,
+            _ => {
+                let b = self.positions.block_of(index)?;
+                if let Some(s) = b.skip_at {
+                    touch.touch(Part::Positions, self.at + s, 4);
                 }
+                let (head, len) = b.head_bytes();
+                touch.touch(Part::Positions, self.at + head, len);
+                self.block = Some(b);
+                b
             }
-            self.next = entry;
-            self.next_at = entry_at;
+        };
+        let entry = self.positions.entry(&block, index)?;
+        let (first, len) = entry.first_bytes();
+        touch.touch(Part::Positions, self.at + first, len);
+        if entry.count == 1 {
+            out.clear();
+            out.push(entry.first);
+            return Ok(());
         }
-        if let Some(m) = self.positions.mask_at(index) {
-            touch.touch(Part::Positions, self.at + m, 4);
-        }
-        let from = self.next_at;
-        let mut p = self
-            .positions
-            .skip_entries(self.next, self.next_at, index)?;
-        p = self.positions.read_entry(index, p, out)?;
-        self.next = index + 1;
-        self.next_at = p;
-        touch.touch(Part::Positions, self.at + from, p - from);
-        Ok(())
+        let (from, to) = entry.gap_bytes();
+        touch.touch(Part::Positions, self.at + from, to - from);
+        let gaps = if entry.count as usize - 1 < kernels::POSITIONS_SHORT {
+            self.positions.bytes.get(from, to)?
+        } else {
+            self.positions.bytes.window(from, to - from + GAP_SLACK)?
+        };
+        kernels::positions_decode(&entry, gaps, out)
     }
 }
 
@@ -3506,15 +3527,25 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut next = vec![0u32; n];
         let mut from = 0u32;
         let mut fresh = vec![false; n];
+        // A term is asked for its next group only once the walk has passed
+        // its group at hand (`from` one past it), so a grouped term's next
+        // is the entry after it: read in order, not sought.
+        let grouped: Vec<bool> = self.sc.iter().map(Sc::grouped).collect();
+        let mut order = vec![InOrder::default(); n];
         loop {
             let mut g = u32::MAX;
             for i in 0..n {
                 if !fresh[i] || next[i] < from {
                     let t = self.sc[i].term;
                     let set = self.terms[t].as_mut().expect("scoring");
-                    next[i] =
-                        next_group(set, self.geometry, from, &mut self.mems[t].hint, self.touch)
-                            .unwrap_or(u32::MAX);
+                    let hint = &mut self.mems[t].hint;
+                    next[i] = if grouped[i] {
+                        set.step_index(&mut order[i], hint)
+                    } else {
+                        next_group(set, self.geometry, from, hint, self.touch)
+                    }
+                    .unwrap_or(u32::MAX);
+                    debug_assert!(next[i] >= from);
                     fresh[i] = true;
                 }
                 g = g.min(next[i]);
@@ -4182,9 +4213,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.buckets.fill(NO_BUCKET);
         let mut floor = 0u32;
         let mut reach = bound;
-        // Its length class first: its shortest length bounds every term it
-        // holds before any bucket is read.
-        if self.threshold().is_some() {
+        // Its length class first, for a candidate holding several terms: its
+        // shortest length bounds every term it holds before any bucket is
+        // read. One holding fewer reads its class only after its buckets,
+        // if they leave it in reach (see `CLASS_FIRST_TERMS`).
+        let class_first = self.held_list.len() >= CLASS_FIRST_TERMS;
+        if class_first && self.threshold().is_some() {
             let class = self.class_floor(g, local)?;
             if class > 0 {
                 floor = class;
@@ -4239,7 +4273,22 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // The length known, its buckets bound it at that length.
                 (self.reach(self.held_list.iter().copied(), length), length)
             }
-            None => (reach, u32::MAX),
+            None => {
+                // Its class after its buckets, if not read before them: at
+                // its class's shortest length where that is longer than its
+                // buckets' floor.
+                if !class_first && self.threshold().is_some() {
+                    let class = self.class_floor(g, local)?;
+                    if class > floor {
+                        reach = self.reach(self.held_list.iter().copied(), class);
+                        if self.cut(reach, tid) {
+                            self.answer.class_cuts += 1;
+                            return Ok(None);
+                        }
+                    }
+                }
+                (reach, u32::MAX)
+            }
         }))
     }
 

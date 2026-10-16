@@ -18,7 +18,8 @@
 # /work/<name>; CMD runs in the first, with SRC1, SRC2, ... naming them,
 # OUT=/work/out (everything there comes home) and DATA=/data. --dump syncs
 # s3://<bucket>/replay-dumps/dump150m-v6/ to /data (dump150m/, trace.tsv,
-# pg-ranked.tsv) on a gp3 root volume sized for it; tnsreplay reads every
+# pg-ranked.tsv; DEVBOX_DUMP_PREFIX names another prefix of replay-dumps/
+# laid out alike) on a gp3 root volume sized for it; tnsreplay reads every
 # segment into memory (37.5 GB), so --dump defaults to r7i.2xlarge (64 GiB).
 # --disk sizes the root volume (default 30 GiB, 90 with --dump): a command
 # that re-encodes the dump into two more formats on the box needs about 150.
@@ -46,7 +47,7 @@ REPO=$(git -C "$HERE" rev-parse --show-toplevel)
 HOME_DIR=${DEVBOX_HOME:-$HOME/stannum-lab/x86-devbox}
 LEDGER=$HOME_DIR/ledger.txt
 BUCKET=springbird-dev-stannum-corpus-cache-860510875764
-DUMP_PREFIX=replay-dumps/dump150m-v6/
+DUMP_PREFIX=${DEVBOX_DUMP_PREFIX:-replay-dumps/dump150m-v6/}
 STACK=stannum-devbox
 REMOTE=${DEVBOX_REMOTE:-stannum}
 AMI_PARAM=/aws/service/canonical/ubuntu/server/noble/stable/current/amd64/hvm/ebs-gp3/ami-id
