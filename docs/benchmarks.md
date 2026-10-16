@@ -125,7 +125,12 @@ suites; the benchmark tools live in `benchmarks/`, each with `--help`.
    `python3 benchmarks/published_dataset.py --corpus stackexchange --output DIR`.
 2. Build an image from the working tree:
    `python3 benchmarks/tin.py build-image --image TAG --output DIR`
-   (`--base postgres:18-trixie` builds a native image for local runs).
+   (`--base postgres:18-trixie` builds a native image for local runs). On
+   x86-64 the image builds what ships by default, the
+   [loader](RELEASING.md#x86-64-builds-and-the-loader) with the baseline and
+   x86-64-v4 builds, so a run measures the build the CPU picks;
+   `--target-cpu x86-64` builds the baseline alone (opt-in), and
+   `x86-64-v3` or `x86-64-v4` one build for that level.
 3. Run a workload:
    `python3 benchmarks/tin.py run --published-corpus stackexchange --dataset DIR --image TAG --workload topk --style mixed ...`.
    `--save-database` keeps the built, vacuumed and checked database so later
@@ -156,7 +161,8 @@ credentials out of Git.
 extension with `-C profile-use` and the committed profile for the image's
 architecture, `benchmarks/pgo/<arch>.profdata` (`uname -m`: `aarch64` and
 `x86_64`; an x86-64-v4 build takes `x86_64-v4.profdata` when there is one,
-else `x86_64.profdata`). An architecture without a profile builds as
+else `x86_64.profdata`; the default x86-64 image, the loader, compiles each
+of its two builds with its own profile). An architecture without a profile builds as
 without PGO, with a warning. `--pgo strict` fails instead, and also fails on a stale
 profile (below). Without `--pgo`, builds are as before. A profile changes
 code layout, inlining and branch weights only; answers and formats do not

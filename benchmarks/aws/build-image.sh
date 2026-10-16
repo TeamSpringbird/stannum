@@ -13,9 +13,11 @@
 # clone URL.
 #
 # The image is built for the host's own architecture (amd64 on i7i, arm64 on
-# i8g): run() refuses emulated images. On x86-64, STANNUM_TARGET_CPU
-# (x86-64-v3 or x86-64-v4) builds for that CPU level; unset, the default, builds
-# the baseline whose SIMD kernels pick AVX2 or AVX-512 at run time. It is a
+# i8g): run() refuses emulated images. On x86-64, unset STANNUM_TARGET_CPU
+# builds what ships, the loader with the baseline and x86-64-v4 builds (the
+# Dockerfile's default); x86-64 builds the baseline alone, whose SIMD kernels
+# pick AVX2 or AVX-512 at run time; x86-64-v3 or x86-64-v4 one build for
+# that CPU level. It is a
 # Dockerfile build argument, never RUSTFLAGS (docs/architecture/tin-shape.md).
 # On arm64, STANNUM_BASE (default postgres:18-trixie) replaces the pinned
 # ParadeDB base, which is published for amd64 only.

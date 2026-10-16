@@ -41,12 +41,13 @@ COPY segment segment
 COPY engine engine
 # A workspace member: cargo reads its manifest; nothing here builds it.
 COPY bench bench
-# x86-64 builds (script/install-release): empty, the baseline alone, which
-# PGDG packages target (the kernels pick AVX2 or AVX-512 at runtime either
-# way); x86-64-v3 or x86-64-v4, a build for that CPU level alone; `loader`,
-# what ships: the baseline and x86-64-v4 builds and the loader that picks
-# one by CPU at load. Ignored elsewhere.
-ARG STANNUM_TARGET_CPU=
+# x86-64 builds (script/install-release): `loader`, the default and what
+# ships: the baseline and x86-64-v4 builds and the loader that picks one by
+# CPU at load; x86-64 (or empty), the baseline alone, which PGDG packages
+# target (the kernels pick AVX2 or AVX-512 at runtime either way);
+# x86-64-v3 or x86-64-v4, a build for that CPU level alone. Ignored
+# elsewhere (the label then names the argument, not a build).
+ARG STANNUM_TARGET_CPU=loader
 # Profile-guided optimization (docs/benchmarks.md#profile-guided-builds).
 # Empty: none. 1: use the committed profile for this architecture,
 # benchmarks/pgo/<arch>.profdata (<arch>-v4.profdata for an x86-64-v4 build
@@ -66,7 +67,7 @@ RUN case "$STANNUM_PGO" in \
       *) echo "STANNUM_PGO is empty, 1, strict or generate" >&2; exit 2 ;; \
     esac \
     && case "$(uname -m):$STANNUM_TARGET_CPU" in \
-      x86_64:) levels=x86-64 ;; \
+      x86_64:|x86_64:x86-64) levels=x86-64 ;; \
       x86_64:loader) levels="x86-64 x86-64-v4" ;; \
       x86_64:*) levels=$STANNUM_TARGET_CPU ;; \
       *) levels=native ;; \
@@ -82,7 +83,7 @@ USER root
 ARG STANNUM_SOURCE_SHA256=unknown
 ARG STANNUM_COMMIT=unknown
 ARG RECIPE_SHA256=unknown
-ARG STANNUM_TARGET_CPU=
+ARG STANNUM_TARGET_CPU=loader
 ARG STANNUM_PGO=
 LABEL benchmark.stannum_source_sha256=${STANNUM_SOURCE_SHA256} benchmark.stannum_commit=${STANNUM_COMMIT} benchmark.recipe_sha256=${RECIPE_SHA256} benchmark.stannum_target_cpu=${STANNUM_TARGET_CPU} benchmark.stannum_pgo=${STANNUM_PGO}
 COPY --from=builder /usr/lib/postgresql/18/lib/stannum*.so /usr/lib/postgresql/18/lib/

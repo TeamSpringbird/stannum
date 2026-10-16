@@ -20,8 +20,10 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   Sapphire Rapids (4.7% for `full_score` disjunctions), and the same
   answers.
   `script/install-release` builds and installs the three files (what
-  `script/test-all install` and the benchmark image's
-  `STANNUM_TARGET_CPU=loader` run); `STANNUM_LOADER_LEVEL` forces a build
+  `script/test-all install` runs, and what the x86-64 benchmark image
+  builds by default, so a campaign measures what ships; `--target-cpu
+  x86-64` builds the baseline alone, and `script/pgo-build image` trains
+  each build's profile from its own image); `STANNUM_LOADER_LEVEL` forces a build
   and `SHOW stannum.cpu_level` reports the running one. aarch64 is
   unchanged.
 - On x86-64, the word kernels of segments in TIN's shape (grid AND, OR and

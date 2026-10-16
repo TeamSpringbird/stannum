@@ -1415,9 +1415,10 @@ def parser():
     p.add_argument('--output', type=Path, required=True)
     p.add_argument('--image', required=True)
     p.add_argument('--base', help='Base image for a rehearsal on another architecture; the published runs use the pinned ParadeDB image')
-    p.add_argument('--target-cpu', help='x86-64 only: STANNUM_TARGET_CPU build argument (x86-64-v3, x86-64-v4, or '
-                                        'loader: the shipped baseline and x86-64-v4 builds with the loader that picks '
-                                        'one by CPU); unset builds the baseline with runtime SIMD dispatch')
+    p.add_argument('--target-cpu', help='x86-64 only: STANNUM_TARGET_CPU build argument; unset, the Dockerfile\'s '
+                                        'default loader: the shipped baseline and x86-64-v4 builds with the loader that '
+                                        'picks one by CPU; x86-64 the baseline alone (runtime SIMD dispatch); '
+                                        'x86-64-v3 or x86-64-v4 one build for that level')
     p.add_argument('--pgo', choices=('1', 'strict', 'generate'),
                    help='STANNUM_PGO build argument: 1 optimizes with benchmarks/pgo/<arch>.profdata if there is one, '
                         'strict also fails when it is missing or stale, '

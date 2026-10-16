@@ -22,8 +22,10 @@
 #                        local build (mock-build.sh 150m); restored instead of
 #                        building here, and no corpus download (recommended: see
 #                        the cost table in docs/benchmarks.md)
-#   STANNUM_TARGET_CPUS  extra x86-64 builds measured after the runtime-dispatch
-#                        baseline, e.g. "x86-64-v3 x86-64-v4" (x86 hosts only)
+#   STANNUM_TARGET_CPUS  extra x86-64 builds measured after the default image
+#                        (variant "baseline" here: the image's default build, on
+#                        x86-64 the shipped loader with the baseline and x86-64-v4
+#                        builds), e.g. "x86-64" for the baseline alone (x86 hosts only)
 #   BENCH_BUCKET         the stack's ArtifactBucket output: evidence goes there
 #   V2_SECONDS           seconds measured per run (600)
 #   V2_LAYOUTS           CPU readings for the baseline ("siblings distinct-cores")
