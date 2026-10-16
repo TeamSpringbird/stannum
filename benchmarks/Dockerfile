@@ -60,7 +60,9 @@ ARG STANNUM_PGO=
 COPY benchmarks/pgo benchmarks/pgo
 COPY script/pgo-check script/install-release script/
 # Keep optimized code and line tables for the owned perf diagnostics (the
-# line tables also keep the symbols script/pgo-check looks for).
+# line tables also keep the symbols script/pgo-check looks for). The summary
+# filter may match nothing (one build without a profile: no `== ` or `PGO
+# profile` lines), which the amd64 base's pipefail shell would take as failure.
 RUN case "$STANNUM_PGO" in \
       ""|1|strict) pgo=$STANNUM_PGO ;; \
       generate) pgo=generate=/var/lib/postgresql/pgo-raw ;; \
@@ -76,7 +78,7 @@ RUN case "$STANNUM_PGO" in \
       script/install-release --pg-config /usr/lib/postgresql/18/bin/pg_config --features pg18 \
         --pgo "$pgo" --levels "$levels" > /tmp/build.log 2>&1 \
       || { tail -n 100 /tmp/build.log; exit 1; }; } \
-    && grep -v 'hash mismatch' /tmp/build.log | grep -E '^(== |PGO profile|  changed|  gone|installed|warning)' | tail -n 40
+    && { grep -v 'hash mismatch' /tmp/build.log | grep -E '^(== |PGO profile|  changed|  gone|installed|warning)' | tail -n 40 || true; }
 
 FROM runtime
 USER root
