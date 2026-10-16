@@ -910,6 +910,10 @@ pub struct RunSource {
     /// span.
     ledger: Cell<*mut SpanLedger>,
     owner: Cell<pg_sys::ResourceOwner>,
+    /// A bit per page of the run: set once this backend has checked the
+    /// page's header and special area (see [`Self::pin_page`]). Kept with
+    /// the cached reader, across queries.
+    checked: RefCell<Vec<u64>>,
 }
 
 /// The buffers a span holds pinned by [`own_pin`], outside PostgreSQL's
@@ -976,7 +980,34 @@ impl RunSource {
             relation: Cell::new(std::ptr::null_mut()),
             ledger: Cell::new(std::ptr::null_mut()),
             owner: Cell::new(std::ptr::null_mut()),
+            checked: RefCell::default(),
         }
+    }
+
+    /// Whether this backend has checked page `page`'s header and special
+    /// area (see [`Self::pin_page`]).
+    fn is_checked(&self, page: usize) -> bool {
+        self.checked
+            .borrow()
+            .get(page / 64)
+            .is_some_and(|word| word & (1 << (page % 64)) != 0)
+    }
+
+    fn set_checked(&self, page: usize) {
+        let mut checked = self.checked.borrow_mut();
+        if checked.is_empty() {
+            checked.resize(self.table.len().div_ceil(64), 0);
+        }
+        if let Some(word) = checked.get_mut(page / 64) {
+            *word |= 1 << (page % 64);
+        }
+    }
+
+    /// The bytes of the run on page `page`: a run fills every page but
+    /// its last (see `verify.rs`).
+    fn page_bytes(&self, page: usize) -> usize {
+        let at = page as u64 * CHAIN_CAPACITY as u64;
+        self.run.bytes.saturating_sub(at).min(CHAIN_CAPACITY as u64) as usize
     }
 
     /// Releases the pages held in every slot, forgets the slots handed out,
@@ -1097,26 +1128,50 @@ impl RunSource {
                 } else {
                     pin_block(index, block, own)
                 };
-                let contents = std::slice::from_raw_parts(page_of(buffer), PAGE_SIZE);
-                let checked = match layout::kind(contents) {
-                    Ok(KIND_RUN) => layout::chain(contents)
-                        .map(|(_, data)| data)
-                        .map_err(str::to_string),
-                    Ok(kind) => Err(format!("kind {kind} instead of a run page")),
-                    Err(message) => Err(message.to_string()),
-                };
-                let data = match checked {
-                    Ok(data) => data,
-                    Err(message) => {
+                // A run page's data follows its header and `next` link and
+                // fills it but on the run's last page, so where it lies needs
+                // no read of the page. Its header and special area (the
+                // page's first and last cache lines, a 4 KiB page apart) are
+                // checked when this backend first pins it and whenever a
+                // pin goes through `ReadBuffer` (the page may be new to the
+                // buffer); a page found through its hint was checked by the
+                // backend that read it in. The engine reads the lines it
+                // needs and no other (srvgap: a pin's extra lines were the
+                // server's extra L2 misses over the replay).
+                let base = page_of(buffer);
+                let data = base.add(layout::PAGE_HEADER + 4);
+                let len = self.page_bytes(page);
+                if !owned || !self.is_checked(page) || cfg!(debug_assertions) {
+                    let contents = std::slice::from_raw_parts(base, PAGE_SIZE);
+                    let checked = match layout::kind(contents) {
+                        Ok(KIND_RUN) => layout::chain(contents)
+                            .map(|(_, data)| data)
+                            .map_err(str::to_string),
+                        Ok(kind) => Err(format!("kind {kind} instead of a run page")),
+                        Err(message) => Err(message.to_string()),
+                    }
+                    .and_then(|bytes| {
+                        // The run's length decides what the walk reads.
+                        if bytes.as_ptr() != data || bytes.len() < len {
+                            Err(format!(
+                                "{} data bytes where the run needs {len}",
+                                bytes.len()
+                            ))
+                        } else {
+                            Ok(())
+                        }
+                    });
+                    if let Err(message) = checked {
                         release_pin(buffer, owned);
                         corrupt(format!("Stannum {}: page {block}: {message}", self.label))
                     }
-                };
+                    self.set_checked(page);
+                }
                 let held = HeldPage {
                     page,
                     buffer,
-                    data: data.as_ptr(),
-                    len: data.len(),
+                    data,
+                    len,
                     owned,
                 };
                 if owned {
