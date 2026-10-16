@@ -792,6 +792,9 @@ struct Mem<'a> {
     ///
     /// [`MemoCounts`]: segment::tinshape::segment::MemoCounts
     used: u32,
+    /// A led walk's run of the group's buckets ([`TfRun`]), taken at the
+    /// first bucket it reads there ([`Walk::read_bucket`]).
+    tf: TfRun,
 }
 
 impl Mem<'_> {
@@ -1148,6 +1151,7 @@ fn load<'a>(
     mem.run = 0;
     mem.pos = 0;
     mem.entry = usize::MAX;
+    mem.tf = TfRun::default();
     let group = geometry.groups[g as usize];
     if let Form::Sparse(list) = &set.postings.form {
         let cursor = set.sparse.get_or_insert_with(|| {
@@ -1751,6 +1755,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         for mem in &mut self.mems {
             mem.loaded = 0;
             mem.kind = Kind::List;
+            mem.tf = TfRun::default();
         }
         let held = self.held.len();
         self.held
@@ -2660,6 +2665,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             mem.kind = Kind::List;
             mem.list.clear();
             mem.pos = 0;
+            mem.tf = TfRun::default();
         }
         Ok(())
     }
@@ -2922,21 +2928,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.buckets[i] = NO_BUCKET;
                 continue;
             };
-            let s = &mut self.sc[i];
-            let set = self.terms[t].as_ref().expect("scoring");
-            let block = s.block_of(index, self.mems[t].entry);
-            let bucket = s.bucket_in(block, set.postings.tf, index)?;
-            if s.footer.single().is_none() {
-                self.touch.touch(
-                    Part::TfTail,
-                    set.at + set.postings.tf_at + s.footer.tf_byte(block),
-                    1,
-                );
-            }
+            let block = self.sc[i].block_of(index, self.mems[t].entry);
+            let bucket = self.read_bucket(i, block, index)?;
             let (f, bound) = self.sc[i].floor_kept(block, bucket);
             (floor, low) = (floor.max(f), low.min(f));
             own += bound;
-            self.buckets[i] = bucket;
             self.held_index[i] = index;
         }
         self.cand_floor = floor;
@@ -3038,19 +3034,33 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     /// Reads into [`Walk::buckets`] scoring term `i`'s bucket for its
-    /// posting `index`, which its block `block` holds.
+    /// posting `index`, which its block `block` holds (a grouped term's
+    /// entry for the group at hand): from the group's run of buckets
+    /// ([`TfRun`]), taken at its first read in the group, where it has one.
     #[inline]
     fn read_bucket(&mut self, i: usize, block: usize, index: u32) -> Result<u8> {
-        let s = &mut self.sc[i];
-        let set = self.terms[s.term].as_ref().expect("scoring");
-        let bucket = s.bucket_in(block, set.postings.tf, index)?;
-        if s.footer.single().is_none() {
-            self.touch.touch(
-                Part::TfTail,
-                set.at + set.postings.tf_at + s.footer.tf_byte(block),
-                1,
-            );
+        let t = self.sc[i].term;
+        if self.mems[t].tf.state == TfRun::UNSET {
+            self.mems[t].tf = self.tf_run(i, block)?;
         }
+        let run = self.mems[t].tf;
+        let s = &mut self.sc[i];
+        let set = self.terms[t].as_ref().expect("scoring");
+        let bucket = if run.state == TfRun::READY {
+            self.touch
+                .touch(Part::TfTail, set.at + set.postings.tf_at + run.tail, 1);
+            run.bucket(index)?
+        } else {
+            let bucket = s.bucket_in(block, set.postings.tf, index)?;
+            if s.footer.single().is_none() {
+                self.touch.touch(
+                    Part::TfTail,
+                    set.at + set.postings.tf_at + s.footer.tf_byte(block),
+                    1,
+                );
+            }
+            bucket
+        };
         self.buckets[i] = bucket;
         Ok(bucket)
     }
@@ -3572,6 +3582,9 @@ struct TfRun {
     bit: usize,
     bytes: *const u8,
     len: usize,
+    /// Where the entry's buckets start in the TF tail, in bytes (for page
+    /// accounting).
+    tail: usize,
 }
 
 impl TfRun {
@@ -3600,6 +3613,7 @@ impl Default for TfRun {
             bit: 0,
             bytes: std::ptr::NonNull::dangling().as_ptr(),
             len: 0,
+            tail: 0,
         }
     }
 }
@@ -4509,6 +4523,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(TfRun {
                 state: TfRun::READY,
                 first: e.first,
+                tail: e.tf_bit as usize / 8,
                 ..TfRun::default()
             });
         }
@@ -4528,6 +4543,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             bit: e.tf_bit as usize - from * 8,
             bytes: bytes.as_ptr(),
             len: bytes.len(),
+            tail: from,
         })
     }
 }
