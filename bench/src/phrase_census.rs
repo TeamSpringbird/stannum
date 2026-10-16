@@ -65,6 +65,11 @@ pub struct Tally {
     pub oracle_ns: u64,
     pub sieve_ns: u64,
     pub sieve_in: u64,
+    /// Candidates checked a batch at a time before staging, those kept,
+    /// and the batches' time.
+    pub precheck_in: u64,
+    pub precheck_kept: u64,
+    pub precheck_ns: u64,
     /// The census passes' walks, and the plain ones, timed whole.
     pub walk_ns: u64,
     pub plain_ns: u64,
@@ -83,6 +88,7 @@ pub struct Census<'t> {
     staged: FxHashMap<(u32, u32), Cand>,
     oracle_at: u64,
     sieve_at: u64,
+    precheck_at: u64,
 }
 
 impl<'t> Census<'t> {
@@ -94,6 +100,7 @@ impl<'t> Census<'t> {
             staged: FxHashMap::default(),
             oracle_at: 0,
             sieve_at: 0,
+            precheck_at: 0,
         }
     }
 
@@ -216,6 +223,14 @@ impl Touch for Census<'_> {
                 self.tally.sieve_in += u64::from(n);
             }
             PhraseStep::Sieved => self.tally.sieve_ns += now - self.sieve_at,
+            PhraseStep::Precheck { n } => {
+                self.precheck_at = now;
+                self.tally.precheck_in += u64::from(n);
+            }
+            PhraseStep::Prechecked { kept } => {
+                self.tally.precheck_ns += now - self.precheck_at;
+                self.tally.precheck_kept += u64::from(kept);
+            }
         }
     }
 }
@@ -259,6 +274,16 @@ impl Tally {
             ms(self.sieve_ns as f64),
             self.sieve_in
         );
+        if self.precheck_in > 0 {
+            let _ = writeln!(
+                out,
+                "checked before staging: {} candidates, {} kept, {:.1} ms ({:.1} ns a candidate)",
+                self.precheck_in,
+                self.precheck_kept,
+                ms(self.precheck_ns as f64),
+                self.precheck_ns as f64 / self.precheck_in as f64
+            );
+        }
         let _ = writeln!(
             out,
             "{:<14} {:>9} {:>9} {:>9} {:>9} {:>9} {:>10} {:>9} {:>9} {:>8} {:>9}",

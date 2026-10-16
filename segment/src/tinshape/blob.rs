@@ -892,6 +892,29 @@ impl<'a> From<&'a Vec<u8>> for Bytes<'a> {
     }
 }
 
+/// A hint that the cache line holding `p` is read soon; no load, no
+/// fault, nothing on targets without the instruction.
+#[inline(always)]
+fn prefetch(p: *const u8) {
+    #[cfg(target_arch = "aarch64")]
+    // SAFETY: `prfm` is a hint: it reads nothing architecturally and cannot
+    // fault, whatever the address.
+    unsafe {
+        std::arch::asm!(
+            "prfm pldl1keep, [{p}]",
+            p = in(reg) p,
+            options(nostack, preserves_flags, readonly)
+        );
+    }
+    #[cfg(target_arch = "x86_64")]
+    // SAFETY: as above, `prefetcht0` is a hint.
+    unsafe {
+        std::arch::x86_64::_mm_prefetch::<{ std::arch::x86_64::_MM_HINT_T0 }>(p.cast());
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let _ = p;
+}
+
 impl<'a> Bytes<'a> {
     pub fn len(&self) -> usize {
         match self {
@@ -986,6 +1009,17 @@ impl<'a> Bytes<'a> {
                 }
                 ((at + from) / n * n + n - at).min(len)
             }
+        }
+    }
+
+    /// Asks the CPU to start loading the cache line holding byte `at`, to
+    /// be read soon: reads of several such bytes, each found by a read of
+    /// its own, then overlap. The byte's page is read (pinned) as a read of
+    /// it would; a byte past the end is ignored.
+    #[inline]
+    pub fn prefetch(&self, at: usize) {
+        if let Ok(byte) = self.get(at, at + 1) {
+            prefetch(byte.as_ptr());
         }
     }
 

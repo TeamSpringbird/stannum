@@ -124,6 +124,14 @@ pub enum PhraseStep {
         n: u32,
     },
     Sieved,
+    /// A batch of `n` candidates is checked before staging, and `kept` of
+    /// them hold the phrase.
+    Precheck {
+        n: u32,
+    },
+    Prechecked {
+        kept: u32,
+    },
 }
 
 /// Reads recorded nowhere, for timing.

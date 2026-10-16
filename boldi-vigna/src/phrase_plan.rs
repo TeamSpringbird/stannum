@@ -110,18 +110,26 @@ impl PhrasePlan {
     /// earlier leaf lies the sum of the distances between the two before
     /// some position of the later one. Both leaves' slots must be read.
     pub fn pair_keeps(&self, pair: (usize, usize), positions: &impl TermPositions) -> bool {
+        let (earlier, later, lo, hi) = self.pair_distance(pair);
+        keeps_distance(
+            positions.positions(earlier),
+            positions.positions(later),
+            lo,
+            hi,
+        )
+    }
+
+    /// `pair`'s test as [`Self::pair_keeps`] makes it: the slots of its
+    /// earlier and later leaf, and the least and greatest distance from a
+    /// position of the earlier to one of the later.
+    pub fn pair_distance(&self, pair: (usize, usize)) -> (usize, usize, u32, u32) {
         let (earlier, later) = pair;
         let (lo, hi) = self.gaps[earlier..later]
             .iter()
             .fold((0u32, 0u32), |(lo, hi), gap| {
                 (lo.saturating_add(gap.0), hi.saturating_add(gap.1))
             });
-        keeps_distance(
-            positions.positions(self.leaves[earlier]),
-            positions.positions(self.leaves[later]),
-            lo,
-            hi,
-        )
+        (self.leaves[earlier], self.leaves[later], lo, hi)
     }
 
     /// Adds the leaves of `query` and the gaps between them; `cap` is the
