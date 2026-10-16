@@ -369,6 +369,22 @@ nohup benchmarks/aws/devbox.sh --branch BASE --branch CANDIDATE --dump --disk 12
   --env COMPARE=B:A,Bv4:B --cmd-file benchmarks/aws/devbox-htpair-ab.sh > devbox.log 2>&1 &
 ```
 
+`benchmarks/aws/htpair_gate.py OUT --compare B:A [--target B=conjunction/phrase]`
+is the keep gate over the same files. Per style it takes the median of the
+per-round ratios (a round's arm and base run close together, while the
+host drifts up to 4% between rounds), for the paired core and the single
+thread. A build is kept if no style's paired change is below −0.5%, the
+answers agree, and either the geomean over the six styles is at least
++1.5% with every round's geomean above zero, or one style the change aims
+at gains at least +2.0% with every round at least +1.0% and the geomean is
+at least +0.5%. In the first session (nine arms, three rounds, 2026-10-16)
+the paired change followed the single thread's closely (slope 0.89,
+correlation 0.93 over 42 arm-styles; against the instruction cut, 0.86),
+and it was about a third quieter between rounds (range 1.0 against 1.5
+points). Cutting cheap, high-IPC work gained 1–2.5 points more in the pair
+than alone on conjunctions, but no candidate that the single-thread gate
+had rejected became a keep on the strength of that alone.
+
 ## Matching TIN v1.0.6's published setup
 
 Benchmarks v2 reproduces the setup of PlanetScale's
