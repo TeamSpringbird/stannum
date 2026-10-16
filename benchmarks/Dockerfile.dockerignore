@@ -15,4 +15,5 @@
 !benchmarks/pgo/**
 !script/pgo-check
 !script/install-release
+!script/rustc-cpu-level
 **/target/**

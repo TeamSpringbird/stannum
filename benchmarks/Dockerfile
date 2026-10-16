@@ -58,7 +58,7 @@ ARG STANNUM_TARGET_CPU=loader
 # /var/lib/postgresql/pgo-raw (script/pgo-build trains one).
 ARG STANNUM_PGO=
 COPY benchmarks/pgo benchmarks/pgo
-COPY script/pgo-check script/install-release script/
+COPY script/pgo-check script/install-release script/rustc-cpu-level script/
 # Keep optimized code and line tables for the owned perf diagnostics (the
 # line tables also keep the symbols script/pgo-check looks for). The summary
 # filter may match nothing (one build without a profile: no `== ` or `PGO
