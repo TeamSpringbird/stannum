@@ -437,6 +437,11 @@ pub struct Census {
     /// combinations ([`combo`]) that rule it out, with [`DEAD`] when it
     /// ended with no candidate (for the skip oracle, `--skips`).
     pub skips: Vec<(u32, u32, u64)>,
+    /// Each of [`Self::skips`]' groups' features, tab-separated: required
+    /// terms; the lead's kind and count; the second term's kind (`A`
+    /// absent, `S` sparse), count and container bytes; the candidates left
+    /// after each term, comma-separated.
+    pub feats: Vec<String>,
 }
 
 /// The bit of [`Census::skips`] for a group that ended empty.
@@ -471,6 +476,7 @@ impl Census {
     ) {
         self.queries_seen += 1;
         self.skips.clear();
+        self.feats.clear();
         let mut and_seen = false;
         let mut or_events: Vec<(usize, u32, Option<f32>, Vec<usize>)> = Vec::new();
         for e in events {
@@ -616,6 +622,23 @@ impl Census {
         self.skips
             .push((seg as u32, g, if empty_final { DEAD } else { 0 }));
         let lead = tg[0].expect("the lead holds the group");
+        let kind = |t: &TermGroup| match t.kind {
+            SPARSE => "S".to_owned(),
+            k => k.to_string(),
+        };
+        let (k2, c2, l2) = match tg.get(1) {
+            Some(Some(t)) => (kind(t), t.count, t.len),
+            Some(None) => ("A".to_owned(), 0, 0),
+            None => ("-".to_owned(), 0, 0),
+        };
+        let left_s: Vec<String> = left.iter().map(u32::to_string).collect();
+        self.feats.push(format!(
+            "{}\t{}\t{}\t{k2}\t{c2}\t{l2}\t{}",
+            req.len(),
+            kind(lead),
+            lead.count,
+            left_s.join(",")
+        ));
         if req.len() < 2 {
             emit(&avoided);
             return;

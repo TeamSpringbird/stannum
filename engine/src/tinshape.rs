@@ -118,16 +118,40 @@ pub trait Touch {
     }
 
     /// A lab oracle (off everywhere else): whether a led walk passes
-    /// group `g` unread, as a summary that rules it out would, before its
-    /// lead's container is loaded (`loaded` false) or once it is. The
-    /// oracle names only groups that end with no candidate, so answers
-    /// are unchanged; timing the walk with and without it measures what
-    /// those groups cost.
+    /// group `g` unread from `stage` on, as a summary that rules it out
+    /// would: [`SKIP_PRE`] before its lead's container is loaded,
+    /// [`SKIP_AND`] once it is, and the stages of its intersection after
+    /// (the second term's entry found, loaded, intersected; the last
+    /// term's). The oracle names only groups that end with no candidate, so
+    /// answers are unchanged; timing the walk with and without it measures
+    /// what those groups cost, and from which stage.
     #[inline]
-    fn skip_group(&mut self, _g: u32, _loaded: bool) -> bool {
+    fn skip_group(&mut self, _g: u32, _stage: u8) -> bool {
+        false
+    }
+
+    /// Whether [`Self::skip_group`] is asked at every stage: the second
+    /// term's entry is then found before its container is loaded (in
+    /// every arm, so arms differ only in what they skip).
+    #[inline]
+    fn skip_stages(&self) -> bool {
         false
     }
 }
+
+/// [`Touch::skip_group`]'s stages, in the order a group meets them.
+pub const SKIP_PRE: u8 = 0;
+pub const SKIP_AND: u8 = 1;
+/// The lead's members are the candidates; the second term not looked up.
+pub const SKIP_CANDS: u8 = 2;
+/// The second term's entry found; its container not loaded.
+pub const SKIP_FOUND: u8 = 3;
+/// The second term's members loaded; not intersected.
+pub const SKIP_LOADED: u8 = 4;
+/// The candidates intersected with the second term's members.
+pub const SKIP_SECOND: u8 = 5;
+/// Every required term intersected; the candidates not walked.
+pub const SKIP_ALL: u8 = 6;
 
 /// Reads recorded nowhere, for timing.
 pub struct NoTouch;

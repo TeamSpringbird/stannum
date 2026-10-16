@@ -1543,7 +1543,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.answer.windows_pruned += 1;
                 continue;
             }
-            if self.touch.skip_group(g, false) {
+            if self.touch.skip_group(g, super::SKIP_PRE) {
                 continue;
             }
             if self.mems[lead].loaded != g + 1 {
@@ -1679,7 +1679,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// probing its high bits in place, any other list by a merge. Then walks
     /// the candidates left.
     fn group_and(&mut self, g: u32) -> Result<bool> {
-        if self.touch.skip_group(g, true) {
+        if self.touch.skip_group(g, super::SKIP_AND) {
             return Ok(true);
         }
         let mut cands = std::mem::take(&mut self.cands);
@@ -1692,15 +1692,27 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         let mut left = [0u32; 16];
         left[0] = cands.len() as u32;
+        let stages = self.touch.skip_stages();
         for r in 1..self.req.len() {
             if cands.is_empty() {
                 break;
             }
             let t = self.req[r];
+            if stages && r == 1 && self.touch.skip_group(g, super::SKIP_CANDS) {
+                cands.clear();
+                break;
+            }
             if self.mems[t].loaded != g + 1 {
                 let set = self.terms[t].as_mut().expect("required");
                 let mem = &mut self.mems[t];
                 let sparse = matches!(set.postings.form, Form::Sparse(_));
+                if stages && r == 1 && !sparse {
+                    let _ = set.find(g, &mut mem.hint);
+                    if self.touch.skip_group(g, super::SKIP_FOUND) {
+                        cands.clear();
+                        break;
+                    }
+                }
                 if sparse && next_group(set, self.geometry, g, &mut mem.hint, self.touch) != Some(g)
                 {
                     cands.clear();
@@ -1715,6 +1727,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     cands.clear();
                     break;
                 }
+            }
+            if stages && r == 1 && self.touch.skip_group(g, super::SKIP_LOADED) {
+                cands.clear();
+                break;
             }
             let mem = &self.mems[t];
             match &mem.kind {
@@ -1738,6 +1754,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if self.touch.census() && r < left.len() {
                 left[r] = cands.len() as u32;
             }
+            if stages && r == 1 && self.touch.skip_group(g, super::SKIP_SECOND) {
+                cands.clear();
+                break;
+            }
+        }
+        if stages && self.touch.skip_group(g, super::SKIP_ALL) {
+            cands.clear();
         }
         if self.touch.census() {
             let n = self.req.len().min(left.len());

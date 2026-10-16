@@ -52,7 +52,8 @@
 //! `full`; `--census-or-every N` models every Nth disjunction only;
 //! `--census-sizes` also writes the index-wide sizes and length histogram.
 //! With `--census`, `--skips-out FILE` writes each intersected group with
-//! the combinations that rule it out; `--skips FILE:VARIANT:pre|post`
+//! the combinations that rule it out (then the group's features, for the
+//! dead-group census); `--skips FILE:VARIANT:pre|post|sN`
 //! (with `--timed-walk`) times the walk with an oracle passing those groups
 //! unread (VARIANT `dead`, every group that ended empty, or
 //! `SCOPE/FORM/MIN`, e.g. `all/page256/16`), before its lead's container is
@@ -131,9 +132,9 @@ struct Args {
     census_or_every: usize,
     census_sizes: bool,
     skips_out: Option<PathBuf>,
-    /// `--skips`: the file, the variant's bit, and whether a group is passed
-    /// once its lead is loaded.
-    skips: Option<(PathBuf, u64, bool)>,
+    /// `--skips`: the file, the variant's bit, and the stage a group is
+    /// passed from ([`tin::SKIP_PRE`]...).
+    skips: Option<(PathBuf, u64, u8)>,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -159,7 +160,7 @@ fn usage() -> ! {
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
          [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
          [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK] [--census DIR [--census-or-every N] [--census-sizes] [--skips-out FILE]] \
-         [--skips FILE:VARIANT:pre|post]"
+         [--skips FILE:VARIANT:pre|post|sN]"
     );
     std::process::exit(2)
 }
@@ -267,6 +268,9 @@ fn args() -> Args {
                 let [at, variant, file] = f[..] else { usage() };
                 let bit = match variant {
                     "dead" => bench::gates2::DEAD,
+                    _ if variant.starts_with("bit") => {
+                        1 << variant[3..].parse::<u32>().unwrap_or_else(|_| usage())
+                    }
                     _ => {
                         let p: Vec<&str> = variant.split('/').collect();
                         let [scope, form, min] = p[..] else { usage() };
@@ -274,12 +278,15 @@ fn args() -> Args {
                         bench::gates2::combo_bit(scope, form, min).unwrap_or_else(|| usage())
                     }
                 };
-                let post = match at {
-                    "pre" => false,
-                    "post" => true,
-                    _ => usage(),
+                let stage = match at {
+                    "pre" => tin::SKIP_PRE,
+                    "post" => tin::SKIP_AND,
+                    _ => at
+                        .strip_prefix('s')
+                        .and_then(|n| n.parse().ok())
+                        .unwrap_or_else(|| usage()),
                 };
-                a.skips = Some((file.into(), bit, post));
+                a.skips = Some((file.into(), bit, stage));
             }
             _ => usage(),
         }
@@ -896,7 +903,7 @@ impl Reader {
         seed: Option<&[(f32, Tid)]>,
         order: SegmentOrder,
         answer: &[(f32, Tid)],
-        skips: Option<(&[Vec<u32>], bool)>,
+        skips: Option<(&[Vec<u32>], u8)>,
     ) -> Option<Vec<(f32, Tid)>> {
         let mut names = Vec::new();
         let node = tin::lower(&scorer.query, &mut names)?;
@@ -909,7 +916,7 @@ impl Reader {
         for i in visit {
             self.segs[i]
                 .with(&names, |segment| match skips {
-                    Some((lists, post)) => tin::top_k_into(
+                    Some((lists, stage)) => tin::top_k_into(
                         segment,
                         &node,
                         &names,
@@ -919,7 +926,7 @@ impl Reader {
                         &mut Skips {
                             groups: lists.get(i).map_or(&[], Vec::as_slice),
                             at: 0,
-                            post,
+                            stage,
                         },
                     ),
                     None => tin::top_k_into(
@@ -1147,7 +1154,7 @@ impl tin::Touch for Offset<'_> {
 struct Skips<'a> {
     groups: &'a [u32],
     at: usize,
-    post: bool,
+    stage: u8,
 }
 
 impl tin::Touch for Skips<'_> {
@@ -1155,8 +1162,15 @@ impl tin::Touch for Skips<'_> {
     fn touch(&mut self, _: Part, _: usize, _: usize) {}
 
     #[inline]
-    fn skip_group(&mut self, g: u32, loaded: bool) -> bool {
-        if loaded != self.post {
+    fn skip_stages(&self) -> bool {
+        true
+    }
+
+    #[inline]
+    fn skip_group(&mut self, g: u32, stage: u8) -> bool {
+        // From the stage on: a group may pass a stage unasked (a sparse
+        // second term has no entry to find).
+        if stage < self.stage {
             return false;
         }
         while self.at < self.groups.len() && self.groups[self.at] < g {
@@ -1175,7 +1189,7 @@ fn read_skips(
     let mut out: FxHashMap<String, Vec<Vec<u32>>> = FxHashMap::default();
     for line in text.lines() {
         let f: Vec<&str> = line.split('\t').collect();
-        let [name, seg, g, bits] = f[..] else {
+        let [name, seg, g, bits, ..] = f[..] else {
             return Err(format!("--skips: a bad line {line:?}"));
         };
         let bits = u64::from_str_radix(bits, 16).map_err(|e| e.to_string())?;
@@ -1446,7 +1460,7 @@ fn run() -> Result<bool, String> {
         let skip = skips.as_ref().map(|s| {
             (
                 s.get(&q.name).unwrap_or(&no_skips).as_slice(),
-                args.skips.as_ref().is_some_and(|s| s.2),
+                args.skips.as_ref().map_or(tin::SKIP_PRE, |s| s.2),
             )
         });
         // Warm pass (also the answer, and what it decoded of the terms'
@@ -1579,8 +1593,8 @@ fn run() -> Result<bool, String> {
                 &census_segs,
             );
             if args.skips_out.is_some() {
-                for &(seg, g, bits) in &census.skips {
-                    let _ = writeln!(skips_out, "{}\t{seg}\t{g}\t{bits:x}", q.name);
+                for (&(seg, g, bits), feats) in census.skips.iter().zip(&census.feats) {
+                    let _ = writeln!(skips_out, "{}\t{seg}\t{g}\t{bits:x}\t{feats}", q.name);
                 }
             }
             if (n + 1) % 50 == 0 {
