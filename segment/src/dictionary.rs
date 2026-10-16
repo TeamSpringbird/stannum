@@ -63,6 +63,8 @@ pub struct DictionaryBuilder {
     count: usize,
     index: Vec<u8>,
     blocks: Vec<u8>,
+    /// Bytes of blocks handed out by [`Self::take_blocks`], ahead of `blocks`.
+    taken: u64,
     last: Vec<u8>,
     /// Where the previous entry's extents ended, for the gaps.
     payload_end: u64,
@@ -82,7 +84,7 @@ impl DictionaryBuilder {
             return Err(Error::InvalidTfBucket);
         }
         let shared = if self.count.is_multiple_of(BLOCK_TERMS) {
-            varint::put(&mut self.index, self.blocks.len() as u64);
+            varint::put(&mut self.index, self.taken + self.blocks.len() as u64);
             varint::put(&mut self.index, term.len() as u64);
             self.index.extend_from_slice(term.as_bytes());
             self.payload_end = 0;
@@ -132,13 +134,35 @@ impl DictionaryBuilder {
         self.count == 0
     }
 
+    /// The blocks written since the last call, which the caller keeps in
+    /// order: [`Self::finish_parts`] then gives the stream's head and the
+    /// blocks after them.
+    pub fn take_blocks(&mut self) -> Vec<u8> {
+        self.taken += self.blocks.len() as u64;
+        std::mem::take(&mut self.blocks)
+    }
+
+    /// Bytes of blocks held, not yet taken.
+    pub fn held(&self) -> usize {
+        self.blocks.len()
+    }
+
+    /// The stream: its header and index, the blocks taken (`taken` bytes),
+    /// then the blocks returned here.
+    pub fn finish_parts(self) -> (Vec<u8>, u64, Vec<u8>) {
+        let mut head = Vec::with_capacity(self.index.len() + 16);
+        varint::put(&mut head, self.count as u64);
+        varint::put(&mut head, self.count.div_ceil(BLOCK_TERMS) as u64);
+        varint::put(&mut head, self.index.len() as u64);
+        head.extend_from_slice(&self.index);
+        (head, self.taken, self.blocks)
+    }
+
+    /// The stream, of a builder whose blocks were never taken.
     pub fn finish(self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(self.index.len() + self.blocks.len() + 16);
-        varint::put(&mut out, self.count as u64);
-        varint::put(&mut out, self.count.div_ceil(BLOCK_TERMS) as u64);
-        varint::put(&mut out, self.index.len() as u64);
-        out.extend_from_slice(&self.index);
-        out.extend_from_slice(&self.blocks);
+        let (mut out, taken, blocks) = self.finish_parts();
+        assert_eq!(taken, 0, "finish() of a dictionary whose blocks were taken");
+        out.extend_from_slice(&blocks);
         out
     }
 }
@@ -166,6 +190,22 @@ pub struct DictionaryIndex<'a> {
     /// Every `SAMPLE`th entry: its first term, its block's offset and where
     /// the entry starts in `index_bytes`.
     samples: Vec<(&'a [u8], usize, usize)>,
+    /// Each sample's first term as a [`key`], searched before the terms:
+    /// a term's bytes lie in the index, a cache line apart from the next
+    /// sample's, so a binary search over them missed the cache at nearly
+    /// every step (most of a lookup's cost at 150M rows).
+    keys: Vec<u64>,
+}
+
+/// A term's first eight bytes, zero-padded, as a big-endian word: ordered
+/// as the terms are where two keys differ (`key(a) < key(b)` implies
+/// `a < b`); terms of equal keys compare by their bytes.
+#[inline]
+fn key(term: &[u8]) -> u64 {
+    let mut bytes = [0u8; 8];
+    let n = term.len().min(8);
+    bytes[..n].copy_from_slice(&term[..n]);
+    u64::from_be_bytes(bytes)
 }
 
 impl<'a> DictionaryIndex<'a> {
@@ -202,12 +242,14 @@ impl<'a> DictionaryIndex<'a> {
         if index_reader.remaining() != 0 {
             return Err(Error::Corrupt("dictionary index length"));
         }
+        let keys = samples.iter().map(|(first, _, _)| key(first)).collect();
         Ok(Self {
             count,
             header_len,
             index_bytes,
             blocks: block_count,
             samples,
+            keys,
         })
     }
 
@@ -258,24 +300,41 @@ impl<'a> DictionaryIndex<'a> {
     /// Index of the block that could contain `term`, if any block starts at or
     /// before it.
     fn block_for(&self, term: &[u8]) -> Option<usize> {
-        // The last sample at or before the term, then the last entry at or
-        // before it among the ones up to the next sample.
-        let sample = self
-            .samples
-            .partition_point(|(first, _, _)| *first <= term)
-            .checked_sub(1)?;
+        // The last sample at or before the term, by key, then by bytes among
+        // the samples of the term's key (rarely more than one).
+        let k = key(term);
+        let below = self.keys.partition_point(|s| *s < k);
+        let ties = self.keys[below..].iter().take_while(|s| **s == k).count();
+        let sample = (below
+            + self.samples[below..below + ties].partition_point(|(first, _, _)| *first <= term))
+        .checked_sub(1)?;
+        // Then the last entry at or before it among the ones up to the next
+        // sample, read forward from the sample once.
+        let (_, _, at) = self.samples[sample];
+        let mut reader = Reader::at(self.index_bytes, at);
         let mut block = sample * SAMPLE;
-        for next in block + 1..(block + SAMPLE).min(self.blocks) {
-            match self.entry(next) {
-                Some((first, _)) if first <= term => block = next,
+        for next in block..(block + SAMPLE).min(self.blocks) {
+            let parsed = reader
+                .varint_u32()
+                .and_then(|_| reader.varint_u32())
+                .and_then(|len| reader.take(len as usize));
+            match parsed {
+                Ok(first) if first <= term => block = next,
                 _ => break,
             }
         }
         Some(block)
     }
 
-    fn block_terms(&self, block: usize) -> usize {
+    /// Terms in block `block`.
+    pub fn block_terms(&self, block: usize) -> usize {
         (self.count - block * BLOCK_TERMS).min(BLOCK_TERMS)
+    }
+
+    /// Byte range of block `block` within a blocks area of `blocks_len`
+    /// bytes, for a reader that fetches blocks one at a time.
+    pub fn block_extent(&self, block: usize, blocks_len: usize) -> Option<(usize, usize)> {
+        (block < self.blocks).then(|| self.block_range(block, blocks_len))
     }
 
     /// Byte range of block `block` within the blocks area.
@@ -387,7 +446,6 @@ impl<'a> Dictionary<'a> {
             reader: Reader::new(self.blocks.block(range)?),
             remaining_in_block: self.index.block_terms(block),
             term: Vec::new(),
-            previous: Vec::new(),
             payload_end: 0,
             ordinals_end: 0,
         })
@@ -491,11 +549,9 @@ struct Walker<'a> {
     block: usize,
     reader: Reader<'a>,
     remaining_in_block: usize,
+    /// The term at hand: the next one keeps its shared prefix in place and
+    /// replaces the rest by its suffix.
     term: Vec<u8>,
-    /// The term before `term`: its buffer swapped with `term`'s each step,
-    /// so a walk over a block reuses two buffers rather than allocating one
-    /// per entry.
-    previous: Vec<u8>,
     /// Where the previous entry's extents ended, for the gaps.
     payload_end: u64,
     ordinals_end: u64,
@@ -509,14 +565,20 @@ impl<'a> Walker<'a> {
         }
         let suffix_len = self.reader.varint_u32()? as usize;
         let suffix = self.reader.take(suffix_len)?;
-        std::mem::swap(&mut self.term, &mut self.previous);
-        self.term.clear();
-        self.term.extend_from_slice(&self.previous[..shared]);
-        self.term.extend_from_slice(suffix);
-        let previous = &self.previous;
-        if self.term.is_empty() || (!previous.is_empty() && *previous >= self.term) {
+        // Past the term before (any non-empty term at a block's start): with
+        // the prefix shared, exactly when the suffix is past the rest of the
+        // term before, which its first byte most often decides.
+        let rest = &self.term[shared..];
+        let after = match (suffix.first(), rest.first()) {
+            (Some(s), Some(r)) if s != r => s > r,
+            (Some(_), None) => true,
+            _ => suffix > rest,
+        };
+        if !after {
             return Err(Error::Corrupt("dictionary term order"));
         }
+        self.term.truncate(shared);
+        self.term.extend_from_slice(suffix);
         let df_bucket = self.reader.varint()?;
         let df = u32::try_from(df_bucket >> 4).map_err(|_| Error::Corrupt("dictionary df"))?;
         let max_tf_bucket = (df_bucket & 0xf) as u8;
@@ -685,6 +747,108 @@ mod tests {
         assert_eq!(tail, terms[298..]);
         assert_eq!(dictionary.prefix("zzz").count(), 0);
         assert_eq!(dictionary.iter_from("a").count(), 300);
+    }
+
+    /// One block of entries `(shared, suffix)` as written, whatever their
+    /// order, each with zero extents.
+    fn block_of(entries: &[(u64, &str)]) -> Vec<u8> {
+        let mut block = Vec::new();
+        for &(shared, suffix) in entries {
+            varint::put(&mut block, shared);
+            varint::put(&mut block, suffix.len() as u64);
+            block.extend_from_slice(suffix.as_bytes());
+            block.extend_from_slice(&[1 << 4, 0, 0, 0, 0]);
+        }
+        let first = &entries[0].1;
+        let mut index = Vec::new();
+        varint::put(&mut index, 0);
+        varint::put(&mut index, first.len() as u64);
+        index.extend_from_slice(first.as_bytes());
+        let mut out = Vec::new();
+        varint::put(&mut out, entries.len() as u64);
+        varint::put(&mut out, 1);
+        varint::put(&mut out, index.len() as u64);
+        out.extend_from_slice(&index);
+        out.extend_from_slice(&block);
+        out
+    }
+
+    /// A term must sort after the one before it however its prefix is
+    /// shared (a writer need not share the longest), and an entry that
+    /// does not is corrupt.
+    #[test]
+    fn walking_a_block_checks_each_term_follows_the_last() {
+        let terms = |entries: &[(u64, &str)]| -> Result<Vec<String>> {
+            let bytes = block_of(entries);
+            let owned = OwnedDictionary::parse(&bytes)?;
+            owned.view().iter().map(|r| r.map(|(t, _)| t)).collect()
+        };
+        assert_eq!(
+            terms(&[(0, "ab"), (1, "c"), (0, "acd"), (3, "e"), (4, "")]).ok(),
+            None,
+            "an empty suffix repeats the term"
+        );
+        assert_eq!(
+            terms(&[(0, "ab"), (1, "c"), (0, "acd"), (3, "e"), (2, "")]).ok(),
+            None,
+            "a prefix of the term before"
+        );
+        assert_eq!(
+            terms(&[(0, "ab"), (1, "c"), (0, "acd"), (3, "e"), (2, "e")]).unwrap(),
+            ["ab", "ac", "acd", "acde", "ace"]
+        );
+        assert!(terms(&[(0, "ab"), (0, "aa")]).is_err());
+        assert!(terms(&[(0, "ab"), (1, "b")]).is_err());
+        assert!(terms(&[(0, "ab"), (0, "ab")]).is_err());
+        assert!(terms(&[(0, "ab"), (0, "abc")]).is_ok());
+        assert!(terms(&[(0, "")]).is_err());
+    }
+
+    /// Samples searched by key (a term's first eight bytes): many samples,
+    /// runs of them sharing a key, terms shorter than a key and one holding
+    /// a NUL (padded alike), each found, and misses between them not.
+    #[test]
+    fn lookups_by_key_across_samples_of_equal_keys() {
+        let mut terms: Vec<String> = Vec::new();
+        for i in 0..3000 {
+            terms.push(format!("{i:03x}"));
+            terms.push(format!("sharedprefix{i:05}"));
+            terms.push(format!("x{i:04}"));
+        }
+        terms.push("ab".to_owned());
+        terms.push("ab\0".to_owned());
+        terms.push("ab\0\0z".to_owned());
+        terms.sort();
+        terms.dedup();
+        let refs: Vec<&str> = terms.iter().map(String::as_str).collect();
+        let bytes = build(&refs);
+        let owned = OwnedDictionary::parse(&bytes).unwrap();
+        let dictionary = owned.view();
+        assert!(owned.index.samples.len() > 8);
+        for (i, term) in refs.iter().enumerate() {
+            assert_eq!(
+                dictionary.get(term).unwrap(),
+                Some(entry(i as u32)),
+                "{term:?}"
+            );
+            let miss = format!("{term}\0");
+            if terms.binary_search(&miss).is_err() {
+                assert_eq!(dictionary.get(&miss).unwrap(), None, "{miss:?}");
+            }
+        }
+        for miss in [
+            "",
+            "a",
+            "ab\0\0",
+            "sharedprefix",
+            "sharedprefix0",
+            "zzzz",
+            "\u{ff}",
+        ] {
+            assert_eq!(dictionary.get(miss).unwrap(), None, "{miss:?}");
+        }
+        let prefixed = dictionary.prefix("sharedprefix0299").count();
+        assert_eq!(prefixed, 10);
     }
 
     #[test]

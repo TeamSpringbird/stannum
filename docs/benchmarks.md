@@ -125,7 +125,12 @@ suites; the benchmark tools live in `benchmarks/`, each with `--help`.
    `python3 benchmarks/published_dataset.py --corpus stackexchange --output DIR`.
 2. Build an image from the working tree:
    `python3 benchmarks/tin.py build-image --image TAG --output DIR`
-   (`--base postgres:18-trixie` builds a native image for local runs).
+   (`--base postgres:18-trixie` builds a native image for local runs). On
+   x86-64 the image builds what ships by default, the
+   [loader](RELEASING.md#x86-64-builds-and-the-loader) with the baseline and
+   x86-64-v4 builds, so a run measures the build the CPU picks;
+   `--target-cpu x86-64` builds the baseline alone (opt-in), and
+   `x86-64-v3` or `x86-64-v4` one build for that level.
 3. Run a workload:
    `python3 benchmarks/tin.py run --published-corpus stackexchange --dataset DIR --image TAG --workload topk --style mixed ...`.
    `--save-database` keeps the built, vacuumed and checked database so later
@@ -155,8 +160,10 @@ credentials out of Git.
 `build-image --pgo 1` (the Dockerfile's `STANNUM_PGO=1`) compiles the
 extension with `-C profile-use` and the committed profile for the image's
 architecture, `benchmarks/pgo/<arch>.profdata` (`uname -m`: `aarch64` and
-`x86_64`). An architecture without a profile builds as without PGO,
-with a warning. `--pgo strict` fails instead, and also fails on a stale
+`x86_64`; an x86-64-v4 build takes `x86_64-v4.profdata` when there is one,
+else `x86_64.profdata`; the default x86-64 image, the loader, compiles each
+of its two builds with its own profile). An architecture without a profile builds as
+without PGO, with a warning. `--pgo strict` fails instead, and also fails on a stale
 profile (below). Without `--pgo`, builds are as before. A profile changes
 code layout, inlining and branch weights only; answers and formats do not
 change.
@@ -228,9 +235,12 @@ Two more build-only options were measured on x86-64, both without source
 changes, on the 150M offline replay: post-link layout with LLVM BOLT
 (`script/bolt-build`), and builds for the x86-64-v3 and x86-64-v4 CPU levels
 (which would ship as one source and a small loader choosing the library).
-**Neither is worth adopting:** BOLT gains nothing beyond PGO, and v3 and v4
-gain 1.4% and 2.9% beyond PGO, below the 5% that a loader and three libraries
-would need to pay for.
+BOLT gains nothing beyond PGO and is not used. v3 and v4 gained 1.4% and
+2.9% beyond PGO in single-thread cycles, first judged below what a loader
+and three libraries would cost. The hyperthread-paired gate later measured
+v4 at +3.0% of a core's throughput (2026-10-16), and x86-64 Linux now ships
+the baseline and v4 with the loader ([releasing](RELEASING.md#x86-64-builds-and-the-loader));
+v3 is not built.
 
 Measured on 2026-10-12 at 1e01d81 on one r7i.2xlarge (Xeon 8488C, Sapphire Rapids), with
 `benchmarks/aws/devbox-bolt-variants.sh` (`devbox.sh --dump --on-demand`;
@@ -283,18 +293,104 @@ run 6 to 8% fewer instructions at a lower IPC. The +13.5% that v4 once
 showed was the branchy f32 select that `or_zero` has since fixed for every
 level. In the server, a quarter to a third of the cycles are PostgreSQL's
 and the kernel's, which these builds do not change, so v4 would gain about
-2% there. A loader would make that portable: `stannum.so` as a small C library
-that, in `_PG_init`, reads CPUID, `dlopen`s `stannum_v1.so`, `stannum_v3.so`
-or `stannum_v4.so` (the same crate built three times), and calls that
-library's `_PG_init`. It would export `Pg_magic_func` and a trampoline for
-each symbol PostgreSQL resolves by name: every `#[pg_extern]` function
-(the access method handler among them) with its `pg_finfo_*`, and the
-background workers' entry points (their `bgw_library_name` is `stannum`, so they load
-the loader too). The trampolines can be generated from the variant's
-`nm -D` list. pgrx itself would not change, but packaging would: three
-builds and three PGO trainings per architecture and PostgreSQL version,
-three times the library size, and a symbol list to keep in step. That is
-not worth 2%.
+2% there. A loader makes that portable, and was first judged not worth 2%. The
+paired gate (two hyperthreads of one core busy, as a server's backends
+are) measured v4 at +3.0% (five of six styles at +2% or more), and so the
+loader now ships, with two builds rather than three: `stannum.so` is a
+small C library that reads CPUID in `_PG_init`, `dlopen`s
+`stannum-x86-64-v4.so` or `stannum-x86-64.so` and calls its `_PG_init`,
+and forwards by trampoline every symbol PostgreSQL resolves by name
+(generated from the build's `nm -D`). See
+[releasing](RELEASING.md#x86-64-builds-and-the-loader).
+
+Measured again on 2026-10-16 with the paired gate (one m7i.4xlarge, Xeon
+8488C, the layout-15 dump, three rotated rounds, non-PGO on every side; run
+`20261016-030601-575d`, $0.20 with the loader's checks). The v4 build as
+shipped compiles the workspace's crates for v4 and leaves the dependencies'
+own code at the baseline; a build of every crate for v4 was measured
+beside it:
+
+| style | v4 build (shipped) | every crate v4 | instructions |
+| --- | ---: | ---: | ---: |
+| conjunction | +0.1% | +0.4% | -2.1% |
+| phrase | +0.9% | +1.2% | -3.2% |
+| disjunction | +0.4% | +1.9% | -5.6% |
+| conjunction, full | +2.3% | +2.8% | -5.2% |
+| phrase, full | +2.1% | +2.3% | -5.1% |
+| disjunction, full | +4.7% | +6.0% | -9.6% |
+| geomean | **+1.7%** | +2.4% | |
+
+Paired queries per gigacycle against the baseline build, the median of the
+per-round ratios. The two v4 builds run the same instructions on every
+style, so the 0.65 points between them are code layout, not the
+dependencies' code. The shipped arm was built through a
+`RUSTC_WORKSPACE_WRAPPER`, which renames every function (see
+[releasing](RELEASING.md#x86-64-builds-and-the-loader)); the release
+build's `RUSTC_WRAPPER` compiles the same crates for v4 under the
+baseline's names, and so lays them out otherwise again. In the server, the
+build is also profile-guided, which decides the layout of the hot code.
+
+## The hyperthread-paired replay
+
+A server's backends share each core with a sibling hyperthread. In the
+150M server run at layout 14, a query ran about as many instructions as in
+the offline replay (0.88 to 1.03 times), but 1.69 to 2.05 times its cycles
+per thread: the core retired about 3.0 to 3.4 instructions a cycle for its
+two threads, against 2.8 to 3.2 for the replay's one. So the server's
+throughput follows instructions, and a single-thread replay A/B
+under-credits a change that removes instructions without removing cycles
+(cheap, high-IPC work the sibling would have used) and over-credits one that
+only hides latency (stalls the sibling would have filled).
+
+`tnsreplay --cpus C/C,S` measures the core instead: over one load of the
+dump, the plan's slices run on CPU C alone, then on C and its sibling S at
+once, a pinned thread each with its own segment readers, each thread over
+the whole slice from its own offset. Each query takes an untimed pass, then
+`--repeat` timed ones (`--forget` before each), counted by the thread's own
+`perf_event_open` group. A thread done with its slice keeps replaying it,
+uncounted, until its sibling is done too, so every counted query ran beside
+a busy sibling. Per slice it prints instructions, cycles and branch misses
+per query, the core's IPC, its queries per gigacycle (each thread's queries
+over its own cycles, summed: the core's throughput at a fixed clock) and a
+digest of the answers, which every set and build of a correct walk shares.
+A set can be any list of CPUs (`2,10,3,11,4,12,5,13`: four cores' eight
+hyperthreads, as the i7i server runs eight backends). Sibling CPUs are in
+`/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`; pinning and
+per-thread counts are Linux only.
+
+`benchmarks/aws/devbox-htpair-ab.sh` runs it for several builds on one
+devbox: each arm a tree (`--branch`), a dump directory and optionally an
+x86-64 level (`v4`: the workspace's crates through `script/rustc-cpu-level`,
+as `script/install-release` builds the loader's v4 build; `v4all`: the whole
+build through `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, which keeps
+the link flag a plain `RUSTFLAGS` drops), built in its own target directory; one
+process per arm and round, rounds rotated and reversed in turn;
+`benchmarks/aws/htpair_summary.py` then prints the pair-vs-single table per
+arm and, per compared pair, the paired core's throughput change beside the
+single thread's cycles and instructions.
+
+```sh
+export AWS_PROFILE=springbird-development DEVBOX_DUMP_PREFIX=replay-dumps/<prefix>/
+nohup benchmarks/aws/devbox.sh --branch BASE --branch CANDIDATE --dump --disk 120 --hours 2 \
+  --type m7i.4xlarge --spot-only --env ARMS=A:1:dump150m,B:2:dump150m,Bv4:2:dump150m:v4 \
+  --env COMPARE=B:A,Bv4:B --cmd-file benchmarks/aws/devbox-htpair-ab.sh > devbox.log 2>&1 &
+```
+
+`benchmarks/aws/htpair_gate.py OUT --compare B:A [--target B=conjunction/phrase]`
+is the keep gate over the same files. Per style it takes the median of the
+per-round ratios (a round's arm and base run close together, while the
+host drifts up to 4% between rounds), for the paired core and the single
+thread. A build is kept if no style's paired change is below −0.5%, the
+answers agree, and either the geomean over the six styles is at least
++1.5% with every round's geomean above zero, or one style the change aims
+at gains at least +2.0% with every round at least +1.0% and the geomean is
+at least +0.5%. In the first session (nine arms, three rounds, 2026-10-16)
+the paired change followed the single thread's closely (slope 0.89,
+correlation 0.93 over 42 arm-styles; against the instruction cut, 0.86),
+and it was about a third quieter between rounds (range 1.0 against 1.5
+points). Cutting cheap, high-IPC work gained 1–2.5 points more in the pair
+than alone on conjunctions, but no candidate that the single-thread gate
+had rejected became a keep on the strength of that alone.
 
 ## Matching TIN v1.0.6's published setup
 

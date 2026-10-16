@@ -44,9 +44,11 @@ pub const MAGIC: u32 = 0x4c44_5032;
 /// grouped lists as arrays of `u16` local slots. Version 14: each
 /// document's length class in the DL sidecar, and grouped records'
 /// directories as rows of fixed width, found by a group's rank. Version
-/// 15: positions bit-packed per block of entries at the block's widths. An
-/// index of an earlier version must be rebuilt.
-pub const VERSION: u8 = 15;
+/// 15: positions bit-packed per block of entries at the block's widths.
+/// Version 16: a segment run's and a pending run's length in 64 bits on the
+/// meta page, a page table's length implied by its run. An index of an
+/// earlier version must be rebuilt.
+pub const VERSION: u8 = 16;
 pub const SPECIAL_SIZE: usize = 8;
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;
 pub const PAGE_HEADER: usize = size_of::<pg_sys::PageHeaderData>();
@@ -71,7 +73,7 @@ const FLAGS: usize = PAGE_SIZE - SPECIAL_SIZE + 6;
 pub const MAX_SEGMENTS: usize = 96;
 /// Runs the meta page can hold while they wait for readers to drain: what
 /// fits beside a full directory.
-pub const MAX_PENDING: usize = 48;
+pub const MAX_PENDING: usize = 40;
 /// Sealed write segments waiting for promotion. A seal that would make a
 /// third promotes the oldest first, as TIN does in manual mode.
 pub const MAX_SEALED: usize = 2;
@@ -195,7 +197,10 @@ pub fn chain_payload(next: u32, data: &[u8]) -> Vec<u8> {
 pub struct Run {
     pub first: u32,
     pub blocks: u32,
-    pub bytes: u32,
+    /// The blob's length. A page holds under 8 KiB and a run under 2^32
+    /// pages, so 64 bits; the meta page records it in 32 where the run is
+    /// a dead list, and not at all for a page table (see [`Meta::encode`]).
+    pub bytes: u64,
     /// The chain's last page, so joining two retired chains writes one
     /// page instead of walking a run that may be millions of pages, under
     /// the exclusive meta lock.
@@ -263,8 +268,13 @@ impl Origin {
     }
 }
 
+/// A run with its length in 64 bits: a segment's or a pending run's.
+const WIDE_RUN_BYTES: usize = 20;
+/// A dead list: its length in 32 bits.
 const RUN_BYTES: usize = 16;
-const ENTRY_BYTES: usize = RUN_BYTES * 3 + 4 + 4 + 8 + 4 + 4;
+/// A page table: no length, which is four bytes per page of its segment.
+const TABLE_BYTES: usize = 12;
+const ENTRY_BYTES: usize = WIDE_RUN_BYTES + TABLE_BYTES + RUN_BYTES + 4 + 4 + 8 + 4 + 4;
 
 /// A run waiting until every scan that could still read it has finished.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -274,7 +284,7 @@ pub struct Pending {
     pub xid: u32,
 }
 
-const PENDING_BYTES: usize = RUN_BYTES + 4;
+const PENDING_BYTES: usize = WIDE_RUN_BYTES + 4;
 
 /// The write buffer (the mutable write segment), or a sealed write segment:
 /// a chain of buffer pages holding forward records.
@@ -341,19 +351,66 @@ fn get_buffer(bytes: &[u8], at: usize) -> BufferState {
     }
 }
 
-fn put_run(out: &mut Vec<u8>, run: Run) {
+fn put_wide_run(out: &mut Vec<u8>, run: Run) {
     out.extend_from_slice(&run.first.to_le_bytes());
     out.extend_from_slice(&run.blocks.to_le_bytes());
     out.extend_from_slice(&run.bytes.to_le_bytes());
     out.extend_from_slice(&run.last.to_le_bytes());
 }
 
+fn get_wide_run(bytes: &[u8], at: usize) -> Run {
+    Run {
+        first: u32_at(bytes, at),
+        blocks: u32_at(bytes, at + 4),
+        bytes: u64_at(bytes, at + 8),
+        last: u32_at(bytes, at + 16),
+    }
+}
+
+fn put_run(out: &mut Vec<u8>, run: Run) -> Result<()> {
+    let bytes = u32::try_from(run.bytes).map_err(|_| "Stannum dead list over 4 GiB")?;
+    out.extend_from_slice(&run.first.to_le_bytes());
+    out.extend_from_slice(&run.blocks.to_le_bytes());
+    out.extend_from_slice(&bytes.to_le_bytes());
+    out.extend_from_slice(&run.last.to_le_bytes());
+    Ok(())
+}
+
 fn get_run(bytes: &[u8], at: usize) -> Run {
     Run {
         first: u32_at(bytes, at),
         blocks: u32_at(bytes, at + 4),
-        bytes: u32_at(bytes, at + 8),
+        bytes: u64::from(u32_at(bytes, at + 8)),
         last: u32_at(bytes, at + 12),
+    }
+}
+
+/// The length of the page table of a segment run of `blocks` pages.
+pub const fn table_bytes(blocks: u32) -> u64 {
+    4 * blocks as u64
+}
+
+fn put_table(out: &mut Vec<u8>, table: Run, blocks: u32) -> Result<()> {
+    if !table.is_empty() && table.bytes != table_bytes(blocks) {
+        return Err("Stannum page table length differs from its segment's");
+    }
+    out.extend_from_slice(&table.first.to_le_bytes());
+    out.extend_from_slice(&table.blocks.to_le_bytes());
+    out.extend_from_slice(&table.last.to_le_bytes());
+    Ok(())
+}
+
+fn get_table(bytes: &[u8], at: usize, blocks: u32) -> Run {
+    let first = u32_at(bytes, at);
+    Run {
+        first,
+        blocks: u32_at(bytes, at + 4),
+        bytes: if first == NONE {
+            0
+        } else {
+            table_bytes(blocks)
+        },
+        last: u32_at(bytes, at + 8),
     }
 }
 
@@ -381,9 +438,9 @@ impl Meta {
         out.extend_from_slice(&(self.sealed.len() as u32).to_le_bytes());
         out.extend_from_slice(&(self.retired.len() as u32).to_le_bytes());
         for entry in &self.segments {
-            put_run(&mut out, entry.run);
-            put_run(&mut out, entry.map);
-            put_run(&mut out, entry.dead);
+            put_wide_run(&mut out, entry.run);
+            put_table(&mut out, entry.map, entry.run.blocks)?;
+            put_run(&mut out, entry.dead)?;
             out.extend_from_slice(&entry.dead_stamp.to_le_bytes());
             out.extend_from_slice(&entry.docs.to_le_bytes());
             out.extend_from_slice(&entry.total_length.to_le_bytes());
@@ -391,7 +448,7 @@ impl Meta {
             out.extend_from_slice(&[entry.origin as u8, 0, 0, 0]);
         }
         for pending in &self.pending {
-            put_run(&mut out, pending.run);
+            put_wide_run(&mut out, pending.run);
             out.extend_from_slice(&pending.xid.to_le_bytes());
         }
         for sealed in &self.sealed {
@@ -440,15 +497,17 @@ impl Meta {
         }
         let mut segments = Vec::with_capacity(segment_count);
         for _ in 0..segment_count {
+            let run = get_wide_run(bytes, at);
+            let tail = at + WIDE_RUN_BYTES + TABLE_BYTES + RUN_BYTES;
             let entry = SegmentEntry {
-                run: get_run(bytes, at),
-                map: get_run(bytes, at + RUN_BYTES),
-                dead: get_run(bytes, at + 2 * RUN_BYTES),
-                dead_stamp: u32_at(bytes, at + 3 * RUN_BYTES),
-                docs: u32_at(bytes, at + 3 * RUN_BYTES + 4),
-                total_length: u64_at(bytes, at + 3 * RUN_BYTES + 8),
-                generation: u32_at(bytes, at + 3 * RUN_BYTES + 16),
-                origin: Origin::decode(bytes[at + 3 * RUN_BYTES + 20])?,
+                run,
+                map: get_table(bytes, at + WIDE_RUN_BYTES, run.blocks),
+                dead: get_run(bytes, at + WIDE_RUN_BYTES + TABLE_BYTES),
+                dead_stamp: u32_at(bytes, tail),
+                docs: u32_at(bytes, tail + 4),
+                total_length: u64_at(bytes, tail + 8),
+                generation: u32_at(bytes, tail + 16),
+                origin: Origin::decode(bytes[tail + 20])?,
             };
             if entry.run.is_empty() || entry.run.blocks == 0 {
                 return Err("invalid Stannum segment entry");
@@ -459,8 +518,8 @@ impl Meta {
         let mut pending = Vec::with_capacity(pending_count);
         for _ in 0..pending_count {
             pending.push(Pending {
-                run: get_run(bytes, at),
-                xid: u32_at(bytes, at + RUN_BYTES),
+                run: get_wide_run(bytes, at),
+                xid: u32_at(bytes, at + WIDE_RUN_BYTES),
             });
             at += PENDING_BYTES;
         }
@@ -600,6 +659,31 @@ mod tests {
         let mut overfull = full.clone();
         overfull.sealed.push(meta.sealed[0]);
         assert!(overfull.encode().is_err());
+    }
+
+    #[test]
+    fn runs_over_4_gib_round_trip() {
+        let mut meta = sample_meta();
+        let big = 17u64 << 30;
+        let blocks = big.div_ceil(CHAIN_CAPACITY as u64) as u32;
+        meta.segments[0].run = Run {
+            first: 2,
+            blocks,
+            bytes: big,
+            last: 9,
+        };
+        meta.segments[0].map.bytes = table_bytes(blocks);
+        meta.pending[0].run.bytes = 2 * big;
+        let bytes = meta.encode().unwrap();
+        assert_eq!(Meta::decode(&bytes).unwrap(), meta);
+        // A page table is four bytes per page of its segment, never stored.
+        let mut table = meta.clone();
+        table.segments[0].map.bytes += 4;
+        assert!(table.encode().is_err());
+        // A dead list keeps a 32-bit length.
+        let mut dead = meta.clone();
+        dead.segments[1].dead.bytes = 1 << 32;
+        assert!(dead.encode().is_err());
     }
 
     #[test]

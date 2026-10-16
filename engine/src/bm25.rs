@@ -414,6 +414,15 @@ impl TermScorer {
         self.best_through(bucket, document_length)
     }
 
+    /// Whether [`Self::bound_through`] is [`Self::score_bucket`] (the
+    /// scorer is proven to rise with the bucket at every length), for a
+    /// caller that bounds many pairs with one scorer and tests it once.
+    #[must_use]
+    #[inline]
+    pub fn rises(&self) -> bool {
+        self.rises
+    }
+
     /// [`Self::bound_through`] of a scorer that may fall as the bucket
     /// rises.
     #[cold]

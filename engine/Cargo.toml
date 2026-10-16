@@ -19,6 +19,10 @@ stats = []
 # The walk's private word kernels, exposed for the bench crate's benchmarks;
 # the extension never enables it.
 kernels = []
+# The window bounds census (`tinshape::census`) for offline measurement:
+# counts nothing unless STANNUM_WIN_CENSUS is set; the extension never
+# enables it.
+census = []
 
 [dependencies]
 boldi-vigna = { path = "../boldi-vigna" }

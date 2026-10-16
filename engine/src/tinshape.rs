@@ -26,6 +26,8 @@ use tinql::runtime::{Query, SpanTermSlot};
 
 use crate::bm25::TermScorer;
 
+#[cfg(feature = "census")]
+pub mod census;
 mod rank;
 
 /// The parts of a segment a query reads, named as TIN's EXPLAIN names its

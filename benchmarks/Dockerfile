@@ -41,50 +41,54 @@ COPY segment segment
 COPY engine engine
 # A workspace member: cargo reads its manifest; nothing here builds it.
 COPY bench bench
-# An x86-64 build for a CPU level (x86-64-v3, x86-64-v4); empty, the baseline
-# PGDG packages target (the kernels pick AVX2 or AVX-512 at runtime either
-# way). Set per target, not as RUSTFLAGS, which would replace
-# .cargo/config.toml's link flags.
-ARG STANNUM_TARGET_CPU=
+# x86-64 builds (script/install-release): `loader`, the default and what
+# ships: the baseline and x86-64-v4 builds and the loader that picks one by
+# CPU at load; x86-64 (or empty), the baseline alone, which PGDG packages
+# target (the kernels pick AVX2 or AVX-512 at runtime either way);
+# x86-64-v3 or x86-64-v4, a build for that CPU level alone. Ignored
+# elsewhere (the label then names the argument, not a build).
+ARG STANNUM_TARGET_CPU=loader
 # Profile-guided optimization (docs/benchmarks.md#profile-guided-builds).
 # Empty: none. 1: use the committed profile for this architecture,
-# benchmarks/pgo/<arch>.profdata, or build without one if there is none;
-# then script/pgo-check reports whether the profile's hot functions still
-# match the code. strict: as 1, but a missing or stale profile fails the
-# build. generate: an instrumented build whose backends write raw profiles
-# under /var/lib/postgresql/pgo-raw (script/pgo-build trains one).
+# benchmarks/pgo/<arch>.profdata (<arch>-v4.profdata for an x86-64-v4 build
+# when there is one), or build without one if there is none; then
+# script/pgo-check reports whether the profile's hot functions still match
+# the code. strict: as 1, but a missing or stale profile fails the build.
+# generate: an instrumented build whose backends write raw profiles under
+# /var/lib/postgresql/pgo-raw (script/pgo-build trains one).
 ARG STANNUM_PGO=
 COPY benchmarks/pgo benchmarks/pgo
-COPY script/pgo-check script/pgo-check
+COPY script/pgo-check script/install-release script/rustc-cpu-level script/
 # Keep optimized code and line tables for the owned perf diagnostics (the
-# line tables also keep the symbols script/pgo-check looks for).
-RUN profile="benchmarks/pgo/$(uname -m).profdata" pgo= \
-    && case "$STANNUM_PGO" in \
-      "") ;; \
-      generate) pgo="-C profile-generate=/var/lib/postgresql/pgo-raw" ;; \
-      1|strict) if [ -s "$profile" ]; then pgo="-C profile-use=/src/$profile"; \
-        elif [ "$STANNUM_PGO" = strict ]; then echo "STANNUM_PGO=strict: no $profile" >&2; exit 2; \
-        else echo "warning: no $profile; building without PGO" >&2; fi ;; \
+# line tables also keep the symbols script/pgo-check looks for). The summary
+# filter may match nothing (one build without a profile: no `== ` or `PGO
+# profile` lines), which the amd64 base's pipefail shell would take as failure.
+RUN case "$STANNUM_PGO" in \
+      ""|1|strict) pgo=$STANNUM_PGO ;; \
+      generate) pgo=generate=/var/lib/postgresql/pgo-raw ;; \
       *) echo "STANNUM_PGO is empty, 1, strict or generate" >&2; exit 2 ;; \
     esac \
-    && { CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="${STANNUM_TARGET_CPU:+-C target-cpu=$STANNUM_TARGET_CPU} $pgo" \
-      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="$pgo" \
-      CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none \
-      cargo pgrx install --package stannum --no-default-features --features pg18 --release > /tmp/build.log 2>&1 \
+    && case "$(uname -m):$STANNUM_TARGET_CPU" in \
+      x86_64:|x86_64:x86-64) levels=x86-64 ;; \
+      x86_64:loader) levels="x86-64 x86-64-v4" ;; \
+      x86_64:*) levels=$STANNUM_TARGET_CPU ;; \
+      *) levels=native ;; \
+    esac \
+    && { CARGO_PROFILE_RELEASE_DEBUG=1 CARGO_PROFILE_RELEASE_STRIP=none \
+      script/install-release --pg-config /usr/lib/postgresql/18/bin/pg_config --features pg18 \
+        --pgo "$pgo" --levels "$levels" > /tmp/build.log 2>&1 \
       || { tail -n 100 /tmp/build.log; exit 1; }; } \
-    && grep -v 'hash mismatch' /tmp/build.log | tail -n 20 \
-    && case "$pgo" in *profile-use*) script/pgo-check "${profile%.profdata}.hot.txt" \
-      /usr/lib/postgresql/18/lib/stannum.so /tmp/build.log "$STANNUM_PGO" ;; esac
+    && { grep -v 'hash mismatch' /tmp/build.log | grep -E '^(== |PGO profile|  changed|  gone|installed|warning)' | tail -n 40 || true; }
 
 FROM runtime
 USER root
 ARG STANNUM_SOURCE_SHA256=unknown
 ARG STANNUM_COMMIT=unknown
 ARG RECIPE_SHA256=unknown
-ARG STANNUM_TARGET_CPU=
+ARG STANNUM_TARGET_CPU=loader
 ARG STANNUM_PGO=
 LABEL benchmark.stannum_source_sha256=${STANNUM_SOURCE_SHA256} benchmark.stannum_commit=${STANNUM_COMMIT} benchmark.recipe_sha256=${RECIPE_SHA256} benchmark.stannum_target_cpu=${STANNUM_TARGET_CPU} benchmark.stannum_pgo=${STANNUM_PGO}
-COPY --from=builder /usr/lib/postgresql/18/lib/stannum.so /usr/lib/postgresql/18/lib/
+COPY --from=builder /usr/lib/postgresql/18/lib/stannum*.so /usr/lib/postgresql/18/lib/
 COPY --from=builder /usr/share/postgresql/18/extension/stannum* /usr/share/postgresql/18/extension/
 COPY --from=builder /usr/lib/postgresql/18/lib/pg_textsearch.so /usr/lib/postgresql/18/lib/
 COPY --from=builder /usr/share/postgresql/18/extension/pg_textsearch* /usr/share/postgresql/18/extension/

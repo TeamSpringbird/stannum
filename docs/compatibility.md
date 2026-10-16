@@ -150,7 +150,6 @@ the last two possible.
   apply the server's settings and the index's options, not an inserting
   session's `SET`s. VACUUM keeps doing its own merges and rewrites. See
   [maintenance workers](architecture/maintenance-workers.md).
-  `initial_segment_count` is accepted and ignored with a warning.
 - **Unbound `==>`.** Where no query is planned around the operator (a
   partial-index predicate, a CHECK constraint, a generated column) or the
   document is not an indexed column, `==>` uses the default tokenizer
@@ -178,10 +177,10 @@ are accepted. Stannum's registration is in
 | `b` | real `0..1`; `0.75` | BM25 length normalization | Same; query-time, no rebuild |
 | `score_stop_words` | comma-separated text; unset | Analyzed terms omitted from default scoring | Same; matching unchanged, full scoring ignores the list; on a stemmed index, written as stems |
 | `stemmer` | `ar`, `da`, `de`, `el`, `en`, `es`, `fi`, `fr`, `hu`, `it`, `nl`, `no`, `pt`, `ro`, `ru`, `sv`, `ta`, `tr`; unset | Snowball stemming of indexed and query terms | Same; persisted at build with the other tokenizer settings |
-| `initial_segment_count` | integer `1..4096` | Build partitions | Accepted and ignored, with a warning |
-| `target_segment_count` | integer `1..4096` | Maintenance target | Soft directory bound in place of `stannum.max_segments` |
+| `initial_segment_count` | integer `1..4096`; available parallelism | Build partitions | Segments a build ends with, in place of `stannum.initial_segment_count` (4); at most 96, and fewer for an index too small to give each 1 GiB |
+| `target_segment_count` | integer `1..4096`; `initial_segment_count` | Maintenance target | Soft directory bound; unset, `initial_segment_count` when the index sets it, else `stannum.max_segments` |
 | `max_mutable_segment_size` | integer `>= 131072` bytes; `4194304` | Write segment size before it is sealed and promoted | The size at which the write buffer is sealed, in place of `stannum.write_buffer_bytes` (also 4 MiB); `stannum.write_buffer_docs` (12,288) still applies |
-| `max_merged_segment_size` | integer `>= 100` MB; `2000` | Merge size ceiling | Most input megabytes one merge takes, within the 3 GiB a run can record |
+| `max_merged_segment_size` | integer `>= 100` MB; `2000` | Merge size ceiling | Most input megabytes one maintenance merge takes (2000 unset); a build's own merges take up to 16 GiB |
 | `dead_percent_threshold` | real `0..1`; `0.5` | Dead fraction that triggers a rewrite | VACUUM rewrites a segment at this dead fraction |
 
 The storage options are reloptions read when maintenance runs, so
