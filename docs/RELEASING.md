@@ -141,8 +141,11 @@ AVX-512), else the baseline's profile; `script/pgo-check` reports the
 coverage of each build. The baseline's `x86_64.profdata` covers 35 of its
 40 hot functions in the v4 build (2026-10-16; the other five are the
 weighing and Elias-Fano kernels, whose control flow `cfg(target_feature)`
-changes), so `--pgo strict` fails on the loader's builds until an
-`x86_64-v4` profile is trained.
+changes), so the v4 build has its own profile, `x86_64-v4.profdata`,
+trained on Sapphire Rapids from a `--target-cpu x86-64-v4` image beside the
+baseline's from a `--target-cpu x86-64` one (2026-10-16, the 150M database
+at page layout 16: both answered the whole trace as the oracle does; 39 of
+their 40 hot functions are named alike).
 
 `postgres/tests/test_loader.py` checks the choice on hand-built CPUs (each
 feature missing in turn, XCR0 without the AVX-512 state, short CPUID
