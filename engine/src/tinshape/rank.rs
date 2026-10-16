@@ -1496,6 +1496,10 @@ struct Walk<'s, 'a, T: Touch> {
     /// already ([`Walk::sieve_words`]): its pass over a chunk then keeps
     /// nearly all, which says nothing of what it drops.
     sieve_pre: bool,
+    /// Whether the group's sieve reads every term before judging a chunk
+    /// by what it dropped ([`Walk::ready_sieve`]): its first term alone
+    /// drops few.
+    sieve_joint: bool,
     sieve_prefix: Vec<u32>,
     /// [`Walk::sieve_words`]' scratch: the first term's buckets gathered
     /// from the TF tail, and their pass bits.
@@ -2039,7 +2043,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 });
             }
         }
-        Ok(self.ready_sieve())
+        Ok(self.ready_sieve(true))
     }
 
     /// Orders the sieve's terms by their bounds over the group, highest
@@ -2051,13 +2055,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// dense ones, it does not, and a candidate's own check, which reads its
     /// terms' buckets best first and bounds them at one length, is left to
     /// bound it.
-    fn ready_sieve(&mut self) -> bool {
+    ///
+    /// Else, for a led walk (`joint`), whether every sieve term's bucket 0
+    /// together does (two dense words of a phrase: either's bound over the
+    /// group reaches the bar alone, both their common counts fall short).
+    /// Then the sieve reads every term's buckets before it judges a chunk
+    /// by what it dropped ([`Walk::sieve_joint`]).
+    fn ready_sieve(&mut self, joint: bool) -> bool {
         let ub = &self.sieve_ub;
         self.sieve_terms
             .sort_by(|a, b| ub[b.i].total_cmp(&ub[a.i]).then(a.i.cmp(&b.i)));
         self.sieve_prefix.clear();
         self.sieve_depth = self.sieve_terms.len();
         self.sieve_pre = false;
+        self.sieve_joint = false;
         let Some(first) = self.sieve_terms.first_mut() else {
             return false;
         };
@@ -2069,16 +2080,36 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .enumerate()
             .map(|(i, u)| if i == first.i { 0.0 } else { *u })
             .sum();
-        if rest >= score {
+        if rest < score {
+            // Most postings count one (bucket 0): unless those can drop, few
+            // can. An estimate (summed in another order); the sieve sums
+            // exactly.
+            let (floor, v) = self.sc[first.i].floor_kept(first.entry, 0);
+            first.table[0] = v;
+            first.floors[0] = floor;
+            if rest + v < score {
+                return true;
+            }
+        }
+        if !joint {
             return false;
         }
-        // Most postings count one (bucket 0): unless those can drop, few
-        // can. An estimate (summed in another order); the sieve sums
-        // exactly.
-        let (floor, v) = self.sc[first.i].floor_kept(first.entry, 0);
-        first.table[0] = v;
-        first.floors[0] = floor;
-        rest + v < score
+        // A candidate at bucket 0 of every sieve term it must hold, any
+        // other term at its bound over the group (an estimate, as above).
+        let mut low: f32 = (0..ub.len())
+            .filter(|i| !self.sieve_terms.iter().any(|st| st.i == *i))
+            .map(|i| ub[i])
+            .sum();
+        for st in &mut self.sieve_terms {
+            let (floor, v) = self.sc[st.i].floor_kept(st.entry, 0);
+            st.table[0] = v;
+            st.floors[0] = floor;
+            if self.sc_required[st.i] {
+                low += v;
+            }
+        }
+        self.sieve_joint = low < score;
+        self.sieve_joint
     }
 
     /// Counts the members per word of sieve term `k`'s bitmap, once per
@@ -2404,7 +2435,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
                 // A term that drops too few is not worth its reads: the
                 // group's later chunks stop before it.
-                if kept * 8 > left.len() * 7 && !self.sieve_pre {
+                if kept * 8 > left.len() * 7 && !self.sieve_pre && !self.sieve_joint {
                     self.sieve_depth = k;
                 }
                 left.truncate(kept);
@@ -2434,7 +2465,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 locals[kept] = local;
                 kept += usize::from(!cut_by(bar, bound, || geometry.tid_in(g as usize, local)));
             }
-            if kept * 8 > left.len() * 7 {
+            if kept * 8 > left.len() * 7 && !self.sieve_joint {
                 self.sieve_depth = k;
             }
             left.truncate(kept);
@@ -2450,6 +2481,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let kept = self.sieve_shared(g, m, &held, &mut left, &mut locals);
             left.truncate(kept);
             locals.truncate(kept);
+        }
+        // Every term read, a chunk it left nearly whole: the group's later
+        // chunks are bounded alone.
+        if self.sieve_joint && locals.len() * 8 > m * 7 {
+            self.sieve_depth = 0;
         }
         // Those dropped were examined (bounded) as those left will be.
         self.answer.candidates += (m - locals.len()) as u64;
@@ -2558,7 +2594,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // A group the sieve takes is sieved by its first term's buckets
         // before its candidates are listed.
         let sieved = kernels::popcount(&self.words) >= SIEVE_MIN as u64 && self.sieve_led(g)?;
-        if sieved {
+        if sieved && !self.sieve_joint {
             let mut words = std::mem::take(&mut self.words);
             let done = self.sieve_words(&mut words);
             self.words = words;
@@ -3401,6 +3437,7 @@ pub(super) fn walk_into<'s, 'a>(
         sieve_cands: Vec::new(),
         sieve_depth: 0,
         sieve_pre: false,
+        sieve_joint: false,
         sieve_prefix: Vec::new(),
         sieve_fields: Vec::new(),
         sieve_pass: Vec::new(),
@@ -4322,7 +4359,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 });
             }
         }
-        self.ready_sieve()
+        self.ready_sieve(false)
     }
 
     /// Keeps the members of `word`, word `w` of group `g` (first slot
