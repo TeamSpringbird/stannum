@@ -12,7 +12,7 @@
 //!     [--expect pg.tsv] [--style S] [--k 10] [--repeat 3] [--limit N] \
 //!     [--keep] [--threads N] [--seconds S] [--per-query FILE] [--out FILE] \
 //!     [--per-segment FILE] [--order O] [--seed] [--warm FILE] [--timed-walk] \
-//!     [--plan STYLE:MODE:N,...] [--perf-ctl CTL,ACK]
+//!     [--plan STYLE:MODE:N,...] [--perf-ctl CTL,ACK] [--cpus SETS]
 //! ```
 //!
 //! Each segment is read from memory and kept across queries with its
@@ -46,6 +46,24 @@
 //! only; macOS: `proc_pid_rusage`, no branch misses); `--perf-ctl CTL,ACK`
 //! turns an outside `perf stat` or `perf record` (`-D -1 --control
 //! fifo:CTL,ACK`) on around each timed pass only.
+//!
+//! `--cpus 2/2,10` measures what busy hyperthreads cost (a server's
+//! backends share each core with another): for each set of CPUs (sets
+//! split by `/`), one thread per CPU, pinned to it, each with its own
+//! segments' readers over the one load, replays every slice of the trace
+//! (or of `--plan`) at once, slice by slice: each thread the whole slice
+//! from its own offset (thread `t` of `T` at query `t·n/T`), each query
+//! an untimed pass, then `--repeat` timed ones (`--forget` before each).
+//! A thread done with its slice keeps replaying it, uncounted, until every
+//! thread is done, so every counted query ran beside busy siblings. Per
+//! slice and set it reports the instructions, cycles and branch misses per
+//! query (counted per thread), each thread's cycles per query, the core's
+//! IPC (the threads' instructions over a thread's cycles), the set's
+//! queries per gigacycle (each thread's queries over its own cycles,
+//! summed: a core's throughput at a fixed clock) and the answers' digest
+//! (the same for every set and build of a correct walk). Sibling CPUs
+//! are in `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`;
+//! pinning and per-thread counts are Linux only (macOS counts the process).
 //!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
@@ -116,6 +134,8 @@ struct Args {
     /// enabled around each timed pass only (not the load, the answer's
     /// pass or the instrumented one).
     perf_ctl: Option<(PathBuf, PathBuf)>,
+    /// `--cpus`: sets of CPUs, each measured with one pinned thread per CPU.
+    cpus: Vec<Vec<usize>>,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -140,7 +160,7 @@ fn usage() -> ! {
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
          [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
-         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK]"
+         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,...]"
     );
     std::process::exit(2)
 }
@@ -173,6 +193,7 @@ fn args() -> Args {
         out: None,
         plan: Vec::new(),
         perf_ctl: None,
+        cpus: Vec::new(),
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -224,6 +245,15 @@ fn args() -> Args {
                     };
                     let n = n.parse().unwrap_or_else(|_| usage());
                     a.plan.push((style.to_owned(), full, n));
+                }
+            }
+            "--cpus" => {
+                for set in value(&mut it).split('/') {
+                    let cpus: Vec<usize> = set
+                        .split(',')
+                        .map(|c| c.parse().unwrap_or_else(|_| usage()))
+                        .collect();
+                    a.cpus.push(cpus);
                 }
             }
             "--perf-ctl" => {
@@ -1207,6 +1237,206 @@ fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Resu
     Ok(())
 }
 
+/// What one thread of a `--cpus` set counted over one slice.
+#[derive(Clone, Copy, Default)]
+struct PinnedSlice {
+    queries: u64,
+    unsupported: u64,
+    /// Instructions, cycles and branch misses of the timed passes.
+    counts: [u64; 3],
+    /// From the slice's start to this thread's last counted query.
+    wall_ns: u64,
+    /// The answers: each query's rows hashed, the hashes summed.
+    digest: u64,
+}
+
+/// Pins this thread to `cpu` (Linux: `sched_setaffinity`); false where it
+/// cannot.
+fn pin_to(cpu: usize) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        unsafe extern "C" {
+            fn sched_setaffinity(pid: i32, size: usize, mask: *const u64) -> i32;
+        }
+        let mut mask = [0u64; 16];
+        if cpu >= 64 * mask.len() {
+            return false;
+        }
+        mask[cpu / 64] |= 1 << (cpu % 64);
+        // SAFETY: this thread (0), a mask of the size given.
+        unsafe { sched_setaffinity(0, std::mem::size_of_val(&mask), mask.as_ptr()) == 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = cpu;
+        false
+    }
+}
+
+/// One thread of a `--cpus` set: every slice, each started with the set's
+/// other threads (see the module's documentation).
+fn pinned_thread(
+    args: &Args,
+    reader: &Reader,
+    trace: &[bench::TraceQuery],
+    fulls: &[bool],
+    slices: &[(String, std::ops::Range<usize>)],
+    (t, threads): (usize, usize),
+    (start, done): (&std::sync::Barrier, &[std::sync::atomic::AtomicUsize]),
+) -> Result<Vec<PinnedSlice>, String> {
+    use std::sync::atomic::Ordering;
+    let mut out = Vec::with_capacity(slices.len());
+    for (n, (_, range)) in slices.iter().enumerate() {
+        let len = range.len();
+        let offset = t * len / threads;
+        let mut slice = PinnedSlice::default();
+        start.wait();
+        let began = Instant::now();
+        let mut i = 0usize;
+        loop {
+            if i == len {
+                slice.wall_ns = began.elapsed().as_nanos() as u64;
+                done[n].fetch_add(1, Ordering::AcqRel);
+            }
+            let counted = i < len;
+            if !counted && done[n].load(Ordering::Acquire) >= threads {
+                break;
+            }
+            let at = range.start + (offset + i) % len;
+            i += 1;
+            reader.full.set(fulls[at]);
+            let text = &trace[at].text;
+            let Ok(scorer) = reader.scorer(text) else {
+                slice.unsupported += counted as u64;
+                continue;
+            };
+            if args.forget {
+                reader.forget();
+            }
+            let Some(answer) = reader.ranked(&scorer, args.k) else {
+                slice.unsupported += counted as u64;
+                continue;
+            };
+            let c0 = process_counters();
+            for _ in 0..args.repeat {
+                if args.forget {
+                    reader.forget();
+                }
+                let scorer = reader.scorer(text)?;
+                std::hint::black_box(reader.ranked(&scorer, args.k));
+            }
+            let c1 = process_counters();
+            if counted {
+                slice.queries += 1;
+                for (k, count) in slice.counts.iter_mut().enumerate() {
+                    *count += c1[k] - c0[k];
+                }
+                let mut h = rustc_hash::FxHasher::default();
+                for (score, tid) in &answer {
+                    std::hash::Hash::hash(&(score.to_bits(), tid.block, tid.offset), &mut h);
+                }
+                slice.digest = slice.digest.wrapping_add(std::hash::Hasher::finish(&h));
+            }
+        }
+        out.push(slice);
+    }
+    Ok(out)
+}
+
+/// `--cpus`: each set's pinned threads replay each slice at once (see the
+/// module's documentation).
+fn pinned(
+    args: &Args,
+    loaded: &Loaded,
+    trace: &[bench::TraceQuery],
+    fulls: &[bool],
+) -> Result<(), String> {
+    // Slices: runs of one style label, in the plan's order.
+    let mut slices: Vec<(String, std::ops::Range<usize>)> = Vec::new();
+    for (i, q) in trace.iter().enumerate() {
+        match slices.last_mut() {
+            Some((style, range)) if *style == q.style => range.end = i + 1,
+            _ => slices.push((q.style.clone(), i..i + 1)),
+        }
+    }
+    for set in &args.cpus {
+        let threads = set.len();
+        let start = std::sync::Barrier::new(threads);
+        let done: Vec<std::sync::atomic::AtomicUsize> =
+            slices.iter().map(|_| Default::default()).collect();
+        let (slices, start, done) = (&slices, &start, &done);
+        let per_thread = std::thread::scope(|s| {
+            let handles: Vec<_> = set
+                .iter()
+                .enumerate()
+                .map(|(t, &cpu)| {
+                    s.spawn(move || {
+                        if !pin_to(cpu) {
+                            eprintln!("warning: thread {t} not pinned to CPU {cpu}");
+                        }
+                        let reader = Reader::open(loaded, args)?;
+                        pinned_thread(
+                            args,
+                            &reader,
+                            trace,
+                            fulls,
+                            slices,
+                            (t, threads),
+                            (start, done),
+                        )
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("a pinned thread panicked"))
+                .collect::<Result<Vec<_>, String>>()
+        })?;
+        let label = set
+            .iter()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        for (n, (style, _)) in slices.iter().enumerate() {
+            let all: Vec<PinnedSlice> = per_thread.iter().map(|t| t[n]).collect();
+            let queries = all.iter().map(|s| s.queries).sum::<u64>().max(1) as f64;
+            let sum = |k: usize| all.iter().map(|s| s.counts[k]).sum::<u64>() as f64;
+            let (ins, cyc, miss) = (sum(0), sum(1).max(1.0), sum(2));
+            // Each thread's queries over its own cycles, summed: what the
+            // core finishes per gigacycle of its clock.
+            let rate: f64 = all
+                .iter()
+                .map(|s| s.queries as f64 * 1e9 / s.counts[1].max(1) as f64)
+                .sum();
+            let wall = all.iter().map(|s| s.wall_ns).max().unwrap_or(0).max(1) as f64 / 1e9;
+            // Every thread answers every query of the slice once, counted.
+            let digest = match all.iter().all(|s| s.digest == all[0].digest) {
+                true => format!("{:016x}", all[0].digest),
+                false => "threads-differ".to_owned(),
+            };
+            let per: Vec<String> = all
+                .iter()
+                .map(|s| format!("{:.3}", s.counts[1] as f64 / s.queries.max(1) as f64 / 1e6))
+                .collect();
+            println!(
+                "pinned {label:<8} {style:<18} threads {} queries {queries} unsupported {} \
+                 ins/q {:.3}M cyc/q {:.3}M bmiss/q {:.2}K ipc {:.3} core-ipc {:.3} q/Gcyc {rate:.3} \
+                 qps {:.2} digest {digest} thread-cyc/q {}",
+                all.len(),
+                all.iter().map(|s| s.unsupported).sum::<u64>(),
+                ins / queries / 1e6,
+                cyc / queries / 1e6,
+                miss / queries / 1e3,
+                ins / cyc,
+                ins / (cyc / all.len() as f64),
+                queries / wall,
+                per.join(","),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<bool, String> {
     let args = args();
     let mut trace = bench::read_trace(&args.trace)?;
@@ -1236,6 +1466,9 @@ fn run() -> Result<bool, String> {
     if args.threads > 0 {
         throughput(&args, &loaded, &trace)?;
         return Ok(true);
+    }
+    if !args.cpus.is_empty() {
+        return pinned(&args, &loaded, &trace, &fulls).map(|()| true);
     }
     let start = Instant::now();
     let reader = Reader::open(&loaded, &args)?;
@@ -1759,7 +1992,8 @@ fn main() {
 }
 
 /// Instructions, cycles and branch misses this thread ran so far in user
-/// space (Linux: a `perf_event_open` group opened on first use; macOS:
+/// space (Linux: a `perf_event_open` group per thread, opened on its
+/// first use; macOS:
 /// `proc_pid_rusage`'s instructions and cycles, as `time -l` reports them,
 /// no branch misses); zero where neither counts them. Taken around the
 /// timed passes only, they leave out loading the dump and the
@@ -1791,7 +2025,7 @@ fn process_counters() -> [u64; 3] {
 /// space, read together.
 #[cfg(target_os = "linux")]
 mod linux_counters {
-    use std::sync::OnceLock;
+    use std::cell::OnceCell;
 
     /// `struct perf_event_attr` up to `PERF_ATTR_SIZE_VER0` (64 bytes).
     #[repr(C)]
@@ -1839,15 +2073,21 @@ mod linux_counters {
         (fd >= 0).then_some(fd as i32)
     }
 
+    thread_local! {
+        /// This thread's group leader, opened on its first count.
+        static LEADER: OnceCell<Option<i32>> = const { OnceCell::new() };
+    }
+
     pub(super) fn counts() -> Option<[u64; 3]> {
-        static LEADER: OnceLock<Option<i32>> = OnceLock::new();
-        let leader = (*LEADER.get_or_init(|| {
-            let leader = open(EVENTS[0], -1)?;
-            for config in &EVENTS[1..] {
-                open(*config, leader)?;
-            }
-            Some(leader)
-        }))?;
+        let leader = LEADER.with(|cell| {
+            *cell.get_or_init(|| {
+                let leader = open(EVENTS[0], -1)?;
+                for config in &EVENTS[1..] {
+                    open(*config, leader)?;
+                }
+                Some(leader)
+            })
+        })?;
         // `{ nr, values[nr] }`, in the order the events were opened.
         let mut group = [0u64; 4];
         // SAFETY: at most the buffer's 32 bytes.
