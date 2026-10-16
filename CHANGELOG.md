@@ -13,6 +13,17 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Added
 
+- x86-64 Linux packages ship two builds, the baseline and one compiled for
+  x86-64-v4, and a small loader installed as `stannum.so` that loads the v4
+  build on CPUs with all of x86-64-v4 (and an OS that saves the AVX-512
+  registers) and the baseline elsewhere: 1.7% more queries per core on
+  Sapphire Rapids (4.7% for `full_score` disjunctions), and the same
+  answers.
+  `script/install-release` builds and installs the three files (what
+  `script/test-all install` and the benchmark image's
+  `STANNUM_TARGET_CPU=loader` run); `STANNUM_LOADER_LEVEL` forces a build
+  and `SHOW stannum.cpu_level` reports the running one. aarch64 is
+  unchanged.
 - On x86-64, the word kernels of segments in TIN's shape (grid AND, OR and
   AND NOT, popcount, AND-popcount, masked counts) run AVX-512 or AVX2 bodies
   chosen once at runtime, as PostgreSQL's `pg_popcount` does, so baseline

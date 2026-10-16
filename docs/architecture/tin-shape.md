@@ -518,12 +518,20 @@ scattered `count_ones` and `trailing_zeros` become POPCNT and TZCNT only
 in an `x86-64-v3` or `-v4` build (a baseline build runs bit tricks); that
 difference, not the kernels, is what those builds measure.
 
-x86-64 builds (set the per-target variable, not `RUSTFLAGS`, which would
-replace `.cargo/config.toml`'s link flags; `x86-64-v4` lacks VPOPCNTDQ, so
-its AVX-512 kernels are still chosen at runtime):
+x86-64 Linux packages ship the baseline and an `x86-64-v4` build, and a
+loader that picks one by CPU at load
+([releasing](../RELEASING.md#x86-64-builds-and-the-loader)); the kernels
+choose their level at runtime in both. Single builds for one level
+(`install-release` sets the level for the workspace's crates through
+`script/rustc-cpu-level`; by hand, set the per-target variable, not
+`RUSTFLAGS`, which would replace `.cargo/config.toml`'s link flags, and only
+on a host of that level, as it reaches build scripts too; `x86-64-v4` lacks
+VPOPCNTDQ, so its AVX-512 kernels are still chosen at runtime):
 
 ```sh
-cargo pgrx install --package stannum --release ...           # runtime choice
+script/install-release                                      # the loader and both builds
+STANNUM_LEVELS=x86-64 script/install-release                # the baseline alone
+STANNUM_LEVELS=x86-64-v4 script/install-release             # one level alone
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS='-C target-cpu=x86-64-v3' \
   cargo pgrx install --package stannum --release ...           # or x86-64-v4
 docker build --build-arg STANNUM_TARGET_CPU=x86-64-v4 -f benchmarks/Dockerfile .
