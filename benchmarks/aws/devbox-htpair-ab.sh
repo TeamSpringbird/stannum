@@ -58,8 +58,10 @@ for spec in "${arms[@]}"; do
   IFS=: read -r name n dump level <<< "$spec"
   src=$(eval echo \$SRC$n)
   [ -d "$DATA/$dump" ] || { step "arm $name: no dump $DATA/$dump"; exit 1; }
+  # LEVEL "v4all": the whole build, dependencies too, through the per-target flags.
+  all=; case "${level:-}" in *all) level=${level%all}; all=1 ;; esac
   flags=$LINK; [ -n "${level:-}" ] && flags="-C target-cpu=x86-64-$level $LINK"
-  if [ -n "${level:-}" ] && [ -x $src/script/rustc-cpu-level ]; then
+  if [ -n "${level:-}" ] && [ -z "$all" ] && [ -x $src/script/rustc-cpu-level ]; then
     # As script/install-release builds a level: the workspace's crates only.
     (cd $src && RUSTC_WORKSPACE_WRAPPER=$src/script/rustc-cpu-level STANNUM_RUSTC_TARGET_CPU=x86-64-$level \
       cargo build --release -p bench --bin tnsreplay --target-dir /work/t-$name) > $OUT/build-$name.log 2>&1
@@ -70,7 +72,7 @@ for spec in "${arms[@]}"; do
   fi || { step "build $name failed: $(grep -m1 -E '^error' $OUT/build-$name.log)"; save; continue; }
   cp /work/t-$name/release/tnsreplay /work/tnsreplay-$name
   (cd /work && sha256sum tnsreplay-$name) >> $OUT/shasums.txt
-  echo "$name $dump $(cat $src/.devbox-commit) ${level:-base}" >> $OUT/arms.txt
+  echo "$name $dump $(cat $src/.devbox-commit) ${level:-base}${all:+-all}" >> $OUT/arms.txt
   names+=("$name")
   step "built $name $(cat $src/.devbox-commit) ${level:-} -> $dump"
 done
