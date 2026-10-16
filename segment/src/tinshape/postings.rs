@@ -749,6 +749,15 @@ pub fn encode_reusing<'r>(
     stats
 }
 
+/// Bytes [`KIND_PAGED`] would take for one group's members, `locals` its
+/// slots within the group and `starts` its page starts (for censuses that
+/// weigh other container choices).
+pub fn paged_len(locals: &[u32], starts: &[u32]) -> usize {
+    let mut out = Vec::new();
+    encode_paged(locals, starts, &mut out);
+    out.len()
+}
+
 /// Encodes one group's members, `locals` its slots within the group and
 /// `starts` its page starts; each page's offsets are packed at the bits its
 /// own width needs.

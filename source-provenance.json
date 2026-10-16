@@ -64,6 +64,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: a census of a dumped TNS1 segment's records by form and df band (footer, directory, container, TF and inline-length bytes)."
     },
+    "bench/src/bin/tnsmidcensus.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a census of a dump's grouped containers by kind and density band, with what each grid would take as a list or paged container, weighed by a trace's terms."
+    },
     "bench/src/bin/tnsmerge.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: merges a dump's TNS1 segments into fewer with the segment crate's merge, in memory or streamed as the extension merges, to weigh what the segment count costs a query."
