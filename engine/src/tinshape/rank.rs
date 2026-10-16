@@ -809,7 +809,16 @@ impl Mem<'_> {
                 }
                 let w = local as usize / 64;
                 if w > self.w {
-                    self.run += kernels::popcount_bytes(&bytes[self.w * 8..w * 8]);
+                    // A candidate a few words on (most of a dense group's)
+                    // counts them inline, a far one by the kernel.
+                    self.run += if w - self.w <= 4 {
+                        bytes[self.w * 8..w * 8]
+                            .chunks_exact(8)
+                            .map(|c| u64::from_le_bytes(c.try_into().expect("a word")).count_ones())
+                            .sum::<u32>()
+                    } else {
+                        kernels::popcount_bytes(&bytes[self.w * 8..w * 8])
+                    };
                     self.w = w;
                 }
                 let word = bits::word(bytes, w);
