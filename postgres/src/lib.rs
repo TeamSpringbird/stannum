@@ -8791,6 +8791,47 @@ mod tests {
     }
 
     #[pg_test]
+    fn a_page_is_pinned_through_the_buffer_its_page_table_entry_remembers() {
+        // Beside each run page's block the backend's page table keeps the
+        // buffer it last pinned the page in: the pin finds it on the line
+        // it reads the block from, before the shared table's bucket (a
+        // cache miss of its own per pin, pinpath). With both hint tables
+        // out of play, the page table alone pins nearly every page.
+        use crate::storage::testing::{forget_recent_buffers, skew_page_hints};
+        let ranked = buffer_hint_fixture();
+        let first = ranked();
+        forget_recent_buffers();
+        Spi::run("SET LOCAL stannum.share_buffer_hints = off").unwrap();
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(pins > 0, "the last query pinned no page");
+        assert!(
+            recent * 10 >= pins * 9,
+            "{recent} of {pins} pages pinned through their page table's buffer"
+        );
+        // A remembered buffer since given to another page is refused (its
+        // tag is checked) and the page found as if never pinned.
+        assert!(skew_page_hints() > 0, "no page table remembered a buffer");
+        forget_recent_buffers();
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(pins > 0, "the last query pinned no page");
+        assert!(
+            recent * 4 < pins,
+            "{recent} of {pins} pages pinned through wrong buffers"
+        );
+        // Through the shared table, which the wrong hints don't touch.
+        assert!(skew_page_hints() > 0, "no page table remembered a buffer");
+        Spi::run("SET LOCAL stannum.share_buffer_hints = on").unwrap();
+        assert_eq!(ranked(), first);
+        let (pins, recent) = crate::storage::scan_pins();
+        assert!(
+            recent * 10 >= pins * 9,
+            "{recent} of {pins} pinned through hints"
+        );
+    }
+
+    #[pg_test]
     fn a_buffer_hint_left_by_a_rebuilt_index_pins_nothing_of_it() {
         // A hint names a buffer, not a page: once the index is rebuilt in a
         // new file its blocks are new pages, and a hint left by the old

@@ -836,8 +836,27 @@ fn decode_page_table(bytes: &[u8]) -> Vec<u32> {
         .collect()
 }
 
+/// A run page's block, and what this backend learned pinning it: the
+/// shared buffer it was last pinned in (`RUN_PAGE_BUFFER`, 0 for none) and
+/// whether its header and special area were checked (`RUN_PAGE_CHECKED`,
+/// see [`RunSource::pin_page`]). Beside the block number the walk reads
+/// anyway, the buffer is a hint the pin finds on the line it already has:
+/// the shared table's bucket is a cache miss of its own per pin (pinpath).
+struct RunPage {
+    block: u32,
+    known: Cell<u32>,
+}
+
+/// [`RunPage::known`]'s buffer bits; shared buffers number below 2^30.
+const RUN_PAGE_BUFFER: u32 = (1 << 31) - 1;
+/// [`RunPage::known`]'s bit for a page checked by this backend.
+const RUN_PAGE_CHECKED: u32 = 1 << 31;
+
+/// A segment run's page table: its pages' blocks in run order.
+type RunPages = Rc<[RunPage]>;
+
 /// Page tables by (index identity, segment generation).
-type PageTables = HashMap<(u64, u32), Rc<Vec<u32>>>;
+type PageTables = HashMap<(u64, u32), RunPages>;
 
 thread_local! {
     static PAGE_TABLES: RefCell<PageTables> = RefCell::new(HashMap::new());
@@ -845,15 +864,20 @@ thread_local! {
 
 /// A segment run's page table, cached per backend by index identity and
 /// generation. Generations never repeat within an identity.
-unsafe fn page_table(index: pg_sys::Relation, identity: u64, entry: &SegmentEntry) -> Rc<Vec<u32>> {
+unsafe fn page_table(index: pg_sys::Relation, identity: u64, entry: &SegmentEntry) -> RunPages {
     let key = (identity, entry.generation);
     if let Some(table) = PAGE_TABLES.with_borrow(|tables| tables.get(&key).cloned()) {
         return table;
     }
     let label = generation_label(entry.generation);
-    let table = Rc::new(decode_page_table(&unsafe {
-        read_run(index, entry.map, &format!("{label} page table"))
-    }));
+    let table: RunPages =
+        decode_page_table(&unsafe { read_run(index, entry.map, &format!("{label} page table")) })
+            .into_iter()
+            .map(|block| RunPage {
+                block,
+                known: Cell::new(0),
+            })
+            .collect();
     if table.len() != entry.run.blocks as usize {
         corrupt(format!(
             "Stannum {label}: page table lists {} pages for a run of {}",
@@ -880,7 +904,7 @@ unsafe fn page_table(index: pg_sys::Relation, identity: u64, entry: &SegmentEntr
 pub struct RunSource {
     index_oid: pg_sys::Oid,
     run: Run,
-    table: Rc<Vec<u32>>,
+    table: RunPages,
     /// The run's name in error messages.
     label: String,
     /// Open [`Source::hold`](segment::source::Source::hold) spans; pages
@@ -910,10 +934,6 @@ pub struct RunSource {
     /// span.
     ledger: Cell<*mut SpanLedger>,
     owner: Cell<pg_sys::ResourceOwner>,
-    /// A bit per page of the run: set once this backend has checked the
-    /// page's header and special area (see [`Self::pin_page`]). Kept with
-    /// the cached reader, across queries.
-    checked: RefCell<Vec<u64>>,
 }
 
 /// The buffers a span holds pinned by [`own_pin`], outside PostgreSQL's
@@ -967,7 +987,7 @@ struct HeldPage {
 }
 
 impl RunSource {
-    fn new(index_oid: pg_sys::Oid, run: Run, table: Rc<Vec<u32>>, label: String) -> Self {
+    fn new(index_oid: pg_sys::Oid, run: Run, table: RunPages, label: String) -> Self {
         Self {
             index_oid,
             run,
@@ -980,26 +1000,6 @@ impl RunSource {
             relation: Cell::new(std::ptr::null_mut()),
             ledger: Cell::new(std::ptr::null_mut()),
             owner: Cell::new(std::ptr::null_mut()),
-            checked: RefCell::default(),
-        }
-    }
-
-    /// Whether this backend has checked page `page`'s header and special
-    /// area (see [`Self::pin_page`]).
-    fn is_checked(&self, page: usize) -> bool {
-        self.checked
-            .borrow()
-            .get(page / 64)
-            .is_some_and(|word| word & (1 << (page % 64)) != 0)
-    }
-
-    fn set_checked(&self, page: usize) {
-        let mut checked = self.checked.borrow_mut();
-        if checked.is_empty() {
-            checked.resize(self.table.len().div_ceil(64), 0);
-        }
-        if let Some(word) = checked.get_mut(page / 64) {
-            *word |= 1 << (page % 64);
         }
     }
 
@@ -1102,7 +1102,8 @@ impl RunSource {
     /// when `charge`: a read in place pins a page per page it touches, and
     /// its caller charges the read as a whole ([`with_native`]).
     fn pin_page(&self, page: usize, charge: bool) -> segment::Result<HeldPage> {
-        let block = *self.table.get(page).ok_or(segment::Error::Truncated)?;
+        let entry = self.table.get(page).ok_or(segment::Error::Truncated)?;
+        let (block, known) = (entry.block, entry.known.get());
         {
             // SAFETY: as in `read_into`; the relcache reference is held
             // until the span ends, within the statement, and the pin is
@@ -1123,10 +1124,11 @@ impl RunSource {
                 // outside a span the page is pinned PostgreSQL's way.
                 let ledger = self.ledger.get();
                 let own = OWN_PINS.get() && !ledger.is_null();
+                let hint = (known & RUN_PAGE_BUFFER) as pg_sys::Buffer;
                 let (buffer, owned) = if charge {
-                    crate::score::charging("buffer read", || pin_block(index, block, own))
+                    crate::score::charging("buffer read", || pin_block(index, block, own, hint))
                 } else {
-                    pin_block(index, block, own)
+                    pin_block(index, block, own, hint)
                 };
                 // A run page's data follows its header and `next` link and
                 // fills it but on the run's last page, so where it lies needs
@@ -1141,9 +1143,10 @@ impl RunSource {
                 let base = page_of(buffer);
                 let data = base.add(layout::PAGE_HEADER + 4);
                 let len = self.page_bytes(page);
-                if !owned || !self.is_checked(page) || cfg!(debug_assertions) {
+                let mut checked = known & RUN_PAGE_CHECKED;
+                if !owned || checked == 0 || cfg!(debug_assertions) {
                     let contents = std::slice::from_raw_parts(base, PAGE_SIZE);
-                    let checked = match layout::kind(contents) {
+                    let verdict = match layout::kind(contents) {
                         Ok(KIND_RUN) => layout::chain(contents)
                             .map(|(_, data)| data)
                             .map_err(str::to_string),
@@ -1161,11 +1164,18 @@ impl RunSource {
                             Ok(())
                         }
                     });
-                    if let Err(message) = checked {
+                    if let Err(message) = verdict {
                         release_pin(buffer, owned);
                         corrupt(format!("Stannum {}: page {block}: {message}", self.label))
                     }
-                    self.set_checked(page);
+                    checked = RUN_PAGE_CHECKED;
+                }
+                // Local buffers (a temporary index) are not hinted.
+                if buffer > 0 {
+                    let now = buffer as u32 | checked;
+                    if now != known {
+                        entry.known.set(now);
+                    }
                 }
                 let held = HeldPage {
                     page,
@@ -1403,7 +1413,10 @@ unsafe fn count_use(buffer: pg_sys::Buffer) {
 /// in (by any backend, see [`shared_hints`]) while that buffer still holds
 /// it, which skips the buffer mapping table's partition lock and hash
 /// lookup, else through `ReadBuffer`. A walk pins a page per chunk it
-/// loads, most of them pinned by an earlier query.
+/// loads, most of them pinned by an earlier query. `known`, when not 0,
+/// is the buffer this backend last pinned the block in (see [`RunPage`]),
+/// tried before the shared table: the table's bucket is a line away from
+/// anything the walk has touched, `known` lies beside the block number.
 ///
 /// # Safety
 ///
@@ -1412,6 +1425,7 @@ unsafe fn pin_block(
     index: pg_sys::Relation,
     block: pg_sys::BlockNumber,
     own: bool,
+    known: pg_sys::Buffer,
 ) -> (pg_sys::Buffer, bool) {
     use std::sync::atomic::Ordering;
     // SAFETY: per the contract. `ReadRecentBuffer` checks the buffer's tag
@@ -1438,6 +1452,10 @@ unsafe fn pin_block(
             }
             false
         };
+        if known != 0 && recent(known) {
+            SCAN_RECENT.set(SCAN_RECENT.get() + 1);
+            return (known, own);
+        }
         if SHARE_BUFFER_HINTS.get()
             && let Some(table) = shared_hints()
         {
@@ -1447,7 +1465,8 @@ unsafe fn pin_block(
             for entry in [first, second] {
                 if (entry >> 32) as u32 == block {
                     let buffer = entry as u32 as pg_sys::Buffer;
-                    if recent(buffer) {
+                    // The same buffer as `known` was refused just now.
+                    if buffer != known && recent(buffer) {
                         SCAN_RECENT.set(SCAN_RECENT.get() + 1);
                         return (buffer, own);
                     }
@@ -1471,7 +1490,7 @@ unsafe fn pin_block(
         }
         let at = slot & (RECENT_BUFFERS_LEN - 1);
         let hint = RECENT_BUFFERS.with_borrow(|recent| recent[at]);
-        if hint.block == block && recent(hint.buffer) {
+        if hint.block == block && hint.buffer != known && recent(hint.buffer) {
             SCAN_RECENT.set(SCAN_RECENT.get() + 1);
             return (hint.buffer, own);
         }
@@ -2136,7 +2155,7 @@ impl RunSource {
                 let page = (at / CHAIN_CAPACITY as u64) as usize;
                 let within = (at % CHAIN_CAPACITY as u64) as usize;
                 let block = match self.table.get(page) {
-                    Some(block) => *block,
+                    Some(entry) => entry.block,
                     None => {
                         pg_sys::RelationClose(index);
                         return Err(segment::Error::Truncated);
@@ -2399,7 +2418,10 @@ fn trim_reader_cache(identity: u64, meta: &Meta) {
     };
     let mut bytes = PAGE_TABLES.with_borrow_mut(|tables| {
         tables.retain(|key, _| live(*key));
-        tables.values().map(|table| table.len() * 4).sum::<usize>()
+        tables
+            .values()
+            .map(|table| std::mem::size_of_val::<[RunPage]>(table))
+            .sum::<usize>()
     });
     SEGMENT_READERS.with_borrow_mut(|readers| {
         readers.retain(|key, _| live(*key));
@@ -2485,7 +2507,11 @@ fn report_reader_cache(readers: &SegmentReaders, bytes: usize, budget: usize) {
         dead += dead_bytes(cached);
         native += cached.native.bytes();
     }
-    let tables = PAGE_TABLES.with_borrow(|t| t.values().map(|t| t.len() * 4).sum::<usize>());
+    let tables = PAGE_TABLES.with_borrow(|t| {
+        t.values()
+            .map(|t| std::mem::size_of_val::<[RunPage]>(t))
+            .sum::<usize>()
+    });
     let mb = |b: usize| b as f64 / (1024.0 * 1024.0);
     pgrx::debug1!(
         "stannum reader cache: {:.1} of {:.1} MB in {} readers: page tables {:.1}, arenas {:.1}, \
@@ -6111,7 +6137,7 @@ pub mod testing {
             // the call, as here.
             let own = OWN_PINS.get();
             for block in 1..blocks {
-                let (buffer, owned) = pin_block(index, block, own);
+                let (buffer, owned) = pin_block(index, block, own, 0);
                 let before = usage(buffer);
                 release_pin(buffer, owned);
                 if before >= pg_sys::BM_MAX_USAGE_COUNT {
@@ -6119,7 +6145,7 @@ pub mod testing {
                 }
                 let mut last = buffer;
                 for _ in 0..pins {
-                    let (buffer, owned) = pin_block(index, block, own);
+                    let (buffer, owned) = pin_block(index, block, own, 0);
                     last = buffer;
                     release_pin(buffer, owned);
                 }
@@ -6207,6 +6233,26 @@ pub mod testing {
             pg_sys::index_close(index, pg_sys::AccessShareLock as pg_sys::LOCKMODE);
             locked & pg_sys::BUF_REFCOUNT_MASK
         }
+    }
+
+    /// Points every page hint of this backend's cached page tables (see
+    /// [`RunPage`]) at another shared buffer than the one it names, as
+    /// eviction does to a hint; returns how many hints it changed.
+    pub fn skew_page_hints() -> usize {
+        let buffers = unsafe { pg_sys::NBuffers } as u32;
+        PAGE_TABLES.with_borrow(|tables| {
+            let mut skewed = 0;
+            for entry in tables.values().flat_map(|table| table.iter()) {
+                let known = entry.known.get();
+                let buffer = known & RUN_PAGE_BUFFER;
+                if buffer != 0 {
+                    let other = buffer % buffers + 1;
+                    entry.known.set(known & RUN_PAGE_CHECKED | other);
+                    skewed += 1;
+                }
+            }
+            skewed
+        })
     }
 
     /// Empties this backend's segment readers with their dead lists, and
