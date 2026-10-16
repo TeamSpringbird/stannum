@@ -388,6 +388,10 @@ pub(super) struct Sc<'s, 'a> {
     floors_block: u32,
     /// A common term's bound over a group (see [`Sc::make_common`]).
     common: Option<f32>,
+    /// Per length class (a segment with classes), what each bucket scores
+    /// at most at the class's shortest length: [`Walk::class_reach`] sums
+    /// them where a candidate's class bounds it.
+    class_scores: [[f32; BUCKET_COUNT]; 4],
 }
 
 /// A footer block past what a walk could reach was asked for, or a block
@@ -438,6 +442,7 @@ impl<'s, 'a> Sc<'s, 'a> {
             floors: [0; BUCKET_COUNT],
             floors_block: u32::MAX,
             common: None,
+            class_scores: [[0.0; BUCKET_COUNT]; 4],
         })
     }
 
@@ -3117,23 +3122,25 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         reach: f32,
         tid: impl FnOnce() -> Tid + Copy,
     ) -> Result<Option<f32>> {
-        let top = self.segment.lengths.floors()[3];
+        let floors = self.segment.lengths.floors();
+        let top = floors[3];
         if top <= floor || self.threshold().is_none() {
             return Ok(Some(reach));
         }
         let n = self.sc.len();
-        let at_top = self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), top);
+        let at_top = self.class_reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), 3);
         if !self.cut(at_top, tid) {
             return Ok(Some(reach));
         }
-        let class = self.class_floor(g, local)?;
+        let c = self.class_of(g, local)?;
+        let class = floors[c];
         if class <= floor {
             return Ok(Some(reach));
         }
         let bound = if class == top {
             at_top
         } else {
-            self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), class)
+            self.class_reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), c)
         };
         if self.cut(bound, tid) {
             self.answer.class_cuts += 1;
@@ -3159,6 +3166,31 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.touch
             .touch(Part::DlClasses, self.segment.class_at(rank), 1);
         lengths.floor(rank)
+    }
+
+    /// The length class of the document at slot `local` of group `g`, in a
+    /// segment with classes: its length is at least the class's floor.
+    #[inline]
+    fn class_of(&mut self, g: u32, local: u32) -> Result<usize> {
+        let rank = self
+            .segment
+            .docs
+            .rank_in(g as usize, local)
+            .ok_or(Error::Corrupt("a posting without a document"))?;
+        self.touch
+            .touch(Part::DlClasses, self.segment.class_at(rank), 1);
+        Ok(usize::from(self.segment.lengths.class(rank)?) % 4)
+    }
+
+    /// [`Walk::reach`] at length class `c`'s floor, from the terms' tables
+    /// ([`Sc::class_scores`]): the same scores, summed in the same order.
+    #[inline]
+    fn class_reach(&self, held: impl Iterator<Item = usize>, c: usize) -> f32 {
+        let mut reach = 0.0_f32;
+        for i in held {
+            reach += self.sc[i].class_scores[c][usize::from(self.buckets[i]) % BUCKET_COUNT];
+        }
+        reach
     }
 
     /// The length of the document at slot `local` of group `g`, from the DL
@@ -3456,6 +3488,17 @@ pub(super) fn walk_into<'s, 'a>(
         // footer has read past it, not left pinned to the group's end.
         for s in &mut walk.sc {
             s.footer.release_passed();
+        }
+    }
+    if segment.lengths.has_classes() {
+        let floors = segment.lengths.floors();
+        for s in &mut walk.sc {
+            for (scores, floor) in s.class_scores.iter_mut().zip(floors) {
+                for (bucket, v) in scores.iter_mut().enumerate() {
+                    let bucket = TfBucket::new(bucket as u8).expect("a valid bucket");
+                    *v = s.scorer.bound_through(bucket, floor);
+                }
+            }
         }
     }
     if required.is_empty() {
@@ -4442,10 +4485,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // Its class after its buckets, if not read before them: at
                 // its class's shortest length where that is longer than its
                 // buckets' floor.
-                if !class_first && self.threshold().is_some() {
-                    let class = self.class_floor(g, local)?;
-                    if class > floor {
-                        reach = self.reach(self.held_list.iter().copied(), class);
+                if !class_first && self.threshold().is_some() && self.segment.lengths.has_classes()
+                {
+                    let c = self.class_of(g, local)?;
+                    if self.segment.lengths.floors()[c] > floor {
+                        reach = self.class_reach(self.held_list.iter().copied(), c);
                         if self.cut(reach, tid) {
                             self.answer.class_cuts += 1;
                             return Ok(None);
