@@ -7,7 +7,8 @@
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsmerge -- --in DUMP_DIR --out OUT_DIR \
-//!     --segments K [--jobs N] [--reuse] [--check] [--plan]
+//!     --segments K [--jobs N] [--reuse] [--check] [--plan] [--stream]
+//! cargo run -p bench --release --bin tnsmerge -- --in DUMP_DIR --verify
 //! ```
 //!
 //! The segments, in directory order (by generation, as a tiered merge
@@ -21,6 +22,13 @@
 //! none. `--check` verifies each output with `verify_segment`. `--plan`
 //! prints the runs and each segment's ctid range, and merges nothing.
 //!
+//! `--stream` merges as the extension does (`merge::merge_streaming`):
+//! inputs read through their files a range at a time, what is built term
+//! by term spilled to files beside the output, and the output written as it
+//! is laid out, so memory stays a few bytes per document rather than the
+//! inputs' and the output's bytes. `--check` then reads each output back
+//! whole. `--verify` checks every segment of `--in` and merges nothing.
+//!
 //! The output's manifest copies the source's settings; each merged segment
 //! takes the largest generation of its run. `ids.tsv` is linked to the
 //! source's.
@@ -31,7 +39,9 @@ use std::time::Instant;
 
 use segment::Tid;
 use segment::dead::DeadDocs;
-use segment::tinshape::merge::{Input, merge, merge_afresh};
+use segment::tinshape::merge::{
+    Input, SourceInput, merge, merge_afresh, merge_streaming, merge_streaming_afresh,
+};
 use segment::tinshape::postings::Options;
 use segment::tinshape::segment::Segment;
 use segment::tinshape::verify::verify_segment;
@@ -44,11 +54,13 @@ struct Args {
     reuse: bool,
     check: bool,
     plan: bool,
+    stream: bool,
+    verify: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsmerge --in DIR --out DIR --segments K [--jobs N] [--reuse] [--check] [--plan]"
+        "usage: tnsmerge --in DIR --out DIR --segments K [--jobs N] [--reuse] [--check] [--plan] [--stream]\n       tnsmerge --in DIR --verify"
     );
     std::process::exit(2)
 }
@@ -63,6 +75,8 @@ fn args() -> Args {
         reuse: false,
         check: false,
         plan: false,
+        stream: false,
+        verify: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -74,8 +88,13 @@ fn args() -> Args {
             "--reuse" => a.reuse = true,
             "--check" => a.check = true,
             "--plan" => a.plan = true,
+            "--stream" => a.stream = true,
+            "--verify" => a.verify = true,
             _ => usage(),
         }
+    }
+    if a.verify && !a.input.as_os_str().is_empty() {
+        return a;
     }
     if a.input.as_os_str().is_empty()
         || (a.output.as_os_str().is_empty() && !a.plan)
@@ -131,11 +150,233 @@ fn runs(sources: &[Source], k: usize) -> Vec<Vec<usize>> {
     out
 }
 
+/// A segment file read a range at a time.
+struct FileSource {
+    file: std::fs::File,
+    len: u64,
+}
+
+impl FileSource {
+    fn open(path: &Path) -> Result<Self, String> {
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let len = file.metadata().map_err(|e| e.to_string())?.len();
+        Ok(Self { file, len })
+    }
+
+    /// The segment's documents, from its header and document set alone.
+    fn documents(&self) -> segment::Result<segment::tinshape::docs::DocSet> {
+        use segment::source::Source as _;
+        use segment::tinshape::index::{HEADER_MAX, Header};
+        let head = self.read(0, (HEADER_MAX as u64).min(self.len) as usize)?;
+        let header = Header::parse(&head, self.len)?;
+        let area = segment::tinshape::segment::Area::DocSet as usize;
+        segment::tinshape::docs::DocSet::decode(&self.read(header.at(area), header.len(area))?)
+    }
+}
+
+impl segment::source::Source for FileSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read(&self, offset: u64, len: usize) -> segment::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        let mut out = vec![0u8; len];
+        self.file
+            .read_exact_at(&mut out, offset)
+            .map_err(|_| segment::Error::Truncated)?;
+        Ok(out)
+    }
+}
+
+/// A spill in three files beside the output, removed when dropped.
+struct FileSpill {
+    paths: [PathBuf; 3],
+    files: [Option<std::io::BufWriter<std::fs::File>>; 3],
+}
+
+impl FileSpill {
+    fn new(dir: &Path, name: &str) -> Self {
+        Self {
+            paths: [0, 1, 2].map(|i| dir.join(format!(".{name}.spill{i}"))),
+            files: [None, None, None],
+        }
+    }
+
+    fn slot(area: segment::tinshape::segment::Area) -> usize {
+        use segment::tinshape::segment::Area;
+        match area {
+            Area::TermMap => 0,
+            Area::Postings => 1,
+            _ => 2,
+        }
+    }
+}
+
+impl segment::tinshape::segment::Spill for FileSpill {
+    fn append(
+        &mut self,
+        area: segment::tinshape::segment::Area,
+        bytes: &[u8],
+    ) -> segment::Result<()> {
+        use std::io::Write;
+        let i = Self::slot(area);
+        if self.files[i].is_none() {
+            let file =
+                std::fs::File::create(&self.paths[i]).map_err(|_| segment::Error::Truncated)?;
+            self.files[i] = Some(std::io::BufWriter::with_capacity(1 << 20, file));
+        }
+        let file = self.files[i].as_mut().expect("just opened");
+        file.write_all(bytes).map_err(|_| segment::Error::Truncated)
+    }
+
+    fn replay(
+        &mut self,
+        area: segment::tinshape::segment::Area,
+        out: &mut dyn FnMut(&[u8]) -> segment::Result<()>,
+    ) -> segment::Result<()> {
+        use std::io::{Read, Write};
+        let i = Self::slot(area);
+        let Some(mut file) = self.files[i].take() else {
+            return Ok(());
+        };
+        file.flush().map_err(|_| segment::Error::Truncated)?;
+        drop(file);
+        let mut file =
+            std::fs::File::open(&self.paths[i]).map_err(|_| segment::Error::Truncated)?;
+        let mut chunk = vec![0u8; 1 << 20];
+        loop {
+            let read = file
+                .read(&mut chunk)
+                .map_err(|_| segment::Error::Truncated)?;
+            if read == 0 {
+                return Ok(());
+            }
+            out(&chunk[..read])?;
+        }
+    }
+}
+
+impl Drop for FileSpill {
+    fn drop(&mut self) {
+        for path in &self.paths {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// A file written front to back.
+struct FileSink(std::io::BufWriter<std::fs::File>);
+
+impl segment::tinshape::segment::Sink for FileSink {
+    fn write(&mut self, bytes: &[u8]) -> segment::Result<()> {
+        use std::io::Write;
+        self.0
+            .write_all(bytes)
+            .map_err(|_| segment::Error::Truncated)
+    }
+}
+
+/// [`merge_run`] streaming (see the module).
+fn merge_run_streaming(
+    args: &Args,
+    sources: &[Source],
+    run: &[usize],
+) -> Result<(u32, String, String), String> {
+    use std::io::Write;
+    let start = Instant::now();
+    let files: Vec<FileSource> = run
+        .iter()
+        .map(|&i| FileSource::open(&args.input.join(&sources[i].name)))
+        .collect::<Result<_, _>>()?;
+    let deads: Vec<DeadDocs> = run
+        .iter()
+        .zip(&files)
+        .map(|(&i, file)| {
+            let documents = file
+                .documents()
+                .map_err(|e| e.to_string())?
+                .geometry
+                .documents;
+            dead_docs(&args.input, &sources[i], documents)
+        })
+        .collect::<Result<_, _>>()?;
+    let inputs: Vec<SourceInput<'_>> = files
+        .iter()
+        .zip(&deads)
+        .map(|(source, dead)| SourceInput { source, dead })
+        .collect();
+    let generation = run
+        .iter()
+        .map(|&i| sources[i].generation)
+        .max()
+        .expect("a run");
+    let name = format!("gen{generation}.segment");
+    let path = args.output.join(&name);
+    let mut spill = FileSpill::new(&args.output, &name);
+    let mut sink = FileSink(std::io::BufWriter::with_capacity(
+        1 << 20,
+        std::fs::File::create(&path).map_err(|e| e.to_string())?,
+    ));
+    let merged = if args.reuse {
+        merge_streaming(
+            &inputs,
+            Options::default(),
+            &mut spill,
+            &mut sink,
+            || Ok(()),
+        )
+    } else {
+        merge_streaming_afresh(
+            &inputs,
+            Options::default(),
+            &mut spill,
+            &mut sink,
+            || Ok(()),
+        )
+    }
+    .map_err(|e| e.to_string())?
+    .ok_or("no live document")?;
+    sink.0.flush().map_err(|e| e.to_string())?;
+    drop(sink);
+    drop(spill);
+    let merging = start.elapsed().as_secs_f64();
+    let source_bytes: u64 = files.iter().map(|f| f.len).sum();
+    let mut line = format!(
+        "{name} <- {}: {} documents, {} terms, {} postings, {} reused; {source_bytes} -> {} bytes ({:+.3}%); streamed, merge {merging:.1} s",
+        run.iter()
+            .map(|&i| sources[i].name.as_str())
+            .collect::<Vec<_>>()
+            .join(" "),
+        merged.documents,
+        merged.terms,
+        merged.postings,
+        merged.reused,
+        merged.bytes,
+        100.0 * (merged.bytes as f64 / source_bytes as f64 - 1.0),
+    );
+    if args.check {
+        let t = Instant::now();
+        let blob = std::fs::read(&path).map_err(|e| e.to_string())?;
+        let clean = verify_segment(&blob).is_clean();
+        line += &format!("; verifies {clean} ({:.1} s)", t.elapsed().as_secs_f64());
+        if !clean {
+            return Err(line);
+        }
+    }
+    line += &format!("; total {:.1} s", start.elapsed().as_secs_f64());
+    let manifest = format!("segment\t{generation}\t{}\t{name}\t-", merged.documents);
+    Ok((generation, manifest, line))
+}
+
 fn merge_run(
     args: &Args,
     sources: &[Source],
     run: &[usize],
 ) -> Result<(u32, String, String), String> {
+    if args.stream {
+        return merge_run_streaming(args, sources, run);
+    }
     let start = Instant::now();
     let blobs: Vec<Vec<u8>> = run
         .iter()
@@ -213,15 +454,32 @@ fn main() {
             header.push(line.to_string());
             continue;
         };
-        let blob = std::fs::read(args.input.join(name)).unwrap_or_else(|e| {
-            eprintln!("{name}: {e}");
-            std::process::exit(1)
-        });
-        let segment = Segment::parse(&blob).unwrap_or_else(|e| {
-            eprintln!("{name}: {e}");
-            std::process::exit(1)
-        });
-        let tids = segment.docs.tids();
+        if args.verify {
+            let blob = std::fs::read(args.input.join(name)).unwrap_or_else(|e| {
+                eprintln!("{name}: {e}");
+                std::process::exit(1)
+            });
+            let t = Instant::now();
+            let clean = verify_segment(&blob).is_clean();
+            println!(
+                "{name}: {} bytes, verifies {clean} ({:.1} s)",
+                blob.len(),
+                t.elapsed().as_secs_f64()
+            );
+            if !clean {
+                std::process::exit(1);
+            }
+            continue;
+        }
+        // The documents alone, read through the file: a segment can be
+        // larger than the memory a streamed merge needs.
+        let tids = FileSource::open(&args.input.join(name))
+            .and_then(|file| file.documents().map_err(|e| e.to_string()))
+            .unwrap_or_else(|e| {
+                eprintln!("{name}: {e}");
+                std::process::exit(1)
+            })
+            .tids();
         sources.push(Source {
             generation: generation.parse().unwrap_or_else(|_| usage()),
             documents: documents.parse().unwrap_or_else(|_| usage()),
@@ -230,6 +488,10 @@ fn main() {
             first: *tids.first().expect("a document"),
             last: *tids.last().expect("a document"),
         });
+    }
+    if args.verify {
+        println!("VERIFY-DONE");
+        return;
     }
     for s in &sources {
         let overlaps = sources

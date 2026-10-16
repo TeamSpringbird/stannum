@@ -77,6 +77,56 @@ pub struct BuildStats {
     pub kind_bytes: [u64; 4],
 }
 
+/// Where a builder sets aside the areas it writes term by term (the term
+/// map's blocks, postings and positions) until [`Builder::finish_into`]
+/// lays the blob out: the term map comes first in the blob and is complete
+/// only after the last term. Bytes come back in the order they went in.
+pub trait Spill {
+    fn append(&mut self, area: Area, bytes: &[u8]) -> Result<()>;
+    /// Hands `out` every byte appended to `area`, in order.
+    fn replay(&mut self, area: Area, out: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()>;
+}
+
+/// A spill held in memory.
+#[derive(Default)]
+pub struct MemorySpill {
+    areas: [Vec<u8>; 3],
+}
+
+impl MemorySpill {
+    fn slot(area: Area) -> usize {
+        match area {
+            Area::TermMap => 0,
+            Area::Postings => 1,
+            Area::Positions => 2,
+            _ => unreachable!("only the term map, postings and positions spill"),
+        }
+    }
+}
+
+impl Spill for MemorySpill {
+    fn append(&mut self, area: Area, bytes: &[u8]) -> Result<()> {
+        self.areas[Self::slot(area)].extend_from_slice(bytes);
+        Ok(())
+    }
+
+    fn replay(&mut self, area: Area, out: &mut dyn FnMut(&[u8]) -> Result<()>) -> Result<()> {
+        out(&self.areas[Self::slot(area)])
+    }
+}
+
+/// Where [`Builder::finish_into`] writes a blob, front to back.
+pub trait Sink {
+    fn write(&mut self, bytes: &[u8]) -> Result<()>;
+}
+
+impl Sink for Vec<u8> {
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
 /// Builds a segment from its documents and, term by term in byte order,
 /// their postings.
 pub struct Builder {
@@ -87,6 +137,10 @@ pub struct Builder {
     dictionary: DictionaryBuilder,
     postings: Vec<u8>,
     positions: Vec<u8>,
+    /// Bytes of postings and positions handed to a [`Spill`], ahead of
+    /// `postings` and `positions`.
+    postings_spilled: u64,
+    positions_spilled: u64,
     pub stats: BuildStats,
     slots: Vec<u32>,
     term_lengths: Vec<u32>,
@@ -107,6 +161,8 @@ impl Builder {
             dictionary: DictionaryBuilder::default(),
             postings: Vec::new(),
             positions: Vec::new(),
+            postings_spilled: 0,
+            positions_spilled: 0,
             stats: BuildStats::default(),
             slots: Vec::new(),
             term_lengths: Vec::new(),
@@ -165,6 +221,7 @@ impl Builder {
         let positions = super::positions::encode(positions)?;
         let positions = positions.as_slice();
         let at = self.postings.len();
+        let offset = self.postings_spilled + at as u64;
         let stats = postings::encode_reusing(
             &self.geometry,
             &self.slots,
@@ -178,11 +235,11 @@ impl Builder {
             df: ranks.len() as u32,
             max_tf_bucket: *buckets.iter().max().expect("a posting"),
             ordinals: Extent {
-                offset: at as u64,
+                offset,
                 len: (self.postings.len() - at) as u32,
             },
             payload: Extent {
-                offset: self.positions.len() as u64,
+                offset: self.positions_spilled + self.positions.len() as u64,
                 len: positions.len() as u32,
             },
         };
@@ -210,23 +267,52 @@ impl Builder {
         Ok(stats)
     }
 
+    /// Bytes of the areas built term by term held in memory, not yet
+    /// spilled.
+    pub fn held(&self) -> usize {
+        self.postings.len() + self.positions.len() + self.dictionary.held()
+    }
+
+    /// Hands what [`Self::held`] counts to `spill`.
+    pub fn spill(&mut self, spill: &mut dyn Spill) -> Result<()> {
+        spill.append(Area::TermMap, &self.dictionary.take_blocks())?;
+        spill.append(Area::Postings, &self.postings)?;
+        spill.append(Area::Positions, &self.positions)?;
+        self.postings_spilled += self.postings.len() as u64;
+        self.positions_spilled += self.positions.len() as u64;
+        self.postings.clear();
+        self.positions.clear();
+        Ok(())
+    }
+
     /// The blob, with `dead` (document ranks, ascending) cleared in the
     /// liveness bitmap, and where its bytes went.
-    pub fn finish(mut self, dead: &[u32]) -> (Vec<u8>, BuildStats) {
-        let dictionary = std::mem::take(&mut self.dictionary).finish();
+    pub fn finish(self, dead: &[u32]) -> (Vec<u8>, BuildStats) {
+        let mut out = Vec::new();
+        let (_, stats) = self
+            .finish_into(dead, &mut MemorySpill::default(), &mut out)
+            .expect("an in-memory build cannot fail to write");
+        (out, stats)
+    }
+
+    /// [`Self::finish`] written to `out`, with what was spilled to `spill`
+    /// read back in place: the blob's length and where its bytes went.
+    pub fn finish_into(
+        mut self,
+        dead: &[u32],
+        spill: &mut dyn Spill,
+        out: &mut dyn Sink,
+    ) -> Result<(u64, BuildStats)> {
+        let (dictionary, taken, blocks) = std::mem::take(&mut self.dictionary).finish_parts();
         let docset = docs::encode_docset(&self.geometry, &self.tids);
         let lengths = docs::encode_lengths(&self.lengths, self.options.length_classes);
         let liveness = docs::encode_liveness(self.tids.len() as u32, dead);
         let total_length: u64 = self.lengths.iter().map(|l| u64::from(*l)).sum();
-        let mut out = Vec::with_capacity(
-            64 + dictionary.len()
-                + self.postings.len()
-                + self.positions.len()
-                + docset.len()
-                + lengths.len()
-                + liveness.len(),
-        );
-        out.extend_from_slice(MAGIC);
+        let dictionary_len = dictionary.len() as u64 + taken + blocks.len() as u64;
+        let postings_len = self.postings_spilled + self.postings.len() as u64;
+        let positions_len = self.positions_spilled + self.positions.len() as u64;
+        let mut head = Vec::with_capacity(64);
+        head.extend_from_slice(MAGIC);
         let mut flags = 0;
         if self.options.adaptive_tf {
             flags |= FLAG_ADAPTIVE_TF;
@@ -239,32 +325,46 @@ impl Builder {
             total_length,
             u64::from(self.options.block_size),
             flags,
-            dictionary.len() as u64,
-            self.postings.len() as u64,
-            self.positions.len() as u64,
+            dictionary_len,
+            postings_len,
+            positions_len,
             docset.len() as u64,
             lengths.len() as u64,
             liveness.len() as u64,
         ] {
-            varint::put(&mut out, n);
+            varint::put(&mut head, n);
         }
         let s = &mut self.stats;
-        s.header = out.len() as u64;
-        s.dictionary = dictionary.len() as u64;
+        s.header = head.len() as u64;
+        s.dictionary = dictionary_len;
         s.docset = docset.len() as u64;
         s.lengths = lengths.len() as u64;
         s.liveness = liveness.len() as u64;
-        for section in [
-            &dictionary,
-            &self.postings,
-            &self.positions,
-            &docset,
-            &lengths,
-            &liveness,
-        ] {
-            out.extend_from_slice(section);
+        let mut written = 0u64;
+        let mut write = |bytes: &[u8]| -> Result<()> {
+            written += bytes.len() as u64;
+            out.write(bytes)
+        };
+        write(&head)?;
+        write(&dictionary)?;
+        spill.replay(Area::TermMap, &mut write)?;
+        write(&blocks)?;
+        spill.replay(Area::Postings, &mut write)?;
+        write(&self.postings)?;
+        spill.replay(Area::Positions, &mut write)?;
+        write(&self.positions)?;
+        for section in [&docset, &lengths, &liveness] {
+            write(section)?;
         }
-        (out, self.stats)
+        let expected = head.len() as u64
+            + dictionary_len
+            + postings_len
+            + positions_len
+            + (docset.len() + lengths.len() + liveness.len()) as u64;
+        if written != expected {
+            return Err(Error::Corrupt("a spill gave back other bytes than it took"));
+        }
+        Ok((written, self.stats))
     }
 }
 
