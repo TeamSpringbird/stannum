@@ -2504,6 +2504,15 @@ together by up to 6% from round to round (the host's drift). No layout
 effect stands out of that; the phrase gain holds (-3.1% score, -2.1%
 `full_score`, positions pages -23% and -25%).
 
+The 150M database built afresh at layout 15 (the v2 profile, as layout
+14's): index 36.28 GB against 37.76 (-3.9%), 13 segments where layout 14
+merged to 14 (smaller segments merge further at the same size limits);
+import 15.6 and index build 166.5 minutes against 12.5 and 147.1, on a
+host busy with other work throughout, so not a measure of the build.
+The PGO profiles were retrained on it (`d07348e` aarch64, `b6cef80`
+x86-64, 40 of 40 hot functions each; every training answer equal to
+PostgreSQL's).
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every

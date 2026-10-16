@@ -173,7 +173,8 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
   conjunctions and disjunctions ran the same instructions over the same
   pages, their cycles within the host's run-to-run drift (-1.3% to
   +1.0%; per query 0.989 to 1.006). An index of layout 14 must be
-  rebuilt.
+  rebuilt; built afresh, the 150 million-row index is 3.9% smaller
+  (37.76 to 36.28 GB).
 - The DL sidecar of a segment in TIN's shape holds each document's length
   class, two bits by rank (shorter than 16, 64, 256 words, or longer;
   page layout 14), and a ranked walk bounds a candidate at its class's
