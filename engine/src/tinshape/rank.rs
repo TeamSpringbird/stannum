@@ -388,6 +388,10 @@ pub(super) struct Sc<'s, 'a> {
     floors_block: u32,
     /// A common term's bound over a group (see [`Sc::make_common`]).
     common: Option<f32>,
+    /// Per length class (a segment with classes), what each bucket scores
+    /// at most at the class's shortest length: [`Walk::class_reach`] sums
+    /// them where a candidate's class bounds it.
+    class_scores: [[f32; BUCKET_COUNT]; 4],
 }
 
 /// A footer block past what a walk could reach was asked for, or a block
@@ -438,6 +442,7 @@ impl<'s, 'a> Sc<'s, 'a> {
             floors: [0; BUCKET_COUNT],
             floors_block: u32::MAX,
             common: None,
+            class_scores: [[0.0; BUCKET_COUNT]; 4],
         })
     }
 
@@ -792,6 +797,9 @@ struct Mem<'a> {
     ///
     /// [`MemoCounts`]: segment::tinshape::segment::MemoCounts
     used: u32,
+    /// A led walk's run of the group's buckets ([`TfRun`]), taken at the
+    /// first bucket it reads there ([`Walk::read_bucket`]).
+    tf: TfRun,
 }
 
 impl Mem<'_> {
@@ -806,7 +814,16 @@ impl Mem<'_> {
                 }
                 let w = local as usize / 64;
                 if w > self.w {
-                    self.run += kernels::popcount_bytes(&bytes[self.w * 8..w * 8]);
+                    // A candidate a few words on (most of a dense group's)
+                    // counts them inline, a far one by the kernel.
+                    self.run += if w - self.w <= 4 {
+                        bytes[self.w * 8..w * 8]
+                            .chunks_exact(8)
+                            .map(|c| u64::from_le_bytes(c.try_into().expect("a word")).count_ones())
+                            .sum::<u32>()
+                    } else {
+                        kernels::popcount_bytes(&bytes[self.w * 8..w * 8])
+                    };
                     self.w = w;
                 }
                 let word = bits::word(bytes, w);
@@ -1148,6 +1165,7 @@ fn load<'a>(
     mem.run = 0;
     mem.pos = 0;
     mem.entry = usize::MAX;
+    mem.tf = TfRun::default();
     let group = geometry.groups[g as usize];
     if let Form::Sparse(list) = &set.postings.form {
         let cursor = set.sparse.get_or_insert_with(|| {
@@ -1478,6 +1496,10 @@ struct Walk<'s, 'a, T: Touch> {
     /// already ([`Walk::sieve_words`]): its pass over a chunk then keeps
     /// nearly all, which says nothing of what it drops.
     sieve_pre: bool,
+    /// Whether the group's sieve reads every term before judging a chunk
+    /// by what it dropped ([`Walk::ready_sieve`]): its first term alone
+    /// drops few.
+    sieve_joint: bool,
     sieve_prefix: Vec<u32>,
     /// [`Walk::sieve_words`]' scratch: the first term's buckets gathered
     /// from the TF tail, and their pass bits.
@@ -1751,6 +1773,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         for mem in &mut self.mems {
             mem.loaded = 0;
             mem.kind = Kind::List;
+            mem.tf = TfRun::default();
         }
         let held = self.held.len();
         self.held
@@ -2020,7 +2043,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 });
             }
         }
-        Ok(self.ready_sieve())
+        Ok(self.ready_sieve(true))
     }
 
     /// Orders the sieve's terms by their bounds over the group, highest
@@ -2032,13 +2055,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// dense ones, it does not, and a candidate's own check, which reads its
     /// terms' buckets best first and bounds them at one length, is left to
     /// bound it.
-    fn ready_sieve(&mut self) -> bool {
+    ///
+    /// Else, for a led walk (`joint`), whether every sieve term's bucket 0
+    /// together does (two dense words of a phrase: either's bound over the
+    /// group reaches the bar alone, both their common counts fall short).
+    /// Then the sieve reads every term's buckets before it judges a chunk
+    /// by what it dropped ([`Walk::sieve_joint`]).
+    fn ready_sieve(&mut self, joint: bool) -> bool {
         let ub = &self.sieve_ub;
         self.sieve_terms
             .sort_by(|a, b| ub[b.i].total_cmp(&ub[a.i]).then(a.i.cmp(&b.i)));
         self.sieve_prefix.clear();
         self.sieve_depth = self.sieve_terms.len();
         self.sieve_pre = false;
+        self.sieve_joint = false;
         let Some(first) = self.sieve_terms.first_mut() else {
             return false;
         };
@@ -2050,16 +2080,36 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .enumerate()
             .map(|(i, u)| if i == first.i { 0.0 } else { *u })
             .sum();
-        if rest >= score {
+        if rest < score {
+            // Most postings count one (bucket 0): unless those can drop, few
+            // can. An estimate (summed in another order); the sieve sums
+            // exactly.
+            let (floor, v) = self.sc[first.i].floor_kept(first.entry, 0);
+            first.table[0] = v;
+            first.floors[0] = floor;
+            if rest + v < score {
+                return true;
+            }
+        }
+        if !joint {
             return false;
         }
-        // Most postings count one (bucket 0): unless those can drop, few
-        // can. An estimate (summed in another order); the sieve sums
-        // exactly.
-        let (floor, v) = self.sc[first.i].floor_kept(first.entry, 0);
-        first.table[0] = v;
-        first.floors[0] = floor;
-        rest + v < score
+        // A candidate at bucket 0 of every sieve term it must hold, any
+        // other term at its bound over the group (an estimate, as above).
+        let mut low: f32 = (0..ub.len())
+            .filter(|i| !self.sieve_terms.iter().any(|st| st.i == *i))
+            .map(|i| ub[i])
+            .sum();
+        for st in &mut self.sieve_terms {
+            let (floor, v) = self.sc[st.i].floor_kept(st.entry, 0);
+            st.table[0] = v;
+            st.floors[0] = floor;
+            if self.sc_required[st.i] {
+                low += v;
+            }
+        }
+        self.sieve_joint = low < score;
+        self.sieve_joint
     }
 
     /// Counts the members per word of sieve term `k`'s bitmap, once per
@@ -2385,7 +2435,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
                 // A term that drops too few is not worth its reads: the
                 // group's later chunks stop before it.
-                if kept * 8 > left.len() * 7 && !self.sieve_pre {
+                if kept * 8 > left.len() * 7 && !self.sieve_pre && !self.sieve_joint {
                     self.sieve_depth = k;
                 }
                 left.truncate(kept);
@@ -2415,7 +2465,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 locals[kept] = local;
                 kept += usize::from(!cut_by(bar, bound, || geometry.tid_in(g as usize, local)));
             }
-            if kept * 8 > left.len() * 7 {
+            if kept * 8 > left.len() * 7 && !self.sieve_joint {
                 self.sieve_depth = k;
             }
             left.truncate(kept);
@@ -2431,6 +2481,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let kept = self.sieve_shared(g, m, &held, &mut left, &mut locals);
             left.truncate(kept);
             locals.truncate(kept);
+        }
+        // Every term read, a chunk it left nearly whole: the group's later
+        // chunks are bounded alone.
+        if self.sieve_joint && locals.len() * 8 > m * 7 {
+            self.sieve_depth = 0;
         }
         // Those dropped were examined (bounded) as those left will be.
         self.answer.candidates += (m - locals.len()) as u64;
@@ -2539,7 +2594,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // A group the sieve takes is sieved by its first term's buckets
         // before its candidates are listed.
         let sieved = kernels::popcount(&self.words) >= SIEVE_MIN as u64 && self.sieve_led(g)?;
-        if sieved {
+        if sieved && !self.sieve_joint {
             let mut words = std::mem::take(&mut self.words);
             let done = self.sieve_words(&mut words);
             self.words = words;
@@ -2660,6 +2715,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             mem.kind = Kind::List;
             mem.list.clear();
             mem.pos = 0;
+            mem.tf = TfRun::default();
         }
         Ok(())
     }
@@ -2922,21 +2978,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.buckets[i] = NO_BUCKET;
                 continue;
             };
-            let s = &mut self.sc[i];
-            let set = self.terms[t].as_ref().expect("scoring");
-            let block = s.block_of(index, self.mems[t].entry);
-            let bucket = s.bucket_in(block, set.postings.tf, index)?;
-            if s.footer.single().is_none() {
-                self.touch.touch(
-                    Part::TfTail,
-                    set.at + set.postings.tf_at + s.footer.tf_byte(block),
-                    1,
-                );
-            }
+            let block = self.sc[i].block_of(index, self.mems[t].entry);
+            let bucket = self.read_bucket(i, block, index)?;
             let (f, bound) = self.sc[i].floor_kept(block, bucket);
             (floor, low) = (floor.max(f), low.min(f));
             own += bound;
-            self.buckets[i] = bucket;
             self.held_index[i] = index;
         }
         self.cand_floor = floor;
@@ -3038,19 +3084,33 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 
     /// Reads into [`Walk::buckets`] scoring term `i`'s bucket for its
-    /// posting `index`, which its block `block` holds.
+    /// posting `index`, which its block `block` holds (a grouped term's
+    /// entry for the group at hand): from the group's run of buckets
+    /// ([`TfRun`]), taken at its first read in the group, where it has one.
     #[inline]
     fn read_bucket(&mut self, i: usize, block: usize, index: u32) -> Result<u8> {
-        let s = &mut self.sc[i];
-        let set = self.terms[s.term].as_ref().expect("scoring");
-        let bucket = s.bucket_in(block, set.postings.tf, index)?;
-        if s.footer.single().is_none() {
-            self.touch.touch(
-                Part::TfTail,
-                set.at + set.postings.tf_at + s.footer.tf_byte(block),
-                1,
-            );
+        let t = self.sc[i].term;
+        if self.mems[t].tf.state == TfRun::UNSET {
+            self.mems[t].tf = self.tf_run(i, block)?;
         }
+        let run = self.mems[t].tf;
+        let s = &mut self.sc[i];
+        let set = self.terms[t].as_ref().expect("scoring");
+        let bucket = if run.state == TfRun::READY {
+            self.touch
+                .touch(Part::TfTail, set.at + set.postings.tf_at + run.tail, 1);
+            run.bucket(index)?
+        } else {
+            let bucket = s.bucket_in(block, set.postings.tf, index)?;
+            if s.footer.single().is_none() {
+                self.touch.touch(
+                    Part::TfTail,
+                    set.at + set.postings.tf_at + s.footer.tf_byte(block),
+                    1,
+                );
+            }
+            bucket
+        };
         self.buckets[i] = bucket;
         Ok(bucket)
     }
@@ -3098,23 +3158,25 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         reach: f32,
         tid: impl FnOnce() -> Tid + Copy,
     ) -> Result<Option<f32>> {
-        let top = self.segment.lengths.floors()[3];
+        let floors = self.segment.lengths.floors();
+        let top = floors[3];
         if top <= floor || self.threshold().is_none() {
             return Ok(Some(reach));
         }
         let n = self.sc.len();
-        let at_top = self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), top);
+        let at_top = self.class_reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), 3);
         if !self.cut(at_top, tid) {
             return Ok(Some(reach));
         }
-        let class = self.class_floor(g, local)?;
+        let c = self.class_of(g, local)?;
+        let class = floors[c];
         if class <= floor {
             return Ok(Some(reach));
         }
         let bound = if class == top {
             at_top
         } else {
-            self.reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), class)
+            self.class_reach((0..n).filter(|i| self.buckets[*i] != NO_BUCKET), c)
         };
         if self.cut(bound, tid) {
             self.answer.class_cuts += 1;
@@ -3140,6 +3202,31 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.touch
             .touch(Part::DlClasses, self.segment.class_at(rank), 1);
         lengths.floor(rank)
+    }
+
+    /// The length class of the document at slot `local` of group `g`, in a
+    /// segment with classes: its length is at least the class's floor.
+    #[inline]
+    fn class_of(&mut self, g: u32, local: u32) -> Result<usize> {
+        let rank = self
+            .segment
+            .docs
+            .rank_in(g as usize, local)
+            .ok_or(Error::Corrupt("a posting without a document"))?;
+        self.touch
+            .touch(Part::DlClasses, self.segment.class_at(rank), 1);
+        Ok(usize::from(self.segment.lengths.class(rank)?) % 4)
+    }
+
+    /// [`Walk::reach`] at length class `c`'s floor, from the terms' tables
+    /// ([`Sc::class_scores`]): the same scores, summed in the same order.
+    #[inline]
+    fn class_reach(&self, held: impl Iterator<Item = usize>, c: usize) -> f32 {
+        let mut reach = 0.0_f32;
+        for i in held {
+            reach += self.sc[i].class_scores[c][usize::from(self.buckets[i]) % BUCKET_COUNT];
+        }
+        reach
     }
 
     /// The length of the document at slot `local` of group `g`, from the DL
@@ -3350,6 +3437,7 @@ pub(super) fn walk_into<'s, 'a>(
         sieve_cands: Vec::new(),
         sieve_depth: 0,
         sieve_pre: false,
+        sieve_joint: false,
         sieve_prefix: Vec::new(),
         sieve_fields: Vec::new(),
         sieve_pass: Vec::new(),
@@ -3437,6 +3525,17 @@ pub(super) fn walk_into<'s, 'a>(
         // footer has read past it, not left pinned to the group's end.
         for s in &mut walk.sc {
             s.footer.release_passed();
+        }
+    }
+    if segment.lengths.has_classes() {
+        let floors = segment.lengths.floors();
+        for s in &mut walk.sc {
+            for (scores, floor) in s.class_scores.iter_mut().zip(floors) {
+                for (bucket, v) in scores.iter_mut().enumerate() {
+                    let bucket = TfBucket::new(bucket as u8).expect("a valid bucket");
+                    *v = s.scorer.bound_through(bucket, floor);
+                }
+            }
         }
     }
     if required.is_empty() {
@@ -3572,6 +3671,9 @@ struct TfRun {
     bit: usize,
     bytes: *const u8,
     len: usize,
+    /// Where the entry's buckets start in the TF tail, in bytes (for page
+    /// accounting).
+    tail: usize,
 }
 
 impl TfRun {
@@ -3600,6 +3702,7 @@ impl Default for TfRun {
             bit: 0,
             bytes: std::ptr::NonNull::dangling().as_ptr(),
             len: 0,
+            tail: 0,
         }
     }
 }
@@ -4256,7 +4359,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 });
             }
         }
-        self.ready_sieve()
+        self.ready_sieve(false)
     }
 
     /// Keeps the members of `word`, word `w` of group `g` (first slot
@@ -4419,10 +4522,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // Its class after its buckets, if not read before them: at
                 // its class's shortest length where that is longer than its
                 // buckets' floor.
-                if !class_first && self.threshold().is_some() {
-                    let class = self.class_floor(g, local)?;
-                    if class > floor {
-                        reach = self.reach(self.held_list.iter().copied(), class);
+                if !class_first && self.threshold().is_some() && self.segment.lengths.has_classes()
+                {
+                    let c = self.class_of(g, local)?;
+                    if self.segment.lengths.floors()[c] > floor {
+                        reach = self.class_reach(self.held_list.iter().copied(), c);
                         if self.cut(reach, tid) {
                             self.answer.class_cuts += 1;
                             return Ok(None);
@@ -4509,6 +4613,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(TfRun {
                 state: TfRun::READY,
                 first: e.first,
+                tail: e.tf_bit as usize / 8,
                 ..TfRun::default()
             });
         }
@@ -4528,6 +4633,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             bit: e.tf_bit as usize - from * 8,
             bytes: bytes.as_ptr(),
             len: bytes.len(),
+            tail: from,
         })
     }
 }
