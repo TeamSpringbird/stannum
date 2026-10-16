@@ -2,22 +2,29 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Re-encodes dumped `TNS1` segments of page layout version 13, 12, 11, 10,
-//! 9, 8 or 6 to version 14, whose grouped records' directories are rows of
-//! fixed width found by a group's rank and hold short lists as arrays, and
-//! whose DL sidecar holds length classes (or, with `--keep-records`,
-//! records as they were but for their headers and directories), and reports
-//! what that costs. Version 13 (the DL sidecar's length classes, its
+//! Re-encodes dumped `TNS1` segments of page layout version 14, 13, 12, 11,
+//! 10, 9, 8 or 6 to version 15, whose positions are bit-packed per block of
+//! entries, whose grouped records' directories are rows of fixed width
+//! found by a group's rank and hold short lists as arrays, and whose DL
+//! sidecar holds length classes (or, with `--keep-records`, records as they
+//! were but for their headers and directories), and reports what that
+//! costs. Version 14 has only its positions rewritten (step 0), every other
+//! area copied. Version 13 (the DL sidecar's length classes, its
 //! directories still varint entries) has its directories rewritten; with
 //! `--keep-records` every other area, and the header's flags, are copied.
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 13|12|11|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--grid-share N] \
+//!     [--from 14|13|12|11|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--grid-share N] \
 //!     [--arrays N] [--jobs N] [--check] [--check-merge] [--fresh] [--census] [--keep-records]
 //! ```
 //!
-//! Up to six steps per segment:
+//! 0. **Positions** (every source; versions 6 to 14 share one positions
+//!    format). Each term's stream of varint entries is decoded to the
+//!    payload stream it was encoded from and encoded again by
+//!    `positions::encode`; the dictionary's positions extents follow.
+//!
+//! Up to six more steps per segment:
 //!
 //! 1. **The document set** (from 8 or 6). Versions 6 and 8 gave a group one
 //!    width `w`,
@@ -85,6 +92,7 @@ use segment::tinshape::bits::BitWriter;
 use segment::tinshape::docs::{GROUP_PAGES, Geometry, Lengths, encode_docset, encode_lengths};
 use segment::tinshape::ef;
 use segment::tinshape::merge::{Input, merge, merge_afresh};
+use segment::tinshape::positions;
 use segment::tinshape::postings::{
     ARRAY_SLOTS_MAX, FORM_COMPACT, FORM_GROUPED, FORM_LENGTHS, FORM_ROUNDED, GroupEntry,
     GroupFrontiers, KIND_EF, KIND_GRID, KIND_PAGED, Options, encode_directory, for_each_local,
@@ -142,7 +150,7 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsreencode --in DIR --out DIR [--from 13|12|11|10|9|8|6] [--exact] \
+        "usage: tnsreencode --in DIR --out DIR [--from 14|13|12|11|10|9|8|6] [--exact] \
          [--segment FILE] [--grid-density N] [--grid-share N] [--arrays N] [--jobs N] [--check] \
          [--check-merge] [--fresh] [--census] [--keep-records]"
     );
@@ -189,7 +197,7 @@ fn args() -> Args {
     }
     if a.input.as_os_str().is_empty()
         || a.output.as_os_str().is_empty()
-        || !matches!(a.from, 6 | 8 | 9 | 10 | 11 | 12 | 13)
+        || !matches!(a.from, 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14)
         || (a.keep_records && a.from == 6)
         || a.jobs == 0
     {
@@ -223,6 +231,9 @@ struct Cost {
     rowed_entries: u64,
     rows_before: u64,
     rows_after: u64,
+    /// Step 0: positions bytes before and after.
+    positions_before: u64,
+    positions_after: u64,
 }
 
 /// The source blob's header fields, in order.
@@ -738,6 +749,8 @@ impl Cost {
         self.rowed_entries += other.rowed_entries;
         self.rows_before += other.rows_before;
         self.rows_after += other.rows_after;
+        self.positions_before += other.positions_before;
+        self.positions_after += other.positions_after;
     }
 }
 
@@ -1046,6 +1059,104 @@ fn directory_rows(blob: &[u8], cost: &mut Cost) -> Result<Vec<u8>, String> {
     Ok(new)
 }
 
+/// A positions stream of page layouts 6 to 14 as the payload stream it was
+/// encoded from:
+///
+/// ```text
+/// positions := count << 2 | masks << 1 | subs varint, skip u32le * slots,
+///              [sub u16le * 3 * blocks], [mask u32le * blocks], entry*
+/// entry     := [n varint], position varint * n (first absolute, then
+///              delta - 1; n absent where the block's mask bit is set)
+/// ```
+fn legacy_positions(stream: &[u8]) -> Result<Vec<u8>, String> {
+    let mut at = 0;
+    let head = varint::get(stream, &mut at)?;
+    let count = usize::try_from(head >> 2).map_err(|e| e.to_string())?;
+    let blocks = count.div_ceil(32);
+    let mut p = at + blocks.saturating_sub(1) * 4;
+    if head & 1 == 1 {
+        p += blocks * 3 * 2;
+    }
+    let masks = (head & 2 == 2).then_some(p);
+    if masks.is_some() {
+        p += blocks * 4;
+    }
+    let mut builder = segment::payload::PayloadBuilder::default();
+    let mut positions = Vec::new();
+    for i in 0..count {
+        let one = match masks {
+            Some(m) => {
+                let s = m + i / 32 * 4;
+                let mask = stream
+                    .get(s..s + 4)
+                    .ok_or("positions masks past the stream")?;
+                u32::from_le_bytes(mask.try_into().expect("four bytes")) >> (i % 32) & 1 == 1
+            }
+            None => false,
+        };
+        let n = if one { 1 } else { varint::get(stream, &mut p)? };
+        positions.clear();
+        for k in 0..n {
+            let v = u32::try_from(varint::get(stream, &mut p)?).map_err(|e| e.to_string())?;
+            positions.push(match positions.last() {
+                Some(&q) if k > 0 => q + v + 1,
+                _ => v,
+            });
+        }
+        builder.push(&positions).map_err(|e| e.to_string())?;
+    }
+    if p != stream.len() {
+        return Err("bytes past a positions stream's entries".into());
+    }
+    Ok(builder.finish())
+}
+
+/// Step 0: every term's positions bit-packed per block (page layout 15),
+/// the dictionary's positions extents moved to match; every other area
+/// copied.
+fn positions_blocks(blob: &[u8], cost: &mut Cost) -> Result<Vec<u8>, String> {
+    let segment = Segment::parse(blob).map_err(|e| e.to_string())?;
+    let (fields, _) = header_fields(blob)?;
+    let positions_at = segment.area_at(Area::Positions);
+    let mut out = Vec::with_capacity(fields[6] as usize);
+    let mut dictionary = DictionaryBuilder::default();
+    for item in segment.dictionary().iter() {
+        let (term, entry) = item.map_err(|e| e.to_string())?;
+        let from = positions_at + entry.payload.offset as usize;
+        let stream = &blob[from..from + entry.payload.len as usize];
+        let payload = legacy_positions(stream).map_err(|e| format!("{term}: {e}"))?;
+        let at = out.len();
+        out.extend_from_slice(&positions::encode(&payload).map_err(|e| e.to_string())?);
+        let moved = TermEntry {
+            payload: Extent {
+                offset: at as u64,
+                len: u32::try_from(out.len() - at).map_err(|e| e.to_string())?,
+            },
+            ..entry
+        };
+        dictionary.push(&term, moved).map_err(|e| e.to_string())?;
+    }
+    cost.positions_before += fields[6];
+    cost.positions_after += out.len() as u64;
+    let postings = &blob[segment.area_at(Area::Postings)..positions_at];
+    let rest = &blob[segment.area_at(Area::DocSet)..segment.bounds[7]];
+    let dictionary = dictionary.finish();
+    let mut fields = fields.clone();
+    fields[4] = dictionary.len() as u64;
+    fields[6] = out.len() as u64;
+    let mut new =
+        Vec::with_capacity(64 + dictionary.len() + postings.len() + out.len() + rest.len());
+    new.extend_from_slice(b"TNS1");
+    for f in &fields {
+        varint::put(&mut new, *f);
+    }
+    new.extend_from_slice(&dictionary);
+    new.extend_from_slice(postings);
+    new.extend_from_slice(&out);
+    new.extend_from_slice(rest);
+    Ok(new)
+}
+
 /// Step 5: `blob` merged alone, every record encoded over the grid of its
 /// documents: afresh (no container copied) when `fresh`.
 fn renumber(blob: &[u8], args: &Args, fresh: bool) -> Result<Vec<u8>, String> {
@@ -1082,13 +1193,16 @@ fn one(args: &Args, name: &str, cost: &mut Cost) -> Result<(String, bool), Strin
     let before = area_sizes(&blob)?;
     let source = blob.len();
     let mut new = if args.from >= 9 { blob } else { regrid(&blob)? };
+    new = positions_blocks(&new, cost)?;
     if args.from == 6 {
         new = reencode_v6(&new, args.mode, cost)?;
     } else if args.from < 10 {
         new = add_directory_lengths(&new, cost)?;
     }
-    new = directory_rows(&new, cost)?;
-    let new = if args.keep_records {
+    if args.from < 14 {
+        new = directory_rows(&new, cost)?;
+    }
+    let new = if args.keep_records || args.from == 14 {
         new
     } else {
         renumber(&new, args, args.fresh)?
@@ -1332,6 +1446,12 @@ fn main() {
     println!(
         "areas together {before} -> {after} ({:+.3}%)",
         100.0 * (after as f64 / before.max(1) as f64 - 1.0)
+    );
+    println!(
+        "positions bit-packed per block: {} -> {} B ({:+.2}%)",
+        cost.positions_before,
+        cost.positions_after,
+        100.0 * (cost.positions_after as f64 / cost.positions_before.max(1) as f64 - 1.0)
     );
     println!(
         "directories as rows: {} grouped records, {} entries: {} -> {} B ({:+.2} B an entry)",

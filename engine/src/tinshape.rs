@@ -19,8 +19,7 @@ use segment::tinshape::blob::Bytes;
 use segment::tinshape::docs::DocSet;
 use segment::tinshape::docs::Geometry;
 use segment::tinshape::ef::EfCursor;
-use segment::tinshape::positions::Positions;
-use segment::tinshape::postings::{Directory, Form, GroupEntry, KIND_GRID, Postings};
+use segment::tinshape::postings::{Directory, Form, GroupEntry, InOrder, KIND_GRID, Postings};
 use segment::tinshape::segment::{Area, Segment};
 use segment::{Error, Result};
 use tinql::runtime::{Query, SpanTermSlot};
@@ -418,6 +417,26 @@ impl<'a> TermSet<'a> {
         }
         Self::entry(dir, &self.docs, b, Some(index));
         Some(index)
+    }
+
+    /// A grouped term's next group in order and its entry, read in order
+    /// (see [`Directory::step`]): `hint` moved to it, and its group index
+    /// given; `None` past its last (and for a term without a directory).
+    /// For a walk that asks for every group a term holds, in order.
+    #[inline]
+    fn step_index(&self, order: &mut InOrder, hint: &mut usize) -> Option<u32> {
+        let dir = self.dir.as_ref()?;
+        match dir.step(order, &self.docs.geometry.groups) {
+            Ok(Some((b, entry))) => {
+                *hint = b;
+                Some(entry.index)
+            }
+            Ok(None) => {
+                *hint = dir.len();
+                None
+            }
+            Err(e) => crate::corrupt(format!("Stannum postings: {e}")),
+        }
     }
 
     /// The term's group `group`, if it holds it, looked for from `hint`
@@ -1136,25 +1155,7 @@ pub fn read_positions(
     out: &mut Vec<u32>,
     touch: &mut impl Touch,
 ) -> Result<()> {
-    let (bytes, at) = stream;
-    let positions = Positions::parse(bytes)?;
-    let (mut entry, mut p, reads) = positions.locate(index)?;
-    for (read_at, len) in reads {
-        if len > 0 {
-            touch.touch(Part::Positions, at + read_at, len);
-        }
-    }
-    if let Some(m) = positions.mask_at(index) {
-        touch.touch(Part::Positions, at + m, 4);
-    }
-    let from = p;
-    while entry < index {
-        p = positions.skip(entry, p)?;
-        entry += 1;
-    }
-    let end = positions.read_entry(index, p, out)?;
-    touch.touch(Part::Positions, at + from, end - from);
-    Ok(())
+    rank::PosCursor::new(stream)?.read(index, out, touch)
 }
 
 /// Opens every term of a query.
@@ -2582,7 +2583,7 @@ mod tests {
         let read = lazy.loaded() - before;
         let positions = parsed.bounds[4] - parsed.bounds[3];
         let sidecar = parsed.bounds[6] - parsed.bounds[5];
-        assert!(positions > 400_000, "{positions}");
+        assert!(positions > 200_000, "{positions}");
         assert!(
             read < (positions + sidecar) / 4,
             "read {read} bytes of {positions} of positions and {sidecar} of lengths"
