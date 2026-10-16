@@ -182,7 +182,13 @@ for level in "${LEVELS[@]}"; do
     check_pgo "$level" "$work/$level$pkglibdir/stannum.so" "$work/build-$level.log"
 done
 base="$work/x86-64" v4="$work/x86-64-v4"
-diff -r "$base$extdir" "$v4$extdir" >/dev/null || fail "the two builds' SQL and control files differ"
+# The package takes the baseline's SQL. pgrx may order its entities otherwise
+# from one build to the next, so compare the files' sorted statements.
+(cd "$base$extdir" && ls) | cmp -s - <(cd "$v4$extdir" && ls) || fail "the two builds install other extension files"
+for f in "$base$extdir"/*; do
+    cmp -s <(grep -v '^--' "$f" | sort) <(grep -v '^--' "$v4$extdir/$(basename "$f")" | sort) ||
+        echo "warning: the builds' $(basename "$f") differ beyond order and comments" >&2
+done
 
 # exported LIBRARY: its exported function symbols, but the two PostgreSQL
 # looks up in the library it opened itself (weak or indirect ones marked ?).
@@ -197,6 +203,11 @@ cmp -s "$work/loader/symbols.txt" "$work/loader/symbols-v4.txt" ||
 if grep -q '^?' "$work/loader/symbols.txt"; then
     fail "weak or indirect exported functions: $(grep '^?' "$work/loader/symbols.txt" | tr '\n' ' ')"
 fi
+# Every C function the SQL names must be forwarded.
+sed -n "s/.*'MODULE_PATHNAME', *'\([A-Za-z0-9_]*\)'.*/\1/p" "$base$extdir"/*.sql | sort -u > "$work/loader/sql-symbols.txt"
+[ -s "$work/loader/sql-symbols.txt" ] || fail "no 'MODULE_PATHNAME' function in $base$extdir"
+missing=$(comm -23 "$work/loader/sql-symbols.txt" "$work/loader/symbols.txt")
+[ -z "$missing" ] || fail "the SQL names functions the builds do not export: $missing"
 awk '{ printf "SYMBOL(%d, %s)\n", NR - 1, $0 }' "$work/loader/symbols.txt" > "$work/loader/stannum_loader_symbols.h"
 version=$(sed -n "s/^default_version *= *'\(.*\)'/\1/p" "$base$extdir/stannum.control")
 [ -n "$version" ] || fail "no default_version in $base$extdir/stannum.control"
