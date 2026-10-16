@@ -2181,8 +2181,8 @@ mod linux_counters {
     const EVENTS: [u64; 3] = [1, 0, 5];
     /// `exclude_kernel` and `exclude_hv`.
     const USER_ONLY: u64 = 1 << 5 | 1 << 6;
-    /// `PERF_FORMAT_GROUP`.
-    const GROUP: u64 = 1 << 3;
+    /// `PERF_FORMAT_GROUP`, with `_TOTAL_TIME_ENABLED` and `_RUNNING`.
+    const GROUP: u64 = 1 << 3 | 1 << 0 | 1 << 1;
 
     fn open(config: u64, leader: i32) -> Option<i32> {
         let attr = Attr {
@@ -2213,11 +2213,30 @@ mod linux_counters {
                 Some(leader)
             })
         })?;
-        // `{ nr, values[nr] }`, in the order the events were opened.
-        let mut group = [0u64; 4];
-        // SAFETY: at most the buffer's 32 bytes.
-        let got = unsafe { read(leader, group.as_mut_ptr(), 32) };
-        (got == 32 && group[0] == 3).then(|| [group[1], group[2], group[3]])
+        // `{ nr, time_enabled, time_running, values[nr] }`, the values in
+        // the order the events were opened.
+        let mut group = [0u64; 6];
+        // SAFETY: at most the buffer's 48 bytes.
+        let got = unsafe { read(leader, group.as_mut_ptr(), 48) };
+        if got != 48 || group[0] != 3 {
+            return None;
+        }
+        let (enabled, running) = (group[1], group[2]);
+        if running >= enabled || running == 0 {
+            return Some([group[3], group[4], group[5]]);
+        }
+        // Another perf session on these CPUs (a `perf stat` of many events)
+        // left the group counting part of the time: scale, as perf does.
+        static WARNED: std::sync::Once = std::sync::Once::new();
+        WARNED.call_once(|| {
+            eprintln!(
+                "tnsreplay: hardware counters multiplexed ({:.0}% of the time counted): \
+                 counts are scaled estimates",
+                100.0 * running as f64 / enabled as f64
+            );
+        });
+        let scale = |v: u64| (v as u128 * enabled as u128 / running as u128) as u64;
+        Some([scale(group[3]), scale(group[4]), scale(group[5])])
     }
 }
 
