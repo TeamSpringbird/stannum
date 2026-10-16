@@ -892,10 +892,21 @@ impl<'a> From<&'a Vec<u8>> for Bytes<'a> {
     }
 }
 
-/// A hint that the cache line holding `p` is read soon; no load, no
-/// fault, nothing on targets without the instruction.
+/// A hint that `bytes` (their first two cache lines) are read soon: reads
+/// of several ranges, asked for first, then overlap. No load, no fault,
+/// nothing on targets without the instruction.
 #[inline(always)]
-fn prefetch(p: *const u8) {
+pub fn prefetch(bytes: &[u8]) {
+    let p = bytes.as_ptr();
+    prefetch_line(p);
+    if bytes.len() > 64 {
+        prefetch_line(p.wrapping_add(64));
+    }
+}
+
+/// [`prefetch`] of the cache line holding `p`.
+#[inline(always)]
+fn prefetch_line(p: *const u8) {
     #[cfg(target_arch = "aarch64")]
     // SAFETY: `prfm` is a hint: it reads nothing architecturally and cannot
     // fault, whatever the address.
@@ -1009,17 +1020,6 @@ impl<'a> Bytes<'a> {
                 }
                 ((at + from) / n * n + n - at).min(len)
             }
-        }
-    }
-
-    /// Asks the CPU to start loading the cache line holding byte `at`, to
-    /// be read soon: reads of several such bytes, each found by a read of
-    /// its own, then overlap. The byte's page is read (pinned) as a read of
-    /// it would; a byte past the end is ignored.
-    #[inline]
-    pub fn prefetch(&self, at: usize) {
-        if let Ok(byte) = self.get(at, at + 1) {
-            prefetch(byte.as_ptr());
         }
     }
 

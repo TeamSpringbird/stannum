@@ -147,6 +147,95 @@ impl Block {
     }
 }
 
+/// A block's bytes in hand, not read yet ([`Positions::fetch`]): from its
+/// start to the end of the page it starts on.
+#[derive(Clone, Copy, Debug)]
+pub struct Fetched<'a> {
+    pub index: u32,
+    at: usize,
+    skip_at: Option<usize>,
+    pub bytes: &'a [u8],
+}
+
+/// A block with its bytes in hand ([`Positions::hold`]), its widths read:
+/// where its parts lie as offsets in those bytes.
+#[derive(Clone, Copy, Debug)]
+pub struct Held<'a> {
+    /// The block's number, where it starts and where its skip lies (none
+    /// for the first).
+    pub index: u32,
+    entries: u32,
+    pub at: usize,
+    pub skip_at: Option<usize>,
+    /// From its start, at least to its gaps.
+    bytes: &'a [u8],
+    first_width: u32,
+    gap_width: u32,
+    count_width: u32,
+    plane_len: usize,
+    planes: usize,
+    firsts: usize,
+    gaps: usize,
+}
+
+impl<'a> Held<'a> {
+    /// Its bytes in hand.
+    pub fn bytes(&self) -> &'a [u8] {
+        self.bytes
+    }
+
+    /// Its widths and planes, as `(offset, length)` in the stream.
+    pub fn head_bytes(&self) -> (usize, usize) {
+        (self.at, self.firsts)
+    }
+
+    /// Entry `index`, of this block, located ([`Positions::entry`]), and
+    /// the bytes from its gaps' start (with those after them in hand) when
+    /// it has gaps that lie in hand.
+    #[inline]
+    pub fn entry(&self, index: u32) -> Result<(Entry, Option<&'a [u8]>)> {
+        let i = index.wrapping_sub(self.index * SKIP_INTERVAL);
+        if i >= self.entries {
+            return Err(Error::Corrupt("positions index"));
+        }
+        let below = (1u32 << i) - 1;
+        let (mut extra, mut gap) = (0u32, 0usize);
+        for b in 0..self.count_width as usize {
+            let at = self.planes + b * self.plane_len;
+            // Four bytes where they lie in hand: those past the plane are
+            // bits of entries past `i`, which neither sum reads.
+            let plane = match self.bytes.get(at..at + 4) {
+                Some(word) => u32::from_le_bytes(word.try_into().expect("four bytes")),
+                None => self.bytes[at..at + self.plane_len]
+                    .iter()
+                    .rev()
+                    .fold(0u32, |word, byte| word << 8 | u32::from(*byte)),
+            };
+            extra |= (plane >> i & 1) << b;
+            gap += ((plane & below).count_ones() as usize) << b;
+        }
+        let bit = self.firsts * 8 + i as usize * self.first_width as usize;
+        let first = bits::get_at(self.bytes, bit, self.first_width)?;
+        let entry = Entry {
+            count: extra
+                .checked_add(1)
+                .ok_or(Error::Corrupt("positions count"))?,
+            first,
+            first_at: self.at + bit / 8,
+            first_len: (bit % 8 + self.first_width as usize).div_ceil(8),
+            width: self.gap_width,
+            gaps_at: self.at + self.gaps,
+            gap,
+        };
+        if entry.count == 1 {
+            return Ok((entry, None));
+        }
+        let (from, to) = entry.gap_bytes();
+        let gaps = (to - self.at <= self.bytes.len()).then(|| &self.bytes[from - self.at..]);
+        Ok((entry, gaps))
+    }
+}
+
 /// An entry located in its block: its count and first position, and where
 /// its other positions lie.
 #[derive(Clone, Copy, Debug, Default)]
@@ -235,31 +324,6 @@ impl<'a> Positions<'a> {
         self.parse_block(b, at, skip_at, self.bytes.window(at, 3)?)
     }
 
-    /// Block `b`, parsed, and its bytes from its start in hand: to the end
-    /// of the page it starts on, or to its head's end where that is
-    /// further. Its entries are then read from them by
-    /// [`Self::entry_held`], with no other read but of a gap run past
-    /// them.
-    #[inline]
-    pub fn block_held(&self, b: u32) -> Result<(Block, &'a [u8])> {
-        let (at, skip_at) = self.block_start(b)?;
-        let end = self.bytes.page_end(at).max((at + 3).min(self.bytes.len()));
-        let held = self.bytes.get(at, end)?;
-        Ok((self.parse_block(b, at, skip_at, held)?, held))
-    }
-
-    /// Starts loading block `b`'s head into the cache ([`Bytes::prefetch`]):
-    /// a run of blocks about to be parsed one after another are then read
-    /// together, not each after the one before.
-    #[inline]
-    pub fn prefetch_block(&self, b: u32) {
-        if b * SKIP_INTERVAL < self.count
-            && let Ok((at, _)) = self.block_start(b)
-        {
-            self.bytes.prefetch(at);
-        }
-    }
-
     /// Where block `b` starts, and where its skip lies (none for the
     /// first).
     #[inline]
@@ -332,14 +396,6 @@ impl<'a> Positions<'a> {
     /// read.
     #[inline]
     pub fn entry(&self, block: &Block, index: u32) -> Result<Entry> {
-        self.entry_held(block, &[], index)
-    }
-
-    /// [`Self::entry`] of a block whose bytes from its start `held` holds
-    /// ([`Self::block_held`]): its first position read from them where
-    /// they reach it.
-    #[inline]
-    pub fn entry_held(&self, block: &Block, held: &[u8], index: u32) -> Result<Entry> {
         let i = index.wrapping_sub(block.index * SKIP_INTERVAL);
         if i >= block.entries {
             return Err(Error::Corrupt("positions index"));
@@ -356,11 +412,7 @@ impl<'a> Positions<'a> {
         let bit = i as usize * block.first_width as usize;
         let first_at = block.firsts_at + bit / 8;
         let first_len = (bit % 8 + block.first_width as usize).div_ceil(8);
-        let bytes = match held.get(first_at - block.at..) {
-            Some(bytes) if bytes.len() >= first_len => bytes,
-            _ => self.bytes.window(first_at, 8)?,
-        };
-        let first = bits::get_at(bytes, bit % 8, block.first_width)?;
+        let first = bits::get_at(self.bytes.window(first_at, 8)?, bit % 8, block.first_width)?;
         Ok(Entry {
             count: extra
                 .checked_add(1)
@@ -371,6 +423,77 @@ impl<'a> Positions<'a> {
             width: block.gap_width,
             gaps_at: block.gaps_at,
             gap,
+        })
+    }
+
+    /// Block `b` (below the block count) with its bytes in hand: from its
+    /// start to the end of the page it starts on, or to its gaps where its
+    /// head runs past the page. Its entries are then read from them alone
+    /// ([`Held::entry`]): two reads in all, of its skip and of its bytes,
+    /// where [`Self::block`] and [`Self::entry`] read each part apart.
+    #[inline]
+    pub fn hold(&self, b: u32) -> Result<Held<'a>> {
+        self.hold_fetched(self.fetch(b)?)
+    }
+
+    /// Block `b`'s bytes in hand, unread: [`Self::hold`] is
+    /// [`Self::hold_fetched`] of it. Several fetched first, each one's
+    /// bytes asked for ([`super::blob::prefetch`]), are then held with
+    /// their loads overlapping.
+    #[inline]
+    pub fn fetch(&self, b: u32) -> Result<Fetched<'a>> {
+        let (at, skip_at) = self.block_start(b)?;
+        let end = self.bytes.page_end(at).max((at + 3).min(self.bytes.len()));
+        Ok(Fetched {
+            index: b,
+            at,
+            skip_at,
+            bytes: self.bytes.get(at, end)?,
+        })
+    }
+
+    /// The block `fetched` holds the bytes of, its widths read.
+    #[inline]
+    pub fn hold_fetched(&self, fetched: Fetched<'a>) -> Result<Held<'a>> {
+        let Fetched {
+            index: b,
+            at,
+            skip_at,
+            mut bytes,
+        } = fetched;
+        let head = bytes.get(..2).ok_or(Error::Truncated)?;
+        let widths = u16::from_le_bytes([head[0], head[1]]);
+        let (first_width, gap_width) = (u32::from(widths & 63), u32::from(widths >> 6 & 63));
+        let mut count_width = u32::from(widths >> 12);
+        let mut planes = 2;
+        if count_width == WIDE {
+            count_width = u32::from(*bytes.get(2).ok_or(Error::Truncated)?);
+            planes += 1;
+        }
+        if first_width > 32 || gap_width > 32 || count_width > 32 {
+            return Err(Error::Corrupt("positions widths"));
+        }
+        let entries = (self.count - b * SKIP_INTERVAL).min(SKIP_INTERVAL);
+        let plane_len = entries.div_ceil(8) as usize;
+        let firsts = planes + count_width as usize * plane_len;
+        let gaps = firsts + packed_len(entries as usize, first_width);
+        if gaps > bytes.len() {
+            // Its head runs past the page: in hand whole (stitched).
+            bytes = self.bytes.get(at, at + gaps)?;
+        }
+        Ok(Held {
+            index: b,
+            entries,
+            at,
+            skip_at,
+            bytes,
+            first_width,
+            gap_width,
+            count_width,
+            plane_len,
+            planes,
+            firsts,
+            gaps,
         })
     }
 

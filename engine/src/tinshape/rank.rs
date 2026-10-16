@@ -27,10 +27,10 @@ use segment::Tid;
 use segment::payload::SKIP_INTERVAL;
 use segment::tf_bucket::{BUCKET_COUNT, TfBucket};
 use segment::tinshape::bits;
-use segment::tinshape::blob::{Bytes, LazyBlob};
+use segment::tinshape::blob::{self, Bytes, LazyBlob};
 use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
-use segment::tinshape::positions::{Block, Entry, Positions};
+use segment::tinshape::positions::{Block, Entry, Fetched, Held, Positions};
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, KIND_ARRAY, KIND_EF, KIND_GRID, LazyFooter,
     array_bytes, higher, lower,
@@ -1180,8 +1180,6 @@ pub(super) struct PosCursor<'a> {
     positions: Positions<'a>,
     at: usize,
     block: Option<Block>,
-    /// Within a batch of reads, the block's bytes from its start.
-    held: Option<&'a [u8]>,
 }
 
 /// Bytes past an entry's gaps read with them for the vector bodies' loads.
@@ -1193,7 +1191,6 @@ impl<'a> PosCursor<'a> {
             positions: Positions::parse(stream.0)?,
             at: stream.1,
             block: None,
-            held: None,
         })
     }
 
@@ -1211,44 +1208,22 @@ impl<'a> PosCursor<'a> {
     /// them from, as far as it needs.
     #[inline]
     pub(super) fn locate(&mut self, index: u32, touch: &mut impl Touch) -> Result<Run<'a>> {
-        self.locate_in(index, false, touch)
-    }
-
-    /// [`PosCursor::locate`] within a batch of reads, its block's bytes kept
-    /// in hand from one read to the next ([`Positions::block_held`]) until
-    /// [`PosCursor::release`]: the pages they lie on must stay pinned
-    /// until then.
-    #[inline]
-    fn locate_held(&mut self, index: u32, touch: &mut impl Touch) -> Result<Run<'a>> {
-        self.locate_in(index, true, touch)
-    }
-
-    /// Starts loading the block of entry `index` unless it is the one at
-    /// hand ([`Positions::prefetch_block`]).
-    #[inline]
-    fn prefetch(&self, index: u32) {
-        let b = index / SKIP_INTERVAL;
-        if self.block.as_ref().is_none_or(|block| block.index != b) {
-            self.positions.prefetch_block(b);
-        }
-    }
-
-    /// Ends a batch of [`PosCursor::locate_held`]: no bytes kept.
-    fn release(&mut self) {
-        self.held = None;
-    }
-
-    #[inline(always)]
-    fn locate_in(&mut self, index: u32, hold: bool, touch: &mut impl Touch) -> Result<Run<'a>> {
-        let b = index / SKIP_INTERVAL;
-        if self.block.as_ref().is_none_or(|block| block.index != b)
-            || (hold && self.held.is_none())
+        if self
+            .block
+            .as_ref()
+            .is_none_or(|b| b.index != index / SKIP_INTERVAL)
         {
-            self.enter(index, hold, touch)?;
+            self.enter(index, touch)?;
         }
         let block = self.block.as_ref().expect("the entry's block");
-        let held = if hold { self.held.unwrap_or(&[]) } else { &[] };
-        let entry = self.positions.entry_held(block, held, index)?;
+        let entry = self.positions.entry(block, index)?;
+        self.run(entry, None, touch)
+    }
+
+    /// `entry` as a [`Run`], its gaps' bytes read unless `gaps` holds them
+    /// (from their start).
+    #[inline]
+    fn run(&self, entry: Entry, gaps: Option<&'a [u8]>, touch: &mut impl Touch) -> Result<Run<'a>> {
         let (first, len) = entry.first_bytes();
         touch.touch(Part::Positions, self.at + first, len);
         if entry.count == 1 {
@@ -1256,43 +1231,84 @@ impl<'a> PosCursor<'a> {
         }
         let (from, to) = entry.gap_bytes();
         touch.touch(Part::Positions, self.at + from, to - from);
-        // With the bytes after them on their page: a gap is then read by one
-        // unaligned load (fewer than eight bytes left are read one at a
-        // time), and a long entry's by vector loads.
-        if let Some(gaps) = held.get(from - block.at..)
-            && gaps.len() >= to - from
-        {
+        if let Some(gaps) = gaps {
             return Ok(Run {
                 entry,
                 gaps: &gaps[..gaps.len().min(to - from + GAP_SLACK)],
             });
         }
+        // With the bytes after them on their page: a gap is then read by one
+        // unaligned load (fewer than eight bytes left are read one at a
+        // time), and a long entry's by vector loads.
         let bytes = &self.positions.bytes;
         let gaps = bytes.get(from, bytes.page_end(from).min(to + GAP_SLACK).max(to))?;
         Ok(Run { entry, gaps })
     }
 
-    /// Parses and keeps the block holding entry `index`, and with `hold`
-    /// its bytes.
+    /// Parses and keeps the block holding entry `index`.
     #[inline(never)]
-    fn enter(&mut self, index: u32, hold: bool, touch: &mut impl Touch) -> Result<()> {
-        if index >= self.positions.count {
-            return Err(Error::Corrupt("positions index"));
-        }
-        let b = if hold {
-            let (block, held) = self.positions.block_held(index / SKIP_INTERVAL)?;
-            self.held = Some(held);
-            self.block.insert(block)
-        } else {
-            self.held = None;
-            self.block.insert(self.positions.block_of(index)?)
-        };
+    fn enter(&mut self, index: u32, touch: &mut impl Touch) -> Result<()> {
+        let b = self.block.insert(self.positions.block_of(index)?);
         if let Some(s) = b.skip_at {
             touch.touch(Part::Positions, self.at + s, 4);
         }
         let (head, len) = b.head_bytes();
         touch.touch(Part::Positions, self.at + head, len);
         Ok(())
+    }
+
+    /// The entries `indexes` (ascending) yields into `out` (by the place
+    /// each comes with): each block among them with its bytes in hand
+    /// ([`Positions::hold`]), every block asked for before any is read, so
+    /// that their loads overlap. `held` is scratch.
+    fn locate_all(
+        &mut self,
+        indexes: impl Iterator<Item = (usize, u32)> + Clone,
+        out: &mut [Run<'a>],
+        fetched: &mut Vec<Fetched<'a>>,
+        touch: &mut impl Touch,
+    ) -> Result<()> {
+        fetched.clear();
+        for (_, index) in indexes.clone() {
+            let b = index / SKIP_INTERVAL;
+            if fetched.last().is_some_and(|f| f.index == b) {
+                continue;
+            }
+            if index >= self.positions.count {
+                return Err(Error::Corrupt("positions index"));
+            }
+            let f = self.positions.fetch(b)?;
+            blob::prefetch(f.bytes);
+            fetched.push(f);
+        }
+        let Some(first) = fetched.first() else {
+            return Ok(());
+        };
+        let mut f = 0;
+        let mut held = self.positions.hold_fetched(*first)?;
+        self.touch_head(&held, touch);
+        for (k, index) in indexes {
+            if held.index != index / SKIP_INTERVAL {
+                while fetched[f].index != index / SKIP_INTERVAL {
+                    f += 1;
+                }
+                held = self.positions.hold_fetched(fetched[f])?;
+                self.touch_head(&held, touch);
+            }
+            let (entry, gaps) = held.entry(index)?;
+            out[k] = self.run(entry, gaps, touch)?;
+        }
+        Ok(())
+    }
+
+    /// Records the reads of `held`'s skip and head.
+    #[inline]
+    fn touch_head(&self, held: &Held, touch: &mut impl Touch) {
+        if let Some(s) = held.skip_at {
+            touch.touch(Part::Positions, self.at + s, 4);
+        }
+        let (head, len) = held.head_bytes();
+        touch.touch(Part::Positions, self.at + head, len);
     }
 }
 
@@ -1360,6 +1376,15 @@ fn runs_keep(earlier: &Run, later: &Run, lo: u32, hi: u32) -> Result<bool> {
     }
 }
 
+/// A batch of candidates' posting indexes ([`SpanCheck::retain`]):
+/// candidate `k`'s in slot `s`'s term is `index[k * stride + column[s]]`.
+#[derive(Clone, Copy)]
+struct Indexes<'i> {
+    index: &'i [u32],
+    stride: usize,
+    column: &'i [usize],
+}
+
 /// A top-level span's positions check.
 struct SpanCheck<'a> {
     /// Per span slot, its term, and the first slot of the same term (a
@@ -1382,9 +1407,11 @@ struct SpanCheck<'a> {
     positions: Vec<Vec<u32>>,
     /// A batch of candidates checked together ([`SpanCheck::retain`]): per
     /// slot its entries, one per candidate (`table[slot * n + k]` for
-    /// candidate `k` of `n`), and whether it was located.
+    /// candidate `k` of `n`), and whether it was located; the blocks of a
+    /// slot's entries, in hand while they are located.
     table: Vec<Run<'a>>,
     batch_located: Vec<bool>,
+    fetched: Vec<Fetched<'a>>,
 }
 
 impl<'a> SpanCheck<'a> {
@@ -1424,38 +1451,23 @@ impl<'a> SpanCheck<'a> {
             positions: vec![Vec::new(); slots.len()],
             table: Vec::new(),
             batch_located: vec![false; slots.len()],
+            fetched: Vec::new(),
         }
     }
 
     /// Puts into `kept` the places of the candidates of a batch holding
-    /// the span, ascending: candidate `k`'s posting index in slot `s`'s
-    /// term is `index[k * slots + s]`. Checked together: each step of the
-    /// plan locates its slot's entries for every candidate left, in
-    /// posting order (its term's blocks read forward, each asked for
-    /// before any is parsed, so that their loads overlap), then tests its
-    /// pair on each, dropping those that fail; the solver runs only on
-    /// those every pair keeps.
-    fn retain(&mut self, index: &[u32], touch: &mut impl Touch, kept: &mut Vec<u32>) -> Result<()> {
+    /// the span, ascending, their posting indexes in `index`. Checked
+    /// together: each step of the plan locates its slot's entries for
+    /// every candidate left, in posting order (its term's blocks read
+    /// forward, each asked for before any is parsed, so that their loads
+    /// overlap), then tests its pair on each, dropping those that fail;
+    /// the solver runs only on those every pair keeps.
+    fn retain(&mut self, index: Indexes, touch: &mut impl Touch, kept: &mut Vec<u32>) -> Result<()> {
         let width = self.slots.len();
-        let n = index.len().checked_div(width).unwrap_or(0);
-        kept.clear();
-        kept.extend(0..n as u32);
-        let result = self.retain_batch(index, n, touch, kept);
-        // The bytes in hand lie on pages the group pins.
-        for cursor in &mut self.cursors {
-            cursor.release();
-        }
-        result
-    }
-
-    fn retain_batch(
-        &mut self,
-        index: &[u32],
-        n: usize,
-        touch: &mut impl Touch,
-        alive: &mut Vec<u32>,
-    ) -> Result<()> {
-        let width = self.slots.len();
+        let n = index.index.len().checked_div(index.stride).unwrap_or(0);
+        let alive = kept;
+        alive.clear();
+        alive.extend(0..n as u32);
         if self.table.len() < width * n {
             self.table.resize(width * n, Run::default());
         }
@@ -1506,27 +1518,21 @@ impl<'a> SpanCheck<'a> {
     fn locate_alive(
         &mut self,
         slot: usize,
-        index: &[u32],
+        index: Indexes,
         n: usize,
         alive: &[u32],
         touch: &mut impl Touch,
     ) -> Result<()> {
-        let width = self.slots.len();
-        let cursor = &mut self.cursors[slot];
-        // Each new block's head asked for first: their loads overlap.
-        let mut last = u32::MAX;
-        for k in alive {
-            let i = index[*k as usize * width + slot];
-            if i / SKIP_INTERVAL != last {
-                cursor.prefetch(i);
-                last = i / SKIP_INTERVAL;
-            }
-        }
-        let row = &mut self.table[slot * n..(slot + 1) * n];
-        for k in alive {
-            let i = index[*k as usize * width + slot];
-            row[*k as usize] = cursor.locate_held(i, touch)?;
-        }
+        let (stride, column) = (index.stride, index.column[slot]);
+        let indexes = alive
+            .iter()
+            .map(|k| (*k as usize, index.index[*k as usize * stride + column]));
+        self.cursors[slot].locate_all(
+            indexes,
+            &mut self.table[slot * n..(slot + 1) * n],
+            &mut self.fetched,
+            touch,
+        )?;
         self.batch_located[slot] = true;
         Ok(())
     }
@@ -1686,15 +1692,14 @@ struct Walk<'s, 'a, T: Touch> {
     verify: Verify<'a>,
     /// Whether a span's candidates that reach its common terms' buckets
     /// are checked first, a batch at a time ([`Walk::stage_deferred`]);
-    /// the candidates waiting (their buckets, posting indexes and bounds
-    /// so far, one per scoring term each, and their posting indexes in the
-    /// span's slots); the places in a batch of those holding the span.
+    /// the candidates waiting (their buckets and posting indexes so far,
+    /// one per scoring term each); per span slot, the scoring term of its
+    /// term; the places in a batch of those holding the span.
     defer: bool,
     deferred: Vec<Deferred>,
     deferred_buckets: Vec<u8>,
     deferred_index: Vec<u32>,
-    deferred_bound: Vec<f32>,
-    deferred_span: Vec<u32>,
+    slot_sc: Vec<usize>,
     check_kept: Vec<u32>,
     /// A span's candidate at hand: its posting index in each span slot's
     /// term, and whether its positions were checked as it was staged.
@@ -3084,13 +3089,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             floor,
             low,
         });
+        // Its buckets and posting indexes (every span term scores, so these
+        // are its indexes in the span's terms too); its bounds are read
+        // again for the few that hold the span.
         self.deferred_buckets.extend_from_slice(&self.buckets);
         self.deferred_index.extend_from_slice(&self.held_index);
-        self.deferred_bound.extend_from_slice(&self.held_bound);
-        // Its posting indexes in the span's terms, found now: the terms'
-        // members are found in slot order.
-        self.span_indexes(local);
-        self.deferred_span.extend_from_slice(&self.span_index);
     }
 
     /// Checks the deferred candidates' positions together
@@ -3119,7 +3122,12 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let Verify::Span(check) = &mut self.verify else {
             unreachable!("a span's walk defers")
         };
-        let mut result = check.retain(&self.deferred_span, self.touch, &mut kept);
+        let index = Indexes {
+            index: &self.deferred_index,
+            stride: n,
+            column: &self.slot_sc,
+        };
+        let mut result = check.retain(index, self.touch, &mut kept);
         self.census(
             g,
             0,
@@ -3136,8 +3144,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 .copy_from_slice(&self.deferred_buckets[k * n..(k + 1) * n]);
             self.held_index
                 .copy_from_slice(&self.deferred_index[k * n..(k + 1) * n]);
-            self.held_bound
-                .copy_from_slice(&self.deferred_bound[k * n..(k + 1) * n]);
             self.span_checked = true;
             result = self.stage_later(g, d);
         }
@@ -3146,16 +3152,29 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.deferred = deferred;
         self.deferred_buckets.clear();
         self.deferred_index.clear();
-        self.deferred_bound.clear();
-        self.deferred_span.clear();
         self.check_kept = kept;
         result
     }
 
-    /// Stages deferred candidate `d`, checked and its state restored.
+    /// Stages deferred candidate `d`, checked and its buckets and posting
+    /// indexes restored: its rarer terms' bounds read again, its common
+    /// terms' buckets read.
     fn stage_later(&mut self, g: u32, d: Deferred) -> Result<()> {
         let geometry = self.geometry;
         let tid = move || geometry.tid_in(g as usize, d.local);
+        for i in 0..self.sc.len() {
+            let bucket = self.buckets[i];
+            if bucket != LATER && bucket != NO_BUCKET {
+                let t = self.sc[i].term;
+                let block = self.sc[i].block_of(self.held_index[i], self.mems[t].entry);
+                self.held_bound[i] = self.sc[i].floor_kept(block, bucket).1;
+            }
+        }
+        // Its posting indexes in the span's terms, staged with it.
+        self.span_index.clear();
+        for &i in &self.slot_sc {
+            self.span_index.push(self.held_index[i]);
+        }
         let reach = self.read_buckets_later(g, d.local, d.floor, d.low, tid)?;
         let staged = self.stage_rest(g, d.local, reach, d.length)?;
         self.keep_staged(g, d.local, staged)?;
@@ -3736,8 +3755,7 @@ pub(super) fn walk_into<'s, 'a>(
         deferred: Vec::new(),
         deferred_buckets: Vec::new(),
         deferred_index: Vec::new(),
-        deferred_bound: Vec::new(),
-        deferred_span: Vec::new(),
+        slot_sc: Vec::new(),
         check_kept: Vec::new(),
         span_index: Vec::new(),
         staged: Vec::new(),
@@ -3811,9 +3829,17 @@ pub(super) fn walk_into<'s, 'a>(
     }
     // A span's candidates reaching its common terms' buckets are checked
     // first, a batch at a time: by its plan, which a span without one
-    // lacks.
-    walk.defer = walk.common_terms
-        && matches!(&walk.verify, Verify::Span(check) if check.plan.is_some());
+    // lacks, at their posting indexes in the scoring terms, which a span
+    // with a term not scoring (or a term scoring not required) lacks.
+    if let Verify::Span(check) = &walk.verify
+        && check.plan.is_some()
+        && walk.common_terms
+        && walk.sc_required.iter().all(|r| *r)
+        && check.slots.iter().all(|t| walk.term_sc[*t] != usize::MAX)
+    {
+        walk.defer = true;
+        walk.slot_sc = check.slots.iter().map(|t| walk.term_sc[*t]).collect();
+    }
     if walk.common_terms {
         walk.sc_order = (0..walk.sc.len()).collect();
         walk.sc_order
