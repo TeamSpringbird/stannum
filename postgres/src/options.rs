@@ -124,7 +124,7 @@ pub fn init() {
             ),
             (
                 c"max_merged_segment_size",
-                c"Most input megabytes a merge takes; unset uses the 3 GiB format ceiling",
+                c"Most input megabytes a merge takes; unset uses the 16 GiB ceiling",
                 100,
                 i32::MAX,
             ),

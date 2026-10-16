@@ -713,6 +713,15 @@ fn expect_run_page(buffer: &Buffer, what: &str) {
     }
 }
 
+/// The pages a run of `bytes` takes. A run counts its pages in 32 bits,
+/// which merge selection keeps far from (see [`SEGMENT_BYTES_CAP`]); a
+/// longer blob fails here rather than being written with a wrapped count.
+fn run_pages(bytes: u64) -> u32 {
+    u32::try_from(bytes.div_ceil(CHAIN_CAPACITY as u64).max(1)).unwrap_or_else(|_| {
+        pgrx::error!("Stannum segment of {bytes} bytes exceeds the pages a run can count")
+    })
+}
+
 /// Writes a blob as a new chain of run pages, last page first so each page
 /// can carry its successor's block number.
 unsafe fn write_run(index: pg_sys::Relation, data: &[u8]) -> Run {
@@ -721,16 +730,7 @@ unsafe fn write_run(index: pg_sys::Relation, data: &[u8]) -> Run {
 
 /// Writes a run and returns its block numbers in order.
 unsafe fn write_run_with_map(index: pg_sys::Relation, data: &[u8]) -> (Run, Vec<u32>) {
-    // A run records its length in 32 bits. Merge selection keeps segments
-    // under `SEGMENT_BYTES_CAP`; a longer blob must fail here rather than be
-    // written with a wrapped length, which reads back as a corrupt segment.
-    if u32::try_from(data.len()).is_err() {
-        pgrx::error!(
-            "Stannum segment of {} bytes exceeds the 4 GiB a run can hold; \
-             lower stannum.build_segment_docs or maintenance_work_mem and rebuild",
-            data.len()
-        );
-    }
+    run_pages(data.len() as u64);
     unsafe {
         let chunks: Vec<&[u8]> = if data.is_empty() {
             vec![&[][..]]
@@ -759,7 +759,7 @@ unsafe fn write_run_with_map(index: pg_sys::Relation, data: &[u8]) -> (Run, Vec<
             Run {
                 first: next,
                 blocks: chunks.len() as u32,
-                bytes: data.len() as u32,
+                bytes: data.len() as u64,
                 last,
             },
             blocks,
@@ -1763,7 +1763,7 @@ pub(crate) unsafe fn release_spans_of_owner() {
 
 impl segment::source::Source for RunSource {
     fn len(&self) -> u64 {
-        u64::from(self.run.bytes)
+        self.run.bytes
     }
 
     fn read(&self, offset: u64, len: usize) -> segment::Result<Vec<u8>> {
@@ -1883,7 +1883,7 @@ impl segment::source::Source for RunSource {
         if self.holding.get() == 0 {
             return None;
         }
-        if offset >= u64::from(self.run.bytes) {
+        if offset >= self.run.bytes {
             return Some(Err(segment::Error::Truncated));
         }
         let page = (offset / CHAIN_CAPACITY as u64) as usize;
@@ -1951,7 +1951,7 @@ impl segment::source::Source for RunSource {
         }
         let Some(end) = offset
             .checked_add(len as u64)
-            .filter(|end| *end <= u64::from(self.run.bytes))
+            .filter(|end| *end <= self.run.bytes)
         else {
             return Some(Err(segment::Error::Truncated));
         };
@@ -2017,7 +2017,7 @@ impl RunSource {
     ) -> segment::Result<()> {
         let end = offset
             .checked_add(len as u64)
-            .filter(|end| *end <= u64::from(self.run.bytes))
+            .filter(|end| *end <= self.run.bytes)
             .ok_or(segment::Error::Truncated)?;
         // SAFETY: the transaction still holds the lock the planner or scan
         // took on the index; the relcache reference is scoped to this read.
@@ -2558,7 +2558,7 @@ unsafe fn drain_pending(index: pg_sys::Relation, meta: &mut Meta) {
                     bytes: pending
                         .run
                         .bytes
-                        .saturating_sub(freed.saturating_mul(CHAIN_CAPACITY as u32)),
+                        .saturating_sub(u64::from(freed) * CHAIN_CAPACITY as u64),
                     last: pending.run.last,
                 };
                 still_pending.push(pending);
@@ -3198,21 +3198,23 @@ fn smallest_entries(docs: &[u32], limit: usize) -> Vec<usize> {
     by_size
 }
 
-/// The most input bytes a merge takes. A run holds under 4 GiB, and a merged
-/// segment is at most about as large as its inputs.
-const SEGMENT_BYTES_CAP: u64 = 3 << 30;
+/// The most input bytes a merge takes; a merged segment is at most about as
+/// large as its inputs. A run's length has 64 bits on the meta page, so the
+/// bound is the work one merge may take on, not the format: 16 GiB holds a
+/// quarter of a 150M-row index (TIN's build gives four equal segments).
+const SEGMENT_BYTES_CAP: u64 = 16 << 30;
 
 /// `positions` without its largest members until the rest fit `cap` bytes
 /// (see [`segment_bytes_cap`]); `None` when fewer than two remain, which leaves the
 /// directory as it is. Segment selection counts documents, and at tens of
 /// millions of rows a tier's members outgrow what one run can record.
-fn within_run(mut positions: Vec<usize>, bytes: &[u32], cap: u64) -> Option<Vec<usize>> {
+fn within_run(mut positions: Vec<usize>, bytes: &[u64], cap: u64) -> Option<Vec<usize>> {
     positions.sort_by_key(|position| (bytes[*position], *position));
     let mut total = 0u64;
     let fit = positions
         .iter()
         .take_while(|position| {
-            total += u64::from(bytes[**position]);
+            total += bytes[**position];
             total <= cap
         })
         .count();
@@ -3280,7 +3282,7 @@ unsafe fn maintain(index: pg_sys::Relation, meta: &mut Meta, mut budget: u64) {
     loop {
         pgrx::check_for_interrupts!();
         let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
-        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        let bytes: Vec<u64> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
         match bounded_merge_candidates(&docs, factor, limit, budget)
             .and_then(|positions| within_run(positions, &bytes, cap))
         {
@@ -3324,13 +3326,13 @@ unsafe fn unlock_maintenance(index: pg_sys::Relation) {
 /// The caller holds the maintenance lock of `index` and no buffer lock.
 unsafe fn merge_unlocked(
     index: pg_sys::Relation,
-    mut select: impl FnMut(&[u32], &[u32]) -> Option<Vec<usize>>,
+    mut select: impl FnMut(&[u32], &[u64]) -> Option<Vec<usize>>,
 ) {
     loop {
         pgrx::check_for_interrupts!();
         let meta = unsafe { read_meta(index, false) }.1;
         let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
-        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        let bytes: Vec<u64> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
         let Some(mut positions) = select(&docs, &bytes) else {
             return;
         };
@@ -3354,7 +3356,7 @@ unsafe fn make_room(index: pg_sys::Relation, identity: u64) {
         return;
     }
     let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
-    let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+    let bytes: Vec<u64> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
     let Some(candidates) = room_candidates(&docs) else {
         return;
     };
@@ -3627,7 +3629,7 @@ pub unsafe fn promote_sealed(
         let retired = Run {
             first: state.head,
             blocks: chain.len() as u32,
-            bytes: state.bytes,
+            bytes: u64::from(state.bytes),
             last: *chain.last().expect("a chain has a head"),
         };
         let lengths: u64 = promoted.built.iter().map(|built| built.total_length).sum();
@@ -3975,12 +3977,7 @@ unsafe fn write_run_into(
     data: &[u8],
     free: &mut BTreeSet<u32>,
 ) -> (Run, Vec<u32>) {
-    if u32::try_from(data.len()).is_err() {
-        pgrx::error!(
-            "Stannum segment of {} bytes exceeds the 4 GiB a run can hold",
-            data.len()
-        );
-    }
+    run_pages(data.len() as u64);
     unsafe {
         let chunks: Vec<&[u8]> = if data.is_empty() {
             vec![&[][..]]
@@ -4030,7 +4027,7 @@ unsafe fn write_run_into(
             Run {
                 first: blocks[0],
                 blocks: chunks.len() as u32,
-                bytes: data.len() as u32,
+                bytes: data.len() as u64,
                 last: *blocks.last().expect("a run has a page"),
             },
             blocks,
@@ -4224,7 +4221,7 @@ unsafe fn merge_deferred(index: pg_sys::Relation) {
         reclaim_pending(index);
         let meta = read_meta(index, false).1;
         let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
-        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        let bytes: Vec<u64> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
         if let Some(positions) = merge_candidates(&docs, merge_tier_factor(), max_segments(index))
             .and_then(|positions| within_run(positions, &bytes, segment_bytes_cap(index)))
             .filter(|positions| {
@@ -4281,7 +4278,7 @@ pub unsafe fn merge_toward(index: pg_sys::Relation, request: MergeRequest) -> Me
             break;
         }
         let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
-        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        let bytes: Vec<u64> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
         let mut smallest = smallest_entries(&docs, target);
         smallest.truncate(fan_in);
         let Some(mut positions) = within_run(smallest, &bytes, cap) else {
@@ -5259,7 +5256,7 @@ pub unsafe fn bulk_delete(
                 let retired = Run {
                     first: state.head,
                     blocks: chain.len() as u32,
-                    bytes: state.bytes,
+                    bytes: u64::from(state.bytes),
                     last: *chain.last().expect("a chain has a head"),
                 };
                 if kept_docs == 0 {
@@ -5371,7 +5368,7 @@ unsafe fn maintain_directory(
         pgrx::check_for_interrupts!();
         let meta = unsafe { read_meta(index, false) }.1;
         let docs: Vec<u32> = meta.segments.iter().map(|entry| entry.docs).collect();
-        let bytes: Vec<u32> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+        let bytes: Vec<u64> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
         let due = merge
             .then(|| {
                 merge_candidates(&docs, factor, limit)
@@ -5596,7 +5593,7 @@ unsafe fn reclaim_pending(index: pg_sys::Relation) {
                     bytes: pending
                         .run
                         .bytes
-                        .saturating_sub(freed.saturating_mul(CHAIN_CAPACITY as u32)),
+                        .saturating_sub(u64::from(freed) * CHAIN_CAPACITY as u64),
                     last: pending.run.last,
                 };
             }
@@ -6431,30 +6428,31 @@ mod tests {
     }
 
     #[test]
-    fn a_merge_is_trimmed_to_what_one_run_can_hold() {
-        let gib = 1u32 << 30;
-        // Everything fits: the set is kept, smallest first.
+    fn a_merge_is_trimmed_to_the_segment_byte_cap() {
+        let gib = 1u64 << 30;
+        // Everything fits: the set is kept, smallest first. Runs past the
+        // 4 GiB a 32-bit length could record are ordinary.
         assert_eq!(
-            within_run(vec![2, 0, 1], &[gib, gib / 2, gib / 4], SEGMENT_BYTES_CAP),
+            within_run(vec![2, 0, 1], &[5 * gib, 4 * gib, gib], SEGMENT_BYTES_CAP),
             Some(vec![2, 1, 0])
         );
-        // The largest members go until the rest fit 3 GiB.
+        // The largest members go until the rest fit 16 GiB.
         assert_eq!(
             within_run(
                 vec![0, 1, 2, 3],
-                &[gib, gib, gib, 2 * gib],
+                &[5 * gib, 5 * gib, 5 * gib, 2 * gib],
                 SEGMENT_BYTES_CAP
             ),
-            Some(vec![0, 1, 2])
+            Some(vec![3, 0, 1])
         );
         // Fewer than two admissible members is no merge at all.
         assert_eq!(
-            within_run(vec![0, 1], &[2 * gib, 2 * gib], SEGMENT_BYTES_CAP),
+            within_run(vec![0, 1], &[9 * gib, 9 * gib], SEGMENT_BYTES_CAP),
             None
         );
         // An index's own ceiling trims sooner.
         assert_eq!(
-            within_run(vec![0, 1, 2], &[gib / 4, gib / 4, gib], u64::from(gib)),
+            within_run(vec![0, 1, 2], &[gib / 4, gib / 4, gib], gib),
             Some(vec![0, 1])
         );
         assert_eq!(within_run(vec![0], &[1], SEGMENT_BYTES_CAP), None);
