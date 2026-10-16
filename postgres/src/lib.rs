@@ -246,6 +246,64 @@ mod tests {
     }
 
     #[pg_test]
+    fn maintenance_leaves_the_segments_over_its_byte_ceiling_be() {
+        // A build ends with two segments; maintenance's byte ceiling (the
+        // index's max_merged_segment_size, here below either) then merges
+        // what inserts add among themselves and never into the build's,
+        // although the directory stays over its target (two, the build's
+        // initial_segment_count).
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(Some(1));
+        Spi::run(
+            "CREATE TABLE ceiling(id int, body text);
+             INSERT INTO ceiling SELECT n, (SELECT string_agg('w' || (n * k % 997), ' ')
+             FROM generate_series(1, 40) k) FROM generate_series(1, 2000) n;
+             SET LOCAL stannum.build_segment_docs = 100;
+             SET LOCAL stannum.merge_tier_factor = 64;
+             CREATE INDEX ceiling_idx ON ceiling USING stannum(body) WITH (initial_segment_count = 2);",
+        )
+        .unwrap();
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(None);
+        let current = "FROM stannum.segment_info('ceiling_idx')
+             WHERE kind = 'immutable' AND source_state = 'current'";
+        assert_eq!(value(&format!("SELECT count(*) {current}")), 2);
+        let built = value(&format!("SELECT sum(generation)::bigint {current}"));
+        let pages = value(&format!("SELECT min(total_pages)::bigint {current}"));
+        assert!(pages > 8, "{pages}");
+        // Below the smallest build segment's bytes, above three small ones'.
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(Some((pages as u64 - 1) * 4096));
+        Spi::run(
+            "SET LOCAL stannum.write_buffer_docs = 10;
+             INSERT INTO ceiling SELECT n, 'needle w' || n FROM generate_series(2001, 2030) n;
+             SELECT stannum.promote('ceiling_idx');",
+        )
+        .unwrap();
+        Spi::run("SELECT * FROM stannum.merge('ceiling_idx')").unwrap();
+        let again = Spi::get_one::<String>(
+            "SELECT coalesce(no_op_reason, 'merged') FROM stannum.merge('ceiling_idx')",
+        )
+        .unwrap()
+        .unwrap();
+        crate::storage::testing::SEGMENT_BYTES_CAP_OVERRIDE.set(None);
+        assert_eq!(
+            again,
+            "the smallest segments exceed max_merged_segment_size"
+        );
+        // The build's two, untouched, and one of what the inserts added.
+        assert_eq!(value(&format!("SELECT count(*) {current}")), 3);
+        assert_eq!(
+            value(&format!(
+                "SELECT sum(generation)::bigint {current} AND docs >= 500"
+            )),
+            built
+        );
+        assert_eq!(
+            value("SELECT count(*) FROM ceiling WHERE body ==> 'needle'"),
+            30
+        );
+        assert_clean("ceiling_idx");
+    }
+
+    #[pg_test]
     fn a_build_packs_its_segments_into_its_lowest_pages() {
         // Small build segments and a low merge cap (1.25 MiB, below the
         // smallest max_merged_segment_size): the build's tier merges retire
@@ -5866,6 +5924,93 @@ mod tests {
             1
         );
         assert_clean("build_cancel_idx");
+    }
+
+    #[pg_test]
+    fn a_merge_canceled_while_writing_its_output_leaves_only_orphans_and_runs_again() {
+        // A build ends with eight segments (the floor that keeps a small
+        // index whole is lifted); stannum.merge to one streams them and
+        // writes the merged run front to back, claiming a page at a time.
+        // A cancel at its third claim stops it with pages already written:
+        // they are referenced by nothing (VACUUM's orphans), its temporary
+        // files are gone, the directory is as it was, and the merge run
+        // again completes.
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(Some(1));
+        Spi::run(
+            "CREATE TABLE midwrite(id int, body text);
+             INSERT INTO midwrite SELECT n, (SELECT string_agg('w' || (n * k % 997), ' ')
+             FROM generate_series(1, 40) k) FROM generate_series(1, 2000) n;
+             SET LOCAL stannum.build_segment_docs = 100;
+             SET LOCAL stannum.merge_tier_factor = 64;
+             CREATE INDEX midwrite_idx ON midwrite USING stannum(body) WITH (initial_segment_count = 8);",
+        )
+        .unwrap();
+        crate::storage::testing::FINAL_SEGMENT_FLOOR_OVERRIDE.set(None);
+        let segments = "SELECT count(*) FROM stannum.segment_info('midwrite_idx')
+             WHERE kind = 'immutable' AND source_state = 'current'";
+        assert_eq!(value(segments), 8);
+        assert_clean("midwrite_idx");
+        let own_temp_files = "SELECT count(*) FROM pg_ls_tmpdir()
+             WHERE name LIKE 'pgsql_tmp' || pg_backend_pid() || '.%'";
+        use std::{cell::Cell, rc::Rc};
+        let claims = Rc::new(Cell::new(0u32));
+        let holdoff = Rc::new(Cell::new(u32::MAX));
+        let built = Rc::new(Cell::new(false));
+        let (c, h, b) = (claims.clone(), holdoff.clone(), built.clone());
+        crate::storage::testing::set_race_hook(Some(Box::new(move |name| {
+            if name == "run:claimed" {
+                c.set(c.get() + 1);
+                if c.get() == 3 {
+                    unsafe {
+                        h.set(pg_sys::InterruptHoldoffCount);
+                        pg_sys::QueryCancelPending = 1;
+                        pg_sys::InterruptPending = 1;
+                    }
+                }
+            }
+            if name == "maintenance:built" {
+                b.set(true);
+            }
+        })));
+        Spi::run(
+            "DO $$BEGIN
+            PERFORM * FROM stannum.merge('midwrite_idx', 1);
+            RAISE EXCEPTION 'the merge was not canceled';
+            EXCEPTION WHEN query_canceled THEN NULL;
+        END$$;",
+        )
+        .unwrap();
+        crate::storage::testing::set_race_hook(None);
+        assert_eq!(
+            (claims.get(), holdoff.get(), built.get()),
+            (3, 0, false),
+            "the merge stops at the claim that sees the cancel, its output under way"
+        );
+        assert_eq!(value(segments), 8);
+        assert_eq!(
+            value(own_temp_files),
+            0,
+            "the spill files close with the merge"
+        );
+        assert!(
+            !findings("midwrite_idx", true).is_empty(),
+            "the pages written before the cancel are orphans"
+        );
+        assert_only_orphans("midwrite_idx");
+        for query in ["w5", "w5 AND w7", "\"w5 w10\""] {
+            agreed_ids("midwrite", "midwrite_idx", query);
+        }
+        let index = unsafe { pgrx::PgRelation::open_with_name("midwrite_idx") }.unwrap();
+        unsafe { crate::storage::cleanup(index.as_ptr()) };
+        assert_clean("midwrite_idx");
+        Spi::run("SELECT * FROM stannum.merge('midwrite_idx', 1)").unwrap();
+        assert_eq!(value(segments), 1);
+        assert_eq!(value(own_temp_files), 0);
+        assert_eq!(
+            value("SELECT count(*) FROM midwrite WHERE body ==> 'w5'"),
+            value("SELECT count(*) FROM midwrite WHERE ' ' || body || ' ' LIKE '% w5 %'")
+        );
+        assert_clean("midwrite_idx");
     }
 
     #[pg_test]

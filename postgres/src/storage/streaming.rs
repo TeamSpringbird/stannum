@@ -226,6 +226,7 @@ impl RunWriter {
 
     /// A page claimed for the run.
     fn claim(&mut self) -> u32 {
+        super::race_point("run:claimed");
         pgrx::check_for_interrupts!();
         // SAFETY: the writer's index is open; one page lock at a time.
         unsafe {
