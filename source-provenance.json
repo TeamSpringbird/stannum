@@ -1596,6 +1596,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for the hyperthread-paired replay A/B of several builds (one core's two hyperthreads at once, beside one alone)."
     },
+    "benchmarks/aws/htpair_gate.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the paired-core keep gate over a hyperthread-paired replay run (median of per-round paired throughput ratios per style, geomean and targeted-style rules)."
+    },
     "benchmarks/aws/htpair_summary.py": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the summary of a hyperthread-paired replay run (pair vs single per arm, paired-core throughput per compared pair)."

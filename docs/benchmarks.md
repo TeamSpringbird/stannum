@@ -354,9 +354,10 @@ per-thread counts are Linux only.
 
 `benchmarks/aws/devbox-htpair-ab.sh` runs it for several builds on one
 devbox: each arm a tree (`--branch`), a dump directory and optionally an
-x86-64 level for the whole build (through
-`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, which keeps the link
-flag a plain `RUSTFLAGS` drops), built in its own target directory; one
+x86-64 level (`v4`: the workspace's crates through `script/rustc-cpu-level`,
+as `script/install-release` builds the loader's v4 build; `v4all`: the whole
+build through `CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, which keeps
+the link flag a plain `RUSTFLAGS` drops), built in its own target directory; one
 process per arm and round, rounds rotated and reversed in turn;
 `benchmarks/aws/htpair_summary.py` then prints the pair-vs-single table per
 arm and, per compared pair, the paired core's throughput change beside the

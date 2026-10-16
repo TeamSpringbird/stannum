@@ -62,8 +62,10 @@ for spec in "${arms[@]}"; do
   all=; case "${level:-}" in *all) level=${level%all}; all=1 ;; esac
   flags=$LINK; [ -n "${level:-}" ] && flags="-C target-cpu=x86-64-$level $LINK"
   if [ -n "${level:-}" ] && [ -z "$all" ] && [ -x $src/script/rustc-cpu-level ]; then
-    # As script/install-release builds a level: the workspace's crates only.
-    (cd $src && RUSTC_WORKSPACE_WRAPPER=$src/script/rustc-cpu-level STANNUM_RUSTC_TARGET_CPU=x86-64-$level \
+    # As script/install-release builds a level: the workspace's crates only,
+    # through RUSTC_WRAPPER (not hashed into -C metadata, so names match the baseline's).
+    (cd $src && RUSTC_WRAPPER=$src/script/rustc-cpu-level STANNUM_RUSTC_ROOT=$(cd $src && pwd -P) \
+      STANNUM_RUSTC_TARGET_CPU=x86-64-$level \
       cargo build --release -p bench --bin tnsreplay --target-dir /work/t-$name) > $OUT/build-$name.log 2>&1
   elif [ -n "${level:-}" ]; then
     (cd $src && env "$FV=$flags" cargo build --release -p bench --bin tnsreplay --target-dir /work/t-$name) > $OUT/build-$name.log 2>&1
