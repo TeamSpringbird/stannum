@@ -59,7 +59,11 @@ for spec in "${arms[@]}"; do
   src=$(eval echo \$SRC$n)
   [ -d "$DATA/$dump" ] || { step "arm $name: no dump $DATA/$dump"; exit 1; }
   flags=$LINK; [ -n "${level:-}" ] && flags="-C target-cpu=x86-64-$level $LINK"
-  if [ -n "${level:-}" ]; then
+  if [ -n "${level:-}" ] && [ -x $src/script/rustc-cpu-level ]; then
+    # As script/install-release builds a level: the workspace's crates only.
+    (cd $src && RUSTC_WORKSPACE_WRAPPER=$src/script/rustc-cpu-level STANNUM_RUSTC_TARGET_CPU=x86-64-$level \
+      cargo build --release -p bench --bin tnsreplay --target-dir /work/t-$name) > $OUT/build-$name.log 2>&1
+  elif [ -n "${level:-}" ]; then
     (cd $src && env "$FV=$flags" cargo build --release -p bench --bin tnsreplay --target-dir /work/t-$name) > $OUT/build-$name.log 2>&1
   else
     (cd $src && cargo build --release -p bench --bin tnsreplay --target-dir /work/t-$name) > $OUT/build-$name.log 2>&1
