@@ -133,9 +133,12 @@ check_pgo() {
 target_dir() { if [ "$1" = native ] || [ "$1" = x86-64 ]; then echo "$target_root"; else echo "$target_root/$1"; fi; }
 
 # build_env LEVEL: the environment of cargo for a build at LEVEL, into ENV.
-# A level other than the baseline goes through script/rustc-cpu-level: a
-# per-target RUSTFLAGS would compile build scripts and proc macros for it
-# too, which then fault on a build host without it.
+# A level other than the baseline goes through script/rustc-cpu-level, a
+# RUSTC_WRAPPER that compiles the workspace's crates for it: a per-target
+# RUSTFLAGS would compile build scripts and proc macros for it too, which
+# then fault on a build host without it, and --target or
+# RUSTC_WORKSPACE_WRAPPER would change the crates' -C metadata, and so every
+# function's name, which PGO profiles go by.
 build_env() {
     local rustflags
     rustflags=$(flags "$1")
@@ -143,10 +146,13 @@ build_env() {
     [ -z "$rustflags" ] || ENV+=("$flags_var=$rustflags")
     case "$1" in
         native|x86-64) ;;
-        *) ENV+=(RUSTC_WORKSPACE_WRAPPER="$ROOT/script/rustc-cpu-level" STANNUM_RUSTC_TARGET_CPU="$1") ;;
+        *)
+            [ -z "${RUSTC_WRAPPER:-}${RUSTC_WORKSPACE_WRAPPER:-}" ] ||
+                fail "RUSTC_WRAPPER or RUSTC_WORKSPACE_WRAPPER is set; a build for $1 sets its own"
+            ENV+=(RUSTC_WRAPPER="$ROOT/script/rustc-cpu-level" STANNUM_RUSTC_ROOT="$(pwd -P)"
+                  STANNUM_RUSTC_TARGET_CPU="$1") ;;
     esac
 }
-[ -z "${RUSTC_WORKSPACE_WRAPPER:-}" ] || fail "RUSTC_WORKSPACE_WRAPPER is set; builds for a CPU level set their own"
 
 pkglibdir=$("$pg_config" --pkglibdir)
 extdir=$("$pg_config" --sharedir)/extension
@@ -202,6 +208,20 @@ cmp -s "$work/loader/symbols.txt" "$work/loader/symbols-v4.txt" ||
     fail "the builds export different symbols: diff $work/loader/symbols.txt $work/loader/symbols-v4.txt"
 if grep -q '^?' "$work/loader/symbols.txt"; then
     fail "weak or indirect exported functions: $(grep '^?' "$work/loader/symbols.txt" | tr '\n' ' ')"
+fi
+# The builds must name their functions alike (the same -C metadata), or no
+# PGO profile could apply to both: count the engine's and the segment
+# crate's mangled names they share (inlining differs, so not all).
+rust_names() {
+    nm --defined-only "$1" 2>/dev/null |
+        awk '$3 ~ /^_ZN(6engine|7segment)/ || $3 ~ /^_R.*_(6engine|7segment)/ { print $3 }' | sort -u
+}
+rust_names "$base$pkglibdir/stannum.so" > "$work/loader/names.txt"
+rust_names "$v4$pkglibdir/stannum.so" > "$work/loader/names-v4.txt"
+shared=$(comm -12 "$work/loader/names.txt" "$work/loader/names-v4.txt" | wc -l | tr -d ' ')
+echo "== builds: $shared of $(wc -l < "$work/loader/names.txt" | tr -d ' ') engine and segment functions named alike"
+if [ -s "$work/loader/names.txt" ] && [ "$shared" -eq 0 ]; then
+    fail "the builds name their functions differently (another -C metadata): no PGO profile applies to both"
 fi
 # Every C function the SQL names must be forwarded.
 sed -n "s/.*'MODULE_PATHNAME', *'\([A-Za-z0-9_]*\)'.*/\1/p" "$base$extdir"/*.sql | sort -u > "$work/loader/sql-symbols.txt"

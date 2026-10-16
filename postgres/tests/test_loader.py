@@ -153,28 +153,41 @@ class LoaderChoiceTests(unittest.TestCase):
 
 
 class CpuLevelWrapperTests(unittest.TestCase):
-    """script/rustc-cpu-level, the RUSTC_WORKSPACE_WRAPPER of builds for a CPU level: the
-    workspace's crates get -C target-cpu, and nothing that runs on the build host does."""
+    """script/rustc-cpu-level, the RUSTC_WRAPPER of builds for a CPU level: the workspace's
+    crates get -C target-cpu, and nothing else (dependencies, and what runs on the build host)."""
 
-    def rustc_args(self, *args, level='x86-64-v4'):
+    def rustc_args(self, *args, manifest=ROOT / 'engine', level='x86-64-v4'):
         with tempfile.TemporaryDirectory() as tmp:
             fake = Path(tmp) / 'rustc'
             fake.write_text('#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n')
             fake.chmod(0o755)
-            env = dict(os.environ, STANNUM_RUSTC_TARGET_CPU=level)
+            env = dict(os.environ, STANNUM_RUSTC_TARGET_CPU=level, STANNUM_RUSTC_ROOT=str(ROOT))
+            env.pop('CARGO_MANIFEST_DIR', None)
+            if manifest is not None:
+                env['CARGO_MANIFEST_DIR'] = str(manifest)
             return subprocess.run([str(ROOT / 'script' / 'rustc-cpu-level'), str(fake), *args], env=env,
                                   capture_output=True, text=True, check=True).stdout.splitlines()
 
     def test_workspace_crates_are_compiled_for_the_level(self):
         for crate_type in ('lib', 'cdylib', 'bin', 'rlib'):
-            args = self.rustc_args('--crate-name', 'engine', '--crate-type', crate_type, 'src/lib.rs')
-            self.assertEqual(args[-2:], ['-C', 'target-cpu=x86-64-v4'], crate_type)
+            for member in ('engine', 'postgres', 'bench'):
+                args = self.rustc_args('--crate-name', 'x', '--crate-type', crate_type, 'src/lib.rs',
+                                       manifest=ROOT / member)
+                self.assertEqual(args[-2:], ['-C', 'target-cpu=x86-64-v4'], (crate_type, member))
 
     def test_what_runs_on_the_build_host_is_not(self):
         for args in (['--crate-name', 'build_script_build', '--crate-type', 'bin', 'build.rs'],
-                     ['--crate-name', 'derive', '--crate-type', 'proc-macro', 'src/lib.rs'],
-                     ['-vV'], ['-', '--crate-name', '___', '--print=cfg']):
+                     ['--crate-name', 'derive', '--crate-type', 'proc-macro', 'src/lib.rs']):
             self.assertNotIn('target-cpu=x86-64-v4', self.rustc_args(*args), args)
+        for args in (['-vV'], ['-', '--crate-name', '___', '--print=cfg']):
+            self.assertNotIn('target-cpu=x86-64-v4', self.rustc_args(*args, manifest=None), args)
+
+    def test_dependencies_are_not(self):
+        # A dependency's manifest is in cargo's registry or git checkouts, never in the repository
+        # (a prefix of the root's name is not inside it either).
+        for manifest in (Path.home() / '.cargo/registry/src/x/hashbrown-0.16.1', Path(str(ROOT) + '-other/engine')):
+            args = self.rustc_args('--crate-name', 'dep', '--crate-type', 'lib', 'src/lib.rs', manifest=manifest)
+            self.assertNotIn('target-cpu=x86-64-v4', args, manifest)
 
 
 if __name__ == '__main__':

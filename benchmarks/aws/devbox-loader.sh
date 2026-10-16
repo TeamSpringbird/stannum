@@ -89,7 +89,7 @@ save
 # --- the kernels in an x86-64-v4 build ---------------------------------------------
 if [ "$KERNELS" = 1 ]; then
   for l in scalar avx2 avx512; do
-    RUSTC_WORKSPACE_WRAPPER=$SRC1/script/rustc-cpu-level STANNUM_RUSTC_TARGET_CPU=x86-64-v4 \
+    RUSTC_WRAPPER=$SRC1/script/rustc-cpu-level STANNUM_RUSTC_ROOT=$SRC1 STANNUM_RUSTC_TARGET_CPU=x86-64-v4 \
       STANNUM_KERNELS=$l STANNUM_EXPECT_KERNELS=$l \
       cargo test --release -p engine -p segment --target-dir /work/t-kernels-v4 > "$L/kernels-v4-$l.txt" 2>&1
     step "loader: v4 build, kernels $l: exit $? $(grep -E '^test result' "$L/kernels-v4-$l.txt" | awk '{p += $4; f += $6} END {print p " passed, " f " failed"}')"
