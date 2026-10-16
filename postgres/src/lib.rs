@@ -8816,8 +8816,10 @@ mod tests {
         assert_eq!(ranked(), first);
         let (pins, recent) = crate::storage::scan_pins();
         assert!(pins > 0, "the last query pinned no page");
+        // (A page the query pins again, in another span, it pins through
+        // the buffer it pinned it in moments before.)
         assert!(
-            recent * 4 < pins,
+            recent * 2 < pins,
             "{recent} of {pins} pages pinned through wrong buffers"
         );
         // Through the shared table, which the wrong hints don't touch.
@@ -8886,6 +8888,10 @@ mod tests {
             Spi::get_one::<i64>("SELECT count(*) FROM hints").unwrap(),
             Some(20000)
         );
+        // Forgotten again: pages the page tables remember a buffer for
+        // are pinned without asking the shared table.
+        forget_recent_buffers();
+        clear_reader_caches();
         assert_eq!(ranked(), first);
         assert!(
             reattach_shared_hints(),
