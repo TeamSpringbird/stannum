@@ -1,0 +1,25 @@
+#!/bin/sh
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+# The RUSTC_WORKSPACE_WRAPPER of a build for an x86-64 CPU level
+# (script/install-release): runs rustc with -C target-cpu=$STANNUM_RUSTC_TARGET_CPU
+# for the workspace's crates, and as given for build scripts, proc macros and
+# rustc's probes, which run on the build host, a CPU that may lack the level
+# (a per-target RUSTFLAGS reaches those too when cargo has no --target, and
+# --target would change every crate's metadata, so no PGO profile trained on
+# the baseline build would name the level's functions). Dependencies outside
+# the workspace are not wrapped: they keep the baseline, but what they
+# instantiate in the workspace's crates (hash maps, iterators) is compiled
+# for the level.
+#
+#   RUSTC_WORKSPACE_WRAPPER=script/rustc-cpu-level STANNUM_RUSTC_TARGET_CPU=x86-64-v4 cargo build ...
+set -eu
+rustc=$1
+shift
+case " $* " in
+    *" --crate-name build_script_"* | *" --crate-type proc-macro "* | *" -vV "* | *" --print"* | *" -V "*)
+        exec "$rustc" "$@" ;;
+esac
+exec "$rustc" "$@" -C "target-cpu=${STANNUM_RUSTC_TARGET_CPU:?STANNUM_RUSTC_TARGET_CPU names the CPU level}"

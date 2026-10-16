@@ -15,7 +15,8 @@
 #   the maintenance launcher through the loader, and the same answers;
 # - the conformance suite under the build the CPU picks and under the baseline;
 # - KERNELS=1 (default): the engine and segment tests of an x86-64-v4 build
-#   at each forced kernel level (scalar, avx2, avx512).
+#   (as install-release builds it, through script/rustc-cpu-level) at each
+#   forced kernel level (scalar, avx2, avx512).
 #
 #   devbox.sh --branch B --type c7i.2xlarge --cmd-file benchmarks/aws/devbox-loader.sh
 #
@@ -88,7 +89,7 @@ save
 # --- the kernels in an x86-64-v4 build ---------------------------------------------
 if [ "$KERNELS" = 1 ]; then
   for l in scalar avx2 avx512; do
-    CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C target-cpu=x86-64-v4" \
+    RUSTC_WORKSPACE_WRAPPER=$SRC1/script/rustc-cpu-level STANNUM_RUSTC_TARGET_CPU=x86-64-v4 \
       STANNUM_KERNELS=$l STANNUM_EXPECT_KERNELS=$l \
       cargo test --release -p engine -p segment --target-dir /work/t-kernels-v4 > "$L/kernels-v4-$l.txt" 2>&1
     step "loader: v4 build, kernels $l: exit $? $(grep -E '^test result' "$L/kernels-v4-$l.txt" | awk '{p += $4; f += $6} END {print p " passed, " f " failed"}')"

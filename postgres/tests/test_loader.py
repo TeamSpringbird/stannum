@@ -152,5 +152,30 @@ class LoaderChoiceTests(unittest.TestCase):
         self.assertEqual(self.choose('--real', '--hide', 'avx512f')[0], 'x86-64')
 
 
+class CpuLevelWrapperTests(unittest.TestCase):
+    """script/rustc-cpu-level, the RUSTC_WORKSPACE_WRAPPER of builds for a CPU level: the
+    workspace's crates get -C target-cpu, and nothing that runs on the build host does."""
+
+    def rustc_args(self, *args, level='x86-64-v4'):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = Path(tmp) / 'rustc'
+            fake.write_text('#!/bin/sh\nfor a in "$@"; do echo "$a"; done\n')
+            fake.chmod(0o755)
+            env = dict(os.environ, STANNUM_RUSTC_TARGET_CPU=level)
+            return subprocess.run([str(ROOT / 'script' / 'rustc-cpu-level'), str(fake), *args], env=env,
+                                  capture_output=True, text=True, check=True).stdout.splitlines()
+
+    def test_workspace_crates_are_compiled_for_the_level(self):
+        for crate_type in ('lib', 'cdylib', 'bin', 'rlib'):
+            args = self.rustc_args('--crate-name', 'engine', '--crate-type', crate_type, 'src/lib.rs')
+            self.assertEqual(args[-2:], ['-C', 'target-cpu=x86-64-v4'], crate_type)
+
+    def test_what_runs_on_the_build_host_is_not(self):
+        for args in (['--crate-name', 'build_script_build', '--crate-type', 'bin', 'build.rs'],
+                     ['--crate-name', 'derive', '--crate-type', 'proc-macro', 'src/lib.rs'],
+                     ['-vV'], ['-', '--crate-name', '___', '--print=cfg']):
+            self.assertNotIn('target-cpu=x86-64-v4', self.rustc_args(*args), args)
+
+
 if __name__ == '__main__':
     unittest.main()

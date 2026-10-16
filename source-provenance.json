@@ -1623,6 +1623,10 @@
     "benchmarks/aws/devbox-loader.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file that builds the x86-64 loader with both builds and tests it on real hardware."
+    },
+    "script/rustc-cpu-level": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the RUSTC_WORKSPACE_WRAPPER that compiles the workspace's crates for an x86-64 CPU level."
     }
   }
 }

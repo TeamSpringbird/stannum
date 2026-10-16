@@ -104,11 +104,10 @@ profile() {
     fi
 }
 
-# flags LEVEL: rustc flags of a build at LEVEL (CPU level and PGO).
+# flags LEVEL: rustc flags of a build at LEVEL (PGO; the level itself is
+# script/rustc-cpu-level's, see build_env).
 flags() {
     local out="${!flags_var:-}" prof
-    out=${out# }
-    case "$1" in native|x86-64) ;; *) out="$out -C target-cpu=$1" ;; esac
     case "$pgo" in
         generate=*) out="$out -C profile-generate=${pgo#generate=}" ;;
         1|strict)
@@ -133,6 +132,22 @@ check_pgo() {
 
 target_dir() { if [ "$1" = native ] || [ "$1" = x86-64 ]; then echo "$target_root"; else echo "$target_root/$1"; fi; }
 
+# build_env LEVEL: the environment of cargo for a build at LEVEL, into ENV.
+# A level other than the baseline goes through script/rustc-cpu-level: a
+# per-target RUSTFLAGS would compile build scripts and proc macros for it
+# too, which then fault on a build host without it.
+build_env() {
+    local rustflags
+    rustflags=$(flags "$1")
+    ENV=(CARGO_TARGET_DIR="$(target_dir "$1")")
+    [ -z "$rustflags" ] || ENV+=("$flags_var=$rustflags")
+    case "$1" in
+        native|x86-64) ;;
+        *) ENV+=(RUSTC_WORKSPACE_WRAPPER="$ROOT/script/rustc-cpu-level" STANNUM_RUSTC_TARGET_CPU="$1") ;;
+    esac
+}
+[ -z "${RUSTC_WORKSPACE_WRAPPER:-}" ] || fail "RUSTC_WORKSPACE_WRAPPER is set; builds for a CPU level set their own"
+
 pkglibdir=$("$pg_config" --pkglibdir)
 extdir=$("$pg_config" --sharedir)/extension
 pgrx_args=(--package stannum --no-default-features --features "$features" --pg-config "$pg_config")
@@ -146,9 +161,8 @@ if [ ${#LEVELS[@]} = 1 ]; then
     else
         action=(install --release)
     fi
-    rustflags=$(flags "$level")
-    env ${rustflags:+"$flags_var=$rustflags"} CARGO_TARGET_DIR="$(target_dir "$level")" \
-        cargo pgrx "${action[@]}" "${pgrx_args[@]}" 2>&1 | tee "$log"
+    build_env "$level"
+    env "${ENV[@]}" cargo pgrx "${action[@]}" "${pgrx_args[@]}" 2>&1 | tee "$log"
     library=$stage$pkglibdir/stannum.so
     [ -f "$library" ] || library=$stage$pkglibdir/stannum.dylib
     check_pgo "$level" "$library" "$log"
@@ -162,9 +176,8 @@ rm -rf "$work"
 mkdir -p "$work/loader"
 for level in "${LEVELS[@]}"; do
     echo "== building $level"
-    rustflags=$(flags "$level")
-    env ${rustflags:+"$flags_var=$rustflags"} CARGO_TARGET_DIR="$(target_dir "$level")" \
-        cargo pgrx package "${pgrx_args[@]}" --out-dir "$work/$level" 2>&1 | tee "$work/build-$level.log"
+    build_env "$level"
+    env "${ENV[@]}" cargo pgrx package "${pgrx_args[@]}" --out-dir "$work/$level" 2>&1 | tee "$work/build-$level.log"
     [ -f "$work/$level$pkglibdir/stannum.so" ] || fail "$level: no $work/$level$pkglibdir/stannum.so"
     check_pgo "$level" "$work/$level$pkglibdir/stannum.so" "$work/build-$level.log"
 done
