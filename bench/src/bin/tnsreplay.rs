@@ -64,6 +64,12 @@
 //! (the same for every set and build of a correct walk). Sibling CPUs
 //! are in `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`;
 //! pinning and per-thread counts are Linux only (macOS counts the process).
+//! `--once` drops the untimed pass: each query is answered by one timed
+//! pass that starts from the caches the previous query left, as a
+//! server's queries do (use `--repeat 1`). Thread 0 prints each slice's
+//! window to stderr (`mark slice N threads T from NS to NS`, in
+//! `CLOCK_MONOTONIC`), to split a `perf record -k CLOCK_MONOTONIC` or a
+//! `perf stat -I` of the set's CPUs by slice.
 //!
 //! The dump comes from `script/dump-segments.py`; `--expect` takes
 //! `script/replay-oracle.py postgres` output (`--ranked-only` suffices).
@@ -136,6 +142,10 @@ struct Args {
     perf_ctl: Option<(PathBuf, PathBuf)>,
     /// `--cpus`: sets of CPUs, each measured with one pinned thread per CPU.
     cpus: Vec<Vec<usize>>,
+    /// `--once` (with `--cpus`): each query is answered once, by its timed
+    /// pass, with no untimed pass before it, so it starts from the caches
+    /// the previous query left, as a server's queries do.
+    once: bool,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -160,7 +170,7 @@ fn usage() -> ! {
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
          [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
-         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,...]"
+         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,... [--once]]"
     );
     std::process::exit(2)
 }
@@ -194,6 +204,7 @@ fn args() -> Args {
         plan: Vec::new(),
         perf_ctl: None,
         cpus: Vec::new(),
+        once: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -207,6 +218,7 @@ fn args() -> Args {
             "--limit" => a.limit = Some(value(&mut it).parse().unwrap_or_else(|_| usage())),
             "--keep" => a.keep = true,
             "--forget" => a.forget = true,
+            "--once" => a.once = true,
             "--full" => a.full = true,
             "--memory" => a.memory = true,
             "--seed" => a.seed = true,
@@ -1295,6 +1307,43 @@ struct PinnedSlice {
     digest: u64,
 }
 
+impl PinnedSlice {
+    /// Adds one counted query: its timed passes' counts and its answer.
+    fn count(&mut self, c0: [u64; 3], c1: [u64; 3], answer: &[(f32, Tid)]) {
+        self.queries += 1;
+        for (k, count) in self.counts.iter_mut().enumerate() {
+            *count += c1[k] - c0[k];
+        }
+        let mut h = rustc_hash::FxHasher::default();
+        for (score, tid) in answer {
+            std::hash::Hash::hash(&(score.to_bits(), tid.block, tid.offset), &mut h);
+        }
+        self.digest = self.digest.wrapping_add(std::hash::Hasher::finish(&h));
+    }
+}
+
+/// `CLOCK_MONOTONIC` in nanoseconds (perf's `-k CLOCK_MONOTONIC` clock);
+/// 0 where it is not Linux.
+fn monotonic_ns() -> u64 {
+    #[cfg(target_os = "linux")]
+    {
+        #[repr(C)]
+        struct Timespec {
+            sec: i64,
+            nsec: i64,
+        }
+        unsafe extern "C" {
+            fn clock_gettime(clock: i32, tp: *mut Timespec) -> i32;
+        }
+        let mut ts = Timespec { sec: 0, nsec: 0 };
+        // SAFETY: CLOCK_MONOTONIC (1) into a timespec.
+        if unsafe { clock_gettime(1, &mut ts) } == 0 {
+            return ts.sec as u64 * 1_000_000_000 + ts.nsec as u64;
+        }
+    }
+    0
+}
+
 /// Pins this thread to `cpu` (Linux: `sched_setaffinity`); false where it
 /// cannot.
 fn pin_to(cpu: usize) -> bool {
@@ -1337,6 +1386,7 @@ fn pinned_thread(
         let mut slice = PinnedSlice::default();
         start.wait();
         let began = Instant::now();
+        let began_ns = monotonic_ns();
         let mut i = 0usize;
         loop {
             if i == len {
@@ -1351,6 +1401,25 @@ fn pinned_thread(
             i += 1;
             reader.full.set(fulls[at]);
             let text = &trace[at].text;
+            if args.once {
+                if args.forget {
+                    reader.forget();
+                }
+                let c0 = process_counters();
+                let answer = match reader.scorer(text) {
+                    Ok(scorer) => reader.ranked(&scorer, args.k),
+                    Err(_) => None,
+                };
+                let c1 = process_counters();
+                let Some(answer) = answer else {
+                    slice.unsupported += counted as u64;
+                    continue;
+                };
+                if counted {
+                    slice.count(c0, c1, &answer);
+                }
+                continue;
+            }
             let Ok(scorer) = reader.scorer(text) else {
                 slice.unsupported += counted as u64;
                 continue;
@@ -1372,16 +1441,16 @@ fn pinned_thread(
             }
             let c1 = process_counters();
             if counted {
-                slice.queries += 1;
-                for (k, count) in slice.counts.iter_mut().enumerate() {
-                    *count += c1[k] - c0[k];
-                }
-                let mut h = rustc_hash::FxHasher::default();
-                for (score, tid) in &answer {
-                    std::hash::Hash::hash(&(score.to_bits(), tid.block, tid.offset), &mut h);
-                }
-                slice.digest = slice.digest.wrapping_add(std::hash::Hasher::finish(&h));
+                slice.count(c0, c1, &answer);
             }
+        }
+        if t == 0 {
+            // For splitting a `perf record -k CLOCK_MONOTONIC` of the set's
+            // CPUs by slice: every counted query ran inside this window.
+            eprintln!(
+                "mark slice {n} threads {threads} from {began_ns} to {}",
+                monotonic_ns()
+            );
         }
         out.push(slice);
     }
