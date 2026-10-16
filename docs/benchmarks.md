@@ -296,6 +296,51 @@ builds and three PGO trainings per architecture and PostgreSQL version,
 three times the library size, and a symbol list to keep in step. That is
 not worth 2%.
 
+## The hyperthread-paired replay
+
+A server's backends share each core with a sibling hyperthread. In the
+150M server run at layout 14, a query ran about as many instructions as in
+the offline replay (0.88 to 1.03 times), but 1.69 to 2.05 times its cycles
+per thread: the core retired about 3.0 to 3.4 instructions a cycle for its
+two threads, against 2.8 to 3.2 for the replay's one. So the server's
+throughput follows instructions, and a single-thread replay A/B
+under-credits a change that removes instructions without removing cycles
+(cheap, high-IPC work the sibling would have used) and over-credits one that
+only hides latency (stalls the sibling would have filled).
+
+`tnsreplay --cpus C/C,S` measures the core instead: over one load of the
+dump, the plan's slices run on CPU C alone, then on C and its sibling S at
+once, a pinned thread each with its own segment readers, each thread over
+the whole slice from its own offset. Each query takes an untimed pass, then
+`--repeat` timed ones (`--forget` before each), counted by the thread's own
+`perf_event_open` group. A thread done with its slice keeps replaying it,
+uncounted, until its sibling is done too, so every counted query ran beside
+a busy sibling. Per slice it prints instructions, cycles and branch misses
+per query, the core's IPC, its queries per gigacycle (each thread's queries
+over its own cycles, summed: the core's throughput at a fixed clock) and a
+digest of the answers, which every set and build of a correct walk shares.
+A set can be any list of CPUs (`2,10,3,11,4,12,5,13`: four cores' eight
+hyperthreads, as the i7i server runs eight backends). Sibling CPUs are in
+`/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`; pinning and
+per-thread counts are Linux only.
+
+`benchmarks/aws/devbox-htpair-ab.sh` runs it for several builds on one
+devbox: each arm a tree (`--branch`), a dump directory and optionally an
+x86-64 level for the whole build (through
+`CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS`, which keeps the link
+flag a plain `RUSTFLAGS` drops), built in its own target directory; one
+process per arm and round, rounds rotated and reversed in turn;
+`benchmarks/aws/htpair_summary.py` then prints the pair-vs-single table per
+arm and, per compared pair, the paired core's throughput change beside the
+single thread's cycles and instructions.
+
+```sh
+export AWS_PROFILE=springbird-development DEVBOX_DUMP_PREFIX=replay-dumps/<prefix>/
+nohup benchmarks/aws/devbox.sh --branch BASE --branch CANDIDATE --dump --disk 120 --hours 2 \
+  --type m7i.4xlarge --spot-only --env ARMS=A:1:dump150m,B:2:dump150m,Bv4:2:dump150m:v4 \
+  --env COMPARE=B:A,Bv4:B --cmd-file benchmarks/aws/devbox-htpair-ab.sh > devbox.log 2>&1 &
+```
+
 ## Matching TIN v1.0.6's published setup
 
 Benchmarks v2 reproduces the setup of PlanetScale's

@@ -19,6 +19,9 @@ benchmarks/aws/devbox.sh --branch my-branch --dump --cmd 'cargo build --release 
 benchmarks/aws/devbox.sh --branch base --branch candidate --dump --cmd-file benchmarks/aws/devbox-replay-ab.sh
 # build options of one tree: plain, PGO, x86-64-v3/v4 + PGO, PGO + BOLT (an hour: on-demand)
 benchmarks/aws/devbox.sh --branch my-branch --dump --on-demand --cmd-file benchmarks/aws/devbox-bolt-variants.sh
+# builds gated on one core's two hyperthreads at once (docs/benchmarks.md#the-hyperthread-paired-replay)
+benchmarks/aws/devbox.sh --branch base --branch candidate --dump --type m7i.4xlarge --spot-only \
+  --env ARMS=A:1:dump150m,B:2:dump150m --env COMPARE=B:A --cmd-file benchmarks/aws/devbox-htpair-ab.sh
 benchmarks/aws/devbox.sh --list                # live devboxes
 benchmarks/aws/devbox.sh --terminate ID|all    # kill one, or every devbox
 benchmarks/aws/devbox.sh --ledger              # instance-hours and cost so far
