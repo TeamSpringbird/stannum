@@ -14,7 +14,7 @@ import sys
 
 ROOT = Path(__file__).resolve().parents[1]
 MANIFEST = ROOT / "source-provenance.json"
-SOURCE_SUFFIXES = {".rs", ".py", ".sh", ".sql", ".pest", ".toml", ".yml", ".yaml", ".control"}
+SOURCE_SUFFIXES = {".rs", ".c", ".h", ".py", ".sh", ".sql", ".pest", ".toml", ".yml", ".yaml", ".control"}
 OWNERS = {
     "planetscale": ["Copyright (C) 2026 PlanetScale"],
     "ben": ["Copyright (C) 2026 Ben Weis <ben@springbird.app>"],
@@ -37,7 +37,7 @@ def notice(path, owner):
     suffix = Path(path).suffix
     if suffix == ".md":
         return ("<!--\n" + "\n".join(lines) + "\n-->\n\n").encode()
-    prefix = "//" if suffix in {".rs", ".pest"} else "--" if suffix == ".sql" else "#"
+    prefix = "//" if suffix in {".rs", ".pest", ".c", ".h"} else "--" if suffix == ".sql" else "#"
     return ("\n".join(prefix + (" " + line if line else "") for line in lines) + "\n\n").encode()
 
 

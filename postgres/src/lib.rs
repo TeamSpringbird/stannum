@@ -4,7 +4,8 @@
 // See LICENSE in the repository root for license terms.
 
 use engine::bm25;
-use pgrx::pg_guard;
+use pgrx::{GucContext, GucFlags, GucRegistry, GucSetting, pg_guard};
+use std::ffi::{CStr, CString};
 
 ::pgrx::pg_module_magic!(name);
 
@@ -66,8 +67,52 @@ fn check_for_interrupts(site: &'static str) {
     pgrx::check_for_interrupts!();
 }
 
+/// The CPU level this library was compiled for, as `SHOW stannum.cpu_level`
+/// reports it: on x86-64 Linux, which of the loader's two builds runs
+/// (`x86-64` or `x86-64-v4`; postgres/loader/loader.c), and `x86-64-v2` or
+/// `-v3` for builds for those levels.
+pub const CPU_LEVEL: &CStr = if cfg!(target_arch = "aarch64") {
+    c"aarch64"
+} else if cfg!(all(
+    target_feature = "avx512f",
+    target_feature = "avx512bw",
+    target_feature = "avx512cd",
+    target_feature = "avx512dq",
+    target_feature = "avx512vl"
+)) {
+    c"x86-64-v4"
+} else if cfg!(all(
+    target_feature = "avx2",
+    target_feature = "bmi2",
+    target_feature = "fma",
+    target_feature = "movbe"
+)) {
+    c"x86-64-v3"
+} else if cfg!(all(
+    target_feature = "sse4.2",
+    target_feature = "popcnt",
+    target_feature = "cmpxchg16b"
+)) {
+    c"x86-64-v2"
+} else if cfg!(target_arch = "x86_64") {
+    c"x86-64"
+} else {
+    c"portable"
+};
+
+static CPU_LEVEL_SETTING: GucSetting<Option<CString>> =
+    GucSetting::<Option<CString>>::new(Some(CPU_LEVEL));
+
 #[pg_guard]
 pub extern "C-unwind" fn _PG_init() {
+    GucRegistry::define_string_guc(
+        c"stannum.cpu_level",
+        c"The CPU level the loaded Stannum library was compiled for",
+        c"On x86-64 Linux, the loader runs the x86-64-v4 build on CPUs with all of x86-64-v4 and the baseline x86-64 build elsewhere; the word kernels choose AVX2 or AVX-512 at runtime in either.",
+        &CPU_LEVEL_SETTING,
+        GucContext::Internal,
+        GucFlags::default(),
+    );
     tinql::limits::set_stack_check(check_stack_depth);
     segment::set_interrupt_check(check_for_interrupts);
     engine::set_interrupt_check(|| {
@@ -114,6 +159,24 @@ mod tests {
         ["ctid", "ordinal", "ctid+ordinal"]
             .iter()
             .any(|kind| plan.contains(&format!("\"Pruning\":\"{kind}\"")))
+    }
+
+    #[pg_test]
+    fn cpu_level_names_the_build() {
+        let level = Spi::get_one::<String>("SHOW stannum.cpu_level").unwrap();
+        assert_eq!(level.as_deref(), crate::CPU_LEVEL.to_str().ok());
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(level.as_deref(), Some("aarch64"));
+        #[cfg(all(target_arch = "x86_64", not(target_feature = "sse4.2")))]
+        assert_eq!(level.as_deref(), Some("x86-64"));
+        #[cfg(all(target_arch = "x86_64", target_feature = "avx512vl"))]
+        assert_eq!(level.as_deref(), Some("x86-64-v4"));
+        // Internal: reported, never set.
+        let context = Spi::get_one::<String>(
+            "SELECT context FROM pg_settings WHERE name = 'stannum.cpu_level'",
+        )
+        .unwrap();
+        assert_eq!(context.as_deref(), Some("internal"));
     }
 
     #[pg_test]

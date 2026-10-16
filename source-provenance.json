@@ -1595,6 +1595,34 @@
     "script/bolt-build": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: optimizes a built ELF's code layout with LLVM BOLT from a training run."
+    },
+    "postgres/loader/cpu_level.h": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the x86-64 loader's choice between the baseline and x86-64-v4 builds by CPUID and XCR0."
+    },
+    "postgres/loader/cpu_probe.c": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the x86-64 loader's CPU choice as a command, for tests and hosts."
+    },
+    "postgres/loader/loader.c": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: the x86-64 Linux loader that loads the baseline or x86-64-v4 build and forwards its symbols."
+    },
+    "postgres/tests/loader_shim.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a private-cluster test of the installed x86-64 loader under each of its settings."
+    },
+    "postgres/tests/test_loader.py": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: unit tests of the x86-64 loader's CPU choice against hand-built CPUs and rustc's feature list."
+    },
+    "script/install-release": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: builds and installs the release extension, on x86-64 Linux the loader with its two builds."
+    },
+    "benchmarks/aws/devbox-loader.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file that builds the x86-64 loader with both builds and tests it on real hardware."
     }
   }
 }

@@ -1,0 +1,219 @@
+#!/usr/bin/env bash
+# Copyright (C) 2026 Ben Weis <ben@springbird.app>
+#
+# See LICENSE in the repository root for license terms.
+
+# Builds the release extension for one PostgreSQL server and installs it
+# (docs/RELEASING.md#x86-64-builds-and-the-loader).
+#
+#   script/install-release [--pg-config PATH] [--features FEATURES] [--pgo MODE]
+#                          [--levels LEVELS] [--stage DIR]
+#
+# On x86-64 Linux, the default: two builds, the baseline (x86-64, which runs
+# anywhere) and one for x86-64-v4, installed as stannum-x86-64.so and
+# stannum-x86-64-v4.so, and the loader (postgres/loader/loader.c) as
+# stannum.so, which loads the v4 build on CPUs with all of x86-64-v4 and the
+# baseline elsewhere. The loader forwards every function symbol of the builds;
+# their lists must be equal, and the loader is built from them. Elsewhere
+# (aarch64, macOS): one build, `cargo pgrx install --release`, as always.
+#
+#   --pg-config  the server's pg_config (default: pg_config on PATH)
+#   --features   cargo features (default: pgMAJOR of that server)
+#   --levels     x86-64 only: "x86-64 x86-64-v4" (the loader; the default
+#                there), or one level (x86-64, x86-64-v3, x86-64-v4) built
+#                alone as stannum.so; `native`, the default elsewhere, is a
+#                plain build. STANNUM_LEVELS sets the default.
+#   --pgo        profile-guided builds (docs/benchmarks.md#profile-guided-builds):
+#                empty, none; 1, each build with its committed profile,
+#                benchmarks/pgo/<arch>.profdata, or <arch>-v4.profdata for the
+#                v4 build when there is one (else the baseline's), then
+#                script/pgo-check per build; strict, as 1, but a missing or
+#                stale profile fails; generate=DIR, instrumented builds whose
+#                backends write raw profiles under DIR.
+#   --stage DIR  build the package tree (paths as pg_config gives them) into
+#                DIR and install nothing.
+#
+# The baseline builds in the usual target directory, each other level in
+# target/<level>. Libraries are installed by rename, so backends keep what
+# they mapped; restart the server to run the new build. Needs nm and a C
+# compiler (CC, default cc) for the loader.
+set -euo pipefail
+
+ROOT=$(cd "$(dirname "$0")/.." && pwd)
+cd "$ROOT"
+
+usage() {
+    sed -n '/^# Builds the release/,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'
+    exit "${1:-2}"
+}
+fail() { echo "install-release: $*" >&2; exit 1; }
+
+pg_config=$(command -v pg_config || true) features='' pgo='' stage='' levels=${STANNUM_LEVELS:-}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --pg-config) pg_config=${2:?--pg-config needs a path}; shift 2 ;;
+        --features) features=${2:?--features needs a value}; shift 2 ;;
+        --pgo) pgo=$2; shift 2 ;;
+        --levels) levels=${2:?--levels needs a value}; shift 2 ;;
+        --stage) stage=${2:?--stage needs a directory}; shift 2 ;;
+        -h|--help) usage 0 ;;
+        *) usage ;;
+    esac
+done
+[ -n "$pg_config" ] || fail "no pg_config: put it on PATH or pass --pg-config"
+major=$("$pg_config" --version | sed -E 's/PostgreSQL ([0-9]+).*/\1/')
+features=${features:-pg$major}
+case "$pgo" in ''|1|strict|generate=?*) ;; *) fail "--pgo is empty, 1, strict or generate=DIR" ;; esac
+[ -z "$stage" ] || { mkdir -p "$stage" && stage=$(cd "$stage" && pwd); }
+
+# The toolchain rust-toolchain.toml pins, when no rustup proxy is on PATH.
+if ! command -v cargo >/dev/null 2>&1; then
+    channel=$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)
+    for bin in "${RUSTUP_HOME:-$HOME/.rustup}"/toolchains/"$channel"-*/bin; do
+        [ -x "$bin/cargo" ] && PATH="$bin:$PATH" && break
+    done
+fi
+host=$(rustc -vV | sed -n 's/^host: //p')
+arch=$(uname -m)
+if [ -z "$levels" ]; then
+    case "$host" in x86_64-unknown-linux-gnu) levels="x86-64 x86-64-v4" ;; *) levels=native ;; esac
+fi
+read -r -a LEVELS <<< "$levels"
+for level in "${LEVELS[@]}"; do
+    case "$level" in
+        native) [ ${#LEVELS[@]} = 1 ] || fail "native is a level of its own" ;;
+        x86-64|x86-64-v2|x86-64-v3|x86-64-v4)
+            [ "$host" = x86_64-unknown-linux-gnu ] || fail "$level is a level of x86-64 Linux builds; this is $host" ;;
+        *) fail "unknown level $level (x86-64, x86-64-v2, -v3, -v4 or native)" ;;
+    esac
+done
+if [ ${#LEVELS[@]} -gt 1 ] && [ "${LEVELS[*]}" != "x86-64 x86-64-v4" ]; then
+    fail "the loader loads x86-64 and x86-64-v4: --levels \"x86-64 x86-64-v4\" or one level"
+fi
+
+# Per-target flags: RUSTFLAGS would replace .cargo/config.toml's link flags.
+flags_var=CARGO_TARGET_$(echo "$host" | tr 'a-z-' 'A-Z_')_RUSTFLAGS
+target_root=${CARGO_TARGET_DIR:-$ROOT/target}
+
+# profile LEVEL: the committed profile a build at LEVEL uses, or nothing.
+profile() {
+    local own="" base="benchmarks/pgo/$arch.profdata"
+    case "$1" in x86-64-v*) own="benchmarks/pgo/$arch-${1#x86-64-}.profdata" ;; esac
+    if [ -n "$own" ] && [ -s "$own" ]; then echo "$own"
+    elif [ -s "$base" ]; then echo "$base"
+    fi
+}
+
+# flags LEVEL: rustc flags of a build at LEVEL (CPU level and PGO).
+flags() {
+    local out="${!flags_var:-}" prof
+    out=${out# }
+    case "$1" in native|x86-64) ;; *) out="$out -C target-cpu=$1" ;; esac
+    case "$pgo" in
+        generate=*) out="$out -C profile-generate=${pgo#generate=}" ;;
+        1|strict)
+            prof=$(profile "$1")
+            if [ -n "$prof" ]; then out="$out -C profile-use=$ROOT/$prof"
+            elif [ "$pgo" = strict ]; then fail "--pgo strict: no benchmarks/pgo/$arch.profdata"
+            else echo "warning: no benchmarks/pgo/$arch.profdata; building $1 without PGO" >&2
+            fi ;;
+    esac
+    echo "$out"
+}
+
+# check_pgo LEVEL LIBRARY LOG: script/pgo-check of a build that used a profile.
+check_pgo() {
+    local prof
+    case "$pgo" in 1|strict) ;; *) return 0 ;; esac
+    prof=$(profile "$1")
+    [ -n "$prof" ] || return 0
+    echo "== $1: $prof"
+    script/pgo-check "${prof%.profdata}.hot.txt" "$2" "$3" "$pgo"
+}
+
+target_dir() { if [ "$1" = native ] || [ "$1" = x86-64 ]; then echo "$target_root"; else echo "$target_root/$1"; fi; }
+
+pkglibdir=$("$pg_config" --pkglibdir)
+extdir=$("$pg_config" --sharedir)/extension
+pgrx_args=(--package stannum --no-default-features --features "$features" --pg-config "$pg_config")
+
+# --- one build: as `cargo pgrx install` always did --------------------------
+if [ ${#LEVELS[@]} = 1 ]; then
+    level=${LEVELS[0]}
+    log=$(mktemp "${TMPDIR:-/tmp}/stannum-install.XXXXXX")
+    if [ -n "$stage" ]; then
+        action=(package --out-dir "$stage")
+    else
+        action=(install --release)
+    fi
+    rustflags=$(flags "$level")
+    env ${rustflags:+"$flags_var=$rustflags"} CARGO_TARGET_DIR="$(target_dir "$level")" \
+        cargo pgrx "${action[@]}" "${pgrx_args[@]}" 2>&1 | tee "$log"
+    library=$stage$pkglibdir/stannum.so
+    [ -f "$library" ] || library=$stage$pkglibdir/stannum.dylib
+    check_pgo "$level" "$library" "$log"
+    rm -f "$log"
+    exit 0
+fi
+
+# --- the loader and two builds ------------------------------------------------
+work="$target_root/install-release/pg$major"
+rm -rf "$work"
+mkdir -p "$work/loader"
+for level in "${LEVELS[@]}"; do
+    echo "== building $level"
+    rustflags=$(flags "$level")
+    env ${rustflags:+"$flags_var=$rustflags"} CARGO_TARGET_DIR="$(target_dir "$level")" \
+        cargo pgrx package "${pgrx_args[@]}" --out-dir "$work/$level" 2>&1 | tee "$work/build-$level.log"
+    [ -f "$work/$level$pkglibdir/stannum.so" ] || fail "$level: no $work/$level$pkglibdir/stannum.so"
+    check_pgo "$level" "$work/$level$pkglibdir/stannum.so" "$work/build-$level.log"
+done
+base="$work/x86-64" v4="$work/x86-64-v4"
+diff -r "$base$extdir" "$v4$extdir" >/dev/null || fail "the two builds' SQL and control files differ"
+
+# exported LIBRARY: its exported function symbols, but the two PostgreSQL
+# looks up in the library it opened itself (weak or indirect ones marked ?).
+exported() {
+    nm -D --defined-only --format=posix "$1" | awk '{ sub(/@.*/, "", $1) }
+        $2 ~ /^[TtWwi]$/ && $1 != "_PG_init" && $1 != "Pg_magic_func" { print ($2 == "T" ? "" : "?") $1 }' | sort -u
+}
+exported "$base$pkglibdir/stannum.so" > "$work/loader/symbols.txt"
+exported "$v4$pkglibdir/stannum.so" > "$work/loader/symbols-v4.txt"
+cmp -s "$work/loader/symbols.txt" "$work/loader/symbols-v4.txt" ||
+    fail "the builds export different symbols: diff $work/loader/symbols.txt $work/loader/symbols-v4.txt"
+if grep -q '^?' "$work/loader/symbols.txt"; then
+    fail "weak or indirect exported functions: $(grep '^?' "$work/loader/symbols.txt" | tr '\n' ' ')"
+fi
+awk '{ printf "SYMBOL(%d, %s)\n", NR - 1, $0 }' "$work/loader/symbols.txt" > "$work/loader/stannum_loader_symbols.h"
+version=$(sed -n "s/^default_version *= *'\(.*\)'/\1/p" "$base$extdir/stannum.control")
+[ -n "$version" ] || fail "no default_version in $base$extdir/stannum.control"
+"${CC:-cc}" -std=gnu11 -O2 -fPIC -shared -fvisibility=hidden -Wall -Wno-unused-function \
+    -I"$work/loader" -I"$ROOT/postgres/loader" -I"$("$pg_config" --includedir-server)" \
+    -DSTANNUM_VERSION="\"$version\"" -Wl,-Bsymbolic -o "$work/loader/stannum.so" postgres/loader/loader.c
+{ cat "$work/loader/symbols.txt"; printf '%s\n' _PG_init Pg_magic_func; } | sort > "$work/loader/want.txt"
+nm -D --defined-only --format=posix "$work/loader/stannum.so" | awk '$2 == "T" { print $1 }' | sort |
+    cmp -s - "$work/loader/want.txt" || fail "the loader does not export exactly the builds' symbols"
+echo "== loader: $(wc -l < "$work/loader/symbols.txt" | tr -d ' ') symbols forwarded"
+
+# The package: the baseline's tree, its library renamed, the v4 build and the loader beside it.
+package=${stage:-$work/package}
+mkdir -p "$package"
+cp -R "$base/." "$package/"
+mv "$package$pkglibdir/stannum.so" "$package$pkglibdir/stannum-x86-64.so"
+cp "$v4$pkglibdir/stannum.so" "$package$pkglibdir/stannum-x86-64-v4.so"
+cp "$work/loader/stannum.so" "$package$pkglibdir/stannum.so"
+if [ -n "$stage" ]; then
+    echo "staged in $stage"
+    exit 0
+fi
+
+# put SOURCE DIR: SOURCE into DIR by rename (the builds before the loader).
+put() {
+    local temporary
+    temporary="$2/.$(basename "$1").install-release.$$"
+    cp "$1" "$temporary" && mv -f "$temporary" "$2/$(basename "$1")"
+}
+mkdir -p "$pkglibdir" "$extdir"
+for f in stannum-x86-64.so stannum-x86-64-v4.so stannum.so; do put "$package$pkglibdir/$f" "$pkglibdir"; done
+for f in "$package$extdir"/*; do put "$f" "$extdir"; done
+echo "installed the loader with the x86-64 and x86-64-v4 builds in $pkglibdir"

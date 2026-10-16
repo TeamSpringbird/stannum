@@ -6,7 +6,7 @@
 # Trains the profile-guided optimization (PGO) profiles described in
 # docs/benchmarks.md#profile-guided-builds.
 #
-#   script/pgo-build image --data DIR --trace FILE [--image TAG [--no-build]] [--out FILE]
+#   script/pgo-build image --data DIR --trace FILE [--image TAG [--no-build]] [--target-cpu LEVEL] [--out FILE]
 #   script/pgo-build replay --dump DIR --trace FILE [--expect FILE] [--out FILE]
 #
 # image: the extension's profile, the one benchmarks/Dockerfile's
@@ -19,7 +19,9 @@
 # the server so that every backend writes its counts, and merges them into
 # FILE (default benchmarks/pgo/<arch>.profdata, <arch> as `uname -m` prints
 # it inside the image), with its 40 hottest functions beside it in
-# <arch>.hot.txt for script/pgo-check. Then rebuild the image with
+# <arch>.hot.txt for script/pgo-check. --target-cpu x86-64-v4 trains the
+# x86-64-v4 build the loader runs on such CPUs instead (default FILE
+# benchmarks/pgo/x86_64-v4.profdata; train it on a CPU with AVX-512). Then rebuild the image with
 # STANNUM_PGO=1 and commit both files. --no-build uses TAG as already built
 # with `benchmarks/tin.py build-image --pgo generate`.
 #
@@ -47,7 +49,7 @@ usage() {
 mode=${1:-}
 [ -n "$mode" ] || usage
 shift
-data='' dump='' trace='' expect='' out='' image=stannum-bench:pgo-generate build=1
+data='' dump='' trace='' expect='' out='' image=stannum-bench:pgo-generate build=1 target_cpu=''
 while [ $# -gt 0 ]; do
     case "$1" in
         --data) data=$(cd "${2:?--data needs a directory}" && pwd); shift 2 ;;
@@ -56,6 +58,7 @@ while [ $# -gt 0 ]; do
         --expect) expect=${2:?--expect needs a file}; shift 2 ;;
         --out) out=${2:?--out needs a file}; shift 2 ;;
         --image) image=${2:?--image needs a tag}; shift 2 ;;
+        --target-cpu) target_cpu=${2:?--target-cpu needs a level}; shift 2 ;;
         --no-build) build=0; shift ;;
         -h|--help) usage 0 ;;
         *) usage ;;
@@ -79,10 +82,10 @@ image)
     [ -n "$data" ] || usage
     if [ "$build" = 1 ]; then
         python3 benchmarks/tin.py build-image --image "$image" --base "${STANNUM_PGO_BASE:-postgres:18-trixie}" \
-            --pgo generate --output "$(mktemp -d)/image"
+            --pgo generate ${target_cpu:+--target-cpu "$target_cpu"} --output "$(mktemp -d)/image"
     fi
     arch=$(docker run --rm --entrypoint uname "$image" -m)
-    out=${out:-benchmarks/pgo/$arch.profdata}
+    out=${out:-benchmarks/pgo/$arch${target_cpu:+-${target_cpu#x86-64-}}.profdata}
     raw="$data/pgo-raw"
     rm -rf "$raw"
     name=stannum-pgo-train

@@ -109,3 +109,38 @@ class SwapLifecycleTests(unittest.TestCase):
             self.assertEqual(swaps, measured + [b'original'])
             self.assertEqual(library.read_bytes(), b'original')
             self.assertFalse(cluster.exists())
+
+
+class LoaderTests(unittest.TestCase):
+    """The x86-64 loader picks its build from beside the installed library: two
+    different loaders swapped in would run the same builds."""
+
+    def run_main(self, baseline, integrated):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            library = root / 'installed-library'
+            library.write_bytes(b'original')
+            (root / 'baseline').write_bytes(baseline)
+            (root / 'integrated').write_bytes(integrated)
+            argv = ['paired_libraries.py', '--baseline', str(root / 'baseline'),
+                    '--integrated', str(root / 'integrated'), '--installed-library',
+                    str(library), '--output', str(root / 'output')]
+            with (patch('sys.argv', argv), contextlib.redirect_stderr(io.StringIO()) as err,
+                  patch.object(paired_libraries.subprocess, 'run', side_effect=RuntimeError('ran'))):
+                try:
+                    paired_libraries.main()
+                except SystemExit as exit:
+                    return exit.code, err.getvalue()
+                except RuntimeError as error:
+                    return str(error), err.getvalue()
+
+    def test_two_different_loaders_are_refused(self):
+        loader = b'\x7fELF stannum: the loader has not loaded a build '
+        code, err = self.run_main(loader + b'1', loader + b'2')
+        self.assertEqual(code, 2)
+        self.assertIn('loader', err)
+
+    def test_one_loader_against_itself_and_plain_builds_run(self):
+        loader = b'\x7fELF stannum: the loader has not loaded a build'
+        self.assertEqual(self.run_main(loader, loader)[0], 'ran')
+        self.assertEqual(self.run_main(b'build 1', b'build 2')[0], 'ran')
