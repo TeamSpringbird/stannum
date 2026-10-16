@@ -678,6 +678,55 @@ impl<'s, 'a> Sc<'s, 'a> {
         self.footer.max_bucket(b)
     }
 
+    /// The census's window bounds ([`super::census`]): per window size,
+    /// the term's bound over each window of the segment's groups. The
+    /// folds counted and the group bound kept are left as they were.
+    #[cfg(feature = "census")]
+    fn window_bounds(&mut self, groups: &[Group]) -> [Vec<f32>; super::census::SIZES] {
+        use super::census::{SHIFTS, SIZES};
+        let n = groups.len();
+        let mut out: [Vec<f32>; SIZES] = std::array::from_fn(|k| vec![0.0; (n >> SHIFTS[k]) + 1]);
+        let put = |out: &mut [Vec<f32>; SIZES], from: usize, to: usize, v: f32| {
+            for (o, shift) in out.iter_mut().zip(SHIFTS) {
+                for w in &mut o[from >> shift..=to >> shift] {
+                    *w = higher(*w, v);
+                }
+            }
+        };
+        if let Some(c) = self.common_bound() {
+            for o in &mut out {
+                o.fill(c);
+            }
+            return out;
+        }
+        let (computed, gb, gv) = (self.computed, self.gb, self.gv);
+        let group_of = |slot: u32| {
+            groups
+                .partition_point(|g| g.slot_base + g.slots() <= slot)
+                .min(n - 1)
+        };
+        if let Bounds::Groups(g) = &self.footer {
+            let indexes: Vec<usize> = (0..g.dir.len())
+                .map(|b| g.entry(b).index as usize)
+                .collect();
+            for (b, index) in indexes.into_iter().enumerate() {
+                let v = higher(0.0, self.bound_of(b));
+                put(&mut out, index, index, v);
+            }
+        } else {
+            let blocks = self.first_reaching(0, u32::MAX);
+            let mut start = 0u32;
+            for b in 0..blocks {
+                let last = self.footer.last(b);
+                let v = higher(0.0, self.bound(b));
+                put(&mut out, group_of(start), group_of(last), v);
+                start = last.saturating_add(1);
+            }
+        }
+        (self.computed, self.gb, self.gv) = (computed, gb, gv);
+        out
+    }
+
     /// A grouped record's directory entry `b`; `None` for a sparse record.
     #[inline]
     fn group_entry(&self, b: usize) -> Option<GroupEntry> {
@@ -1388,6 +1437,9 @@ struct Walk<'s, 'a, T: Touch> {
     /// each with the least bucket of a count reaching their number of uses.
     repeats: Vec<(usize, u8)>,
     answer: RankedAnswer,
+    /// The window bounds census, when built and enabled.
+    #[cfg(feature = "census")]
+    census: Option<Box<super::census::WalkCensus>>,
     verify: Verify<'a>,
     /// A span's candidate at hand: its posting index in each span slot's
     /// term.
@@ -1437,6 +1489,78 @@ struct Walk<'s, 'a, T: Touch> {
     /// slices of.
     frame: Option<(&'a LazyBlob, usize)>,
     held: Vec<(usize, usize)>,
+}
+
+#[cfg(feature = "census")]
+impl<T: Touch> Walk<'_, '_, T> {
+    /// The census at group `g`, which the walk visits next, before it is
+    /// bounded: the group before it is closed, and each window `g` enters
+    /// is checked against the threshold now.
+    fn census_group(&mut self, g: u32) {
+        use super::census::{SHIFTS, SIZES};
+        let Some(mut c) = self.census.take() else {
+            return;
+        };
+        let folds: u64 = self.sc.iter().map(|s| s.computed).sum();
+        c.close(folds, self.answer.windows_pruned);
+        if c.bounds.is_empty() {
+            let groups = &self.geometry.groups;
+            c.bounds = self
+                .sc
+                .iter_mut()
+                .map(|s| s.window_bounds(groups))
+                .collect();
+            for (s, b) in self.sc.iter().zip(&c.bounds) {
+                if s.grouped() {
+                    c.tally.entries += s.footer.blocks() as u64;
+                    for (windows, b) in c.tally.windows.iter_mut().zip(b) {
+                        *windows += b.iter().filter(|v| **v > 0.0).count() as u64;
+                    }
+                }
+            }
+        }
+        let geometry = self.geometry;
+        for k in 0..SIZES {
+            let w = g >> SHIFTS[k];
+            if c.current[k] == w {
+                continue;
+            }
+            c.current[k] = w;
+            c.tally.checks[k] += 1;
+            let mut sum = 0.0_f32;
+            for b in &c.bounds {
+                sum += b[k][w as usize];
+            }
+            c.cut[k] = self.cut(sum, || geometry.tid_in(g as usize, 0));
+            c.tally.cut_windows[k] += u64::from(c.cut[k]);
+            c.visited[k].push((w, g, 0));
+        }
+        c.open = Some((folds, self.answer.windows_pruned));
+        self.census = Some(c);
+    }
+
+    /// Closes the walk's census and adds it to this thread's tally.
+    fn census_finish(&mut self) {
+        let Some(mut c) = self.census.take() else {
+            return;
+        };
+        let folds: u64 = self.sc.iter().map(|s| s.computed).sum();
+        c.close(folds, self.answer.windows_pruned);
+        let geometry = self.geometry;
+        for k in 0..super::census::SIZES {
+            for &(w, g, folds) in &c.visited[k] {
+                let mut sum = 0.0_f32;
+                for b in &c.bounds {
+                    sum += b[k][w as usize];
+                }
+                if self.cut(sum, || geometry.tid_in(g as usize, 0)) {
+                    c.tally.final_folds[k] += folds;
+                }
+            }
+        }
+        c.tally.walks += 1;
+        super::census::add(&c.tally);
+    }
 }
 
 impl<'a, T: Touch> Walk<'_, 'a, T> {
@@ -1560,6 +1684,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 break;
             }
             self.answer.windows += 1;
+            #[cfg(feature = "census")]
+            self.census_group(g);
             if self.group_below(g, base, end) {
                 self.answer.windows_pruned += 1;
                 continue;
@@ -3227,6 +3353,8 @@ pub(super) fn walk_into<'s, 'a>(
         sc,
         frame: None,
         held: Vec::new(),
+        #[cfg(feature = "census")]
+        census: super::census::WalkCensus::start(),
     };
     walk.term_sc = vec![usize::MAX; walk.terms.len()];
     for i in 0..n {
@@ -3306,6 +3434,8 @@ pub(super) fn walk_into<'s, 'a>(
     } else {
         walk.run()?;
     }
+    #[cfg(feature = "census")]
+    walk.census_finish();
     walk.count_metadata();
     let done = walk.answer;
     answer.scored += done.scored;
@@ -3684,6 +3814,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let base = group.slot_base;
         let end = base + group.slots() - 1;
         self.answer.windows += 1;
+        #[cfg(feature = "census")]
+        self.census_group(g);
         // The present terms' bounds over the group.
         self.cand_w = usize::MAX;
         let mut sb = std::mem::take(&mut self.sub_bounds);

@@ -1207,6 +1207,51 @@ fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Resu
     Ok(())
 }
 
+/// The window bounds census per style (`--features census`, with
+/// `STANNUM_WIN_CENSUS` set): the answer pass's walks only.
+#[cfg(feature = "census")]
+fn print_census(census: &std::collections::BTreeMap<String, engine::tinshape::census::Tally>) {
+    use engine::tinshape::census::SHIFTS;
+    if census.values().all(|t| t.walks == 0) {
+        return;
+    }
+    let pct = |a: u64, b: u64| 100.0 * a as f64 / b.max(1) as f64;
+    println!("\nwindow census (answer pass): per style, then per window size");
+    for (style, t) in census {
+        println!(
+            "census {style}: walks {} groups {} pruned {} ({:.1}%) folds {} in pruned groups {} ({:.1}%); entries {}",
+            t.walks,
+            t.groups,
+            t.pruned,
+            pct(t.pruned, t.groups),
+            t.folds,
+            t.pruned_folds,
+            pct(t.pruned_folds, t.folds),
+            t.entries
+        );
+        for (k, shift) in SHIFTS.iter().enumerate() {
+            println!(
+                "census {style} w{}: checks {} ({:.1}% of folds) cut windows {} ({:.1}%) groups {} ({:.1}% of groups) folds {} ({:.1}% of folds, {:.1}% of pruned folds) violations {} windows {} ({:.3} an entry); final-threshold ceiling {:.1}% of folds, {:.1}% of pruned folds",
+                1u32 << shift,
+                t.checks[k],
+                pct(t.checks[k], t.folds),
+                t.cut_windows[k],
+                pct(t.cut_windows[k], t.checks[k]),
+                t.cut_groups[k],
+                pct(t.cut_groups[k], t.groups),
+                t.cut_folds[k],
+                pct(t.cut_folds[k], t.folds),
+                pct(t.cut_folds[k], t.pruned_folds),
+                t.violations[k],
+                t.windows[k],
+                t.windows[k] as f64 / t.entries.max(1) as f64,
+                pct(t.final_folds[k], t.folds),
+                pct(t.final_folds[k], t.pruned_folds)
+            );
+        }
+    }
+}
+
 fn run() -> Result<bool, String> {
     let args = args();
     let mut trace = bench::read_trace(&args.trace)?;
@@ -1251,6 +1296,8 @@ fn run() -> Result<bool, String> {
     );
     let mut unsupported = 0usize;
     let mut mismatched = 0usize;
+    #[cfg(feature = "census")]
+    let mut census = std::collections::BTreeMap::<String, engine::tinshape::census::Tally>::new();
     for (n, q) in trace.iter().enumerate() {
         reader.full.set(fulls[n]);
         let scorer = reader.scorer(&q.text)?;
@@ -1260,10 +1307,17 @@ fn run() -> Result<bool, String> {
         if args.forget {
             reader.forget();
         }
+        #[cfg(feature = "census")]
+        engine::tinshape::census::take();
         let Some(answer) = reader.ranked(&scorer, args.k) else {
             unsupported += 1;
             continue;
         };
+        #[cfg(feature = "census")]
+        census
+            .entry(q.style.clone())
+            .or_default()
+            .add(&engine::tinshape::census::take());
         let memo = segment::tinshape::segment::memo_counts();
         let mut times = Vec::with_capacity(args.repeat);
         let (mut scorer_allocs, mut walk_allocs) = (Allocs::default(), Allocs::default());
@@ -1439,6 +1493,8 @@ fn run() -> Result<bool, String> {
         "{} queries, {unsupported} not walked natively (zero fill or streamed), {mismatched} instrumented mismatches",
         rows.len()
     );
+    #[cfg(feature = "census")]
+    print_census(&census);
     let mut styles: Vec<String> = rows.iter().map(|r| r.style.clone()).collect();
     styles.sort();
     styles.dedup();
