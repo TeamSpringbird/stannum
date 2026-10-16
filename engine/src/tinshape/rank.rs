@@ -1148,6 +1148,45 @@ fn load<'a>(
     Ok(true)
 }
 
+/// Loads a sparse term's members in group `g` within local slots `span`
+/// (the candidates' first to last), decoded into a list: the intersection
+/// keeps no other, and a sparse term's members are looked up only at
+/// candidates. In most groups a rare lead is read in, its few members span
+/// a small part of the group, and the term's members outside it are passed
+/// by its cursor's high bits rather than decoded; with none in the span the
+/// list is empty, the group's candidates gone.
+fn load_span<'a>(
+    set: &mut TermSet<'a>,
+    geometry: &Geometry,
+    g: u32,
+    mem: &mut Mem<'a>,
+    span: std::ops::RangeInclusive<u32>,
+    touch: &mut impl Touch,
+) {
+    let Form::Sparse(list) = &set.postings.form else {
+        unreachable!("a sparse term")
+    };
+    mem.loaded = g + 1;
+    mem.kind = Kind::List;
+    mem.list.clear();
+    mem.pos = 0;
+    mem.entry = usize::MAX;
+    let base = geometry.groups[g as usize].slot_base;
+    let cursor = set.sparse.get_or_insert_with(|| {
+        touch.touch(
+            Part::Payload,
+            set.at + set.postings.payload_at,
+            set.postings.payload.len(),
+        );
+        list.cursor()
+    });
+    cursor.seek(base + span.start());
+    mem.first = cursor.rank() as u32;
+    let out = &mut mem.list;
+    cursor.drain_below(base + span.end() + 1, |slot| out.push(slot - base));
+    mem.count = out.len() as u32;
+}
+
 /// A term's positions read by posting index, forward from the last entry
 /// read where that is nearer than the entry its tables locate.
 pub(super) struct PosCursor<'a> {
@@ -1713,17 +1752,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         break;
                     }
                 }
-                if sparse && next_group(set, self.geometry, g, &mut mem.hint, self.touch) != Some(g)
-                {
-                    cands.clear();
-                    break;
-                }
-                let probe_over = if sparse {
-                    usize::MAX
-                } else {
-                    SEEK_RATIO * cands.len()
-                };
-                if !load(set, self.geometry, g, mem, probe_over, self.touch)? {
+                if sparse {
+                    let span = cands[0]..=cands[cands.len() - 1];
+                    load_span(set, self.geometry, g, mem, span, self.touch);
+                } else if !load(set, self.geometry, g, mem, SEEK_RATIO * cands.len(), self.touch)? {
                     cands.clear();
                     break;
                 }
