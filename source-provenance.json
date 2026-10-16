@@ -1588,6 +1588,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for kernel changes over layout 9: tests at every level, tnsef, exactness and the replay A/B."
     },
+    "benchmarks/aws/devbox-seg4-ab.sh": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of 14 segments against the same dump merged into 4 on the box."
+    },
     "benchmarks/aws/devbox-replay-ab.sh": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: a devbox command file for the replay A/B of two trees under perf stat."
