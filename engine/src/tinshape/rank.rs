@@ -1148,6 +1148,25 @@ fn load<'a>(
     Ok(true)
 }
 
+/// Lists this short in all are intersected by [`merge_retain`].
+const MERGE_MAX: usize = 32;
+
+/// Keeps the members of `list` (ascending) that `other` (ascending)
+/// holds, by a merge without branches on the values: for short lists,
+/// where marking `other` and clearing it again costs more.
+#[inline]
+fn merge_retain(list: &mut Vec<u32>, other: &[u32]) {
+    let (mut i, mut j, mut kept) = (0, 0, 0);
+    while i < list.len() && j < other.len() {
+        let (a, b) = (list[i], other[j]);
+        list[kept] = a;
+        kept += usize::from(a == b);
+        i += usize::from(a <= b);
+        j += usize::from(b <= a);
+    }
+    list.truncate(kept);
+}
+
 /// Loads a sparse term's members in group `g` within local slots `span`
 /// (the candidates' first to last), decoded into a list: the intersection
 /// keeps no other, and a sparse term's members are looked up only at
@@ -1774,6 +1793,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 Kind::Cursor { .. } => {
                     let mem = &mut self.mems[t];
                     cands.retain(|l| mem.find(*l).is_some());
+                }
+                Kind::List if cands.len() + mem.list.len() <= MERGE_MAX => {
+                    merge_retain(&mut cands, &mem.list);
                 }
                 Kind::List => {
                     let words = self.geometry.groups[g as usize].words();
