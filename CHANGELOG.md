@@ -170,6 +170,19 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- A term lookup searches the term map's block index by each sampled block's
+  first eight bytes, held in a dense array, comparing a term's bytes only
+  among samples of its key; it read the probed samples' terms, a cache line
+  apart, and nearly every step missed the cache in a `memcmp`. A block's
+  entries are read forward once from their sample, and each next term keeps
+  its shared prefix in place, its order checked from its first byte past
+  it. On Sapphire Rapids, one core's two hyperthreads answer 1.1-2.7% more
+  queries per cycle in every style (1.9% over the six).
+- A group frontier's first pairs are decoded, then bounded, without a
+  branch on how many it holds or on each varint's length, its rounded
+  lengths looked up, and bounded by the score bucket only when the scorer
+  rises: on Sapphire Rapids, 2.1% more `score` disjunctions per core cycle
+  and 0.9% more `full_score` ones.
 - An index build ends with `initial_segment_count` segments of about equal
   size (`stannum.initial_segment_count`, 4, as TIN's default build gives),
   each at most 16 GiB and, for a small index, fewer so that each holds at
