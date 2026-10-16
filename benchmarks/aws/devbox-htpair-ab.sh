@@ -15,10 +15,13 @@
 #   devbox.sh --branch BASE --branch CANDIDATE --dump --type m7i.4xlarge --spot-only \
 #     --env ARMS=A:1:dump150m,B:2:dump150m --env COMPARE=B:A --cmd-file benchmarks/aws/devbox-htpair-ab.sh
 #
-# ARMS: comma-separated NAME:SRC:DUMP[:v3|v4], the tree (SRC1, SRC2, ...),
-# the dump directory under $DATA and an optional x86-64 level the whole
-# build is compiled for (through CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS:
-# a plain RUSTFLAGS would drop .cargo/config.toml's link flag). Each arm
+# ARMS: comma-separated NAME:SRC:DUMP[:v3|v4|v3all|v4all], the tree (SRC1,
+# SRC2, ...), the dump directory under $DATA and an optional x86-64 level:
+# v4 compiles the workspace's crates for it through script/rustc-cpu-level,
+# as script/install-release builds the loader's v4 build (when the tree has
+# the script); v4all the whole build, through
+# CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS (a plain RUSTFLAGS would
+# drop .cargo/config.toml's link flag). Each arm
 # builds in its own target directory (its sha256 in shasums.txt). COMPARE:
 # NAME:BASE pairs for the summary (benchmarks/aws/htpair_summary.py, run on
 # the box into summary.txt). ROUNDS (3), PLAN, REPEAT (2), CPU (2: its
