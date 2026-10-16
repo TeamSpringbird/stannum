@@ -40,6 +40,7 @@
 //! standbys serve segmented reads only then (see [`index_reads_allowed`]).
 
 pub mod layout;
+mod streaming;
 pub mod verify;
 pub mod wal;
 
@@ -89,6 +90,9 @@ static BUILD_SEGMENT_DOCS: GucSetting<i32> = GucSetting::<i32>::new(32_768);
 static MAX_SEGMENTS_GUC: GucSetting<i32> = GucSetting::<i32>::new(MAX_SEGMENTS as i32);
 /// Segments a size tier holds before they merge into one segment of the next tier.
 static MERGE_TIER_FACTOR: GucSetting<i32> = GucSetting::<i32>::new(8);
+/// Segments an index build ends with, unless the index sets
+/// `initial_segment_count`: TIN's default build gives four.
+static INITIAL_SEGMENT_COUNT: GucSetting<i32> = GucSetting::<i32>::new(4);
 
 /// Smallest `stannum.merge_tier_factor` value; below it every fold would merge.
 pub const MIN_MERGE_TIER_FACTOR: i32 = 2;
@@ -159,6 +163,16 @@ pub fn init() {
         GucFlags::default(),
     );
     GucRegistry::define_int_guc(
+        c"stannum.initial_segment_count",
+        c"Segments an index build ends with",
+        c"A build merges what it wrote into this many segments of about equal size, as long as each stays within 16 GiB; fewer when the index is small. Every query pays per-segment work, so fewer segments answer faster. TIN's initial_segment_count; an index's option of that name overrides it.",
+        &INITIAL_SEGMENT_COUNT,
+        1,
+        MAX_SEGMENTS as i32,
+        GucContext::Userset,
+        GucFlags::default(),
+    );
+    GucRegistry::define_int_guc(
         c"stannum.merge_tier_factor",
         c"Stannum segments per size tier before they merge",
         c"Segments are tiered by document count in powers of this factor; a tier holding this many segments merges them into one segment of the next tier.",
@@ -171,23 +185,59 @@ pub fn init() {
 }
 
 /// The soft directory bound: the index's `target_segment_count` when it sets
-/// one, otherwise `stannum.max_segments`.
+/// one, else its `initial_segment_count` (TIN's default for the target),
+/// otherwise `stannum.max_segments`.
 unsafe fn max_segments(index: pg_sys::Relation) -> usize {
     unsafe { crate::options::target_segment_count(index) }
+        .or_else(|| unsafe { crate::options::initial_segment_count(index) })
         .unwrap_or(MAX_SEGMENTS_GUC.get().max(1) as usize)
         .min(MAX_SEGMENTS)
 }
 
-/// The most input bytes a merge of this index takes: its
-/// `max_merged_segment_size` when it sets one, within what a run can record.
+/// The segments a build of this index ends with: its `initial_segment_count`
+/// when it sets one, otherwise `stannum.initial_segment_count`.
+unsafe fn initial_segment_count(index: pg_sys::Relation) -> usize {
+    unsafe { crate::options::initial_segment_count(index) }
+        .unwrap_or(INITIAL_SEGMENT_COUNT.get().max(1) as usize)
+        .clamp(1, MAX_SEGMENTS)
+}
+
+/// The most input bytes a maintenance merge of this index takes (an
+/// insert's, VACUUM's or a maintenance worker's): its
+/// `max_merged_segment_size` when it sets one, else TIN's default, 2000 MB.
+/// The ceiling keeps a merge's time bounded: the segments a build ends with
+/// are larger, and maintenance leaves them be, merging what inserts add.
 unsafe fn segment_bytes_cap(index: pg_sys::Relation) -> u64 {
     #[cfg(feature = "pg_test")]
     if let Some(cap) = testing::SEGMENT_BYTES_CAP_OVERRIDE.get() {
         return cap;
     }
     unsafe { crate::options::merged_segment_bytes(index) }
-        .unwrap_or(SEGMENT_BYTES_CAP)
+        .unwrap_or(MERGED_SEGMENT_BYTES)
         .min(SEGMENT_BYTES_CAP)
+}
+
+/// The least a segment a build ends with holds: a smaller index ends with
+/// fewer segments than `initial_segment_count` asks, down to one. Splitting
+/// a small index buys nothing (Stannum reads segments one after another)
+/// and costs per-segment work in every query.
+const FINAL_SEGMENT_FLOOR: u64 = 1 << 30;
+
+fn final_segment_floor() -> u64 {
+    #[cfg(feature = "pg_test")]
+    if let Some(floor) = testing::FINAL_SEGMENT_FLOOR_OVERRIDE.get() {
+        return floor;
+    }
+    FINAL_SEGMENT_FLOOR
+}
+
+/// The most input bytes one of a build's merges takes: [`SEGMENT_BYTES_CAP`].
+fn build_bytes_cap() -> u64 {
+    #[cfg(feature = "pg_test")]
+    if let Some(cap) = testing::SEGMENT_BYTES_CAP_OVERRIDE.get() {
+        return cap;
+    }
+    SEGMENT_BYTES_CAP
 }
 
 /// Encoded bytes the write buffer of this index holds before folding: its
@@ -3053,25 +3103,9 @@ unsafe fn try_dead_docs(
         .map_err(|error| format!("Stannum {what}: {error}"))
 }
 
-/// Merges segment blobs without their dead documents. An input that fails
-/// to decode is reported through `corrupt` by the caller.
-fn merge_blobs(
-    inputs: &[(Vec<u8>, segment::dead::DeadDocs)],
-    mut checkpoint: impl FnMut(),
-) -> segment::Result<Option<Built>> {
-    let inputs = inputs
-        .iter()
-        .map(|(bytes, dead)| segment::tinshape::merge::Input { bytes, dead })
-        .collect::<Vec<_>>();
-    segment::tinshape::merge::merge(&inputs, encoding(), || {
-        checkpoint();
-        Ok(())
-    })
-}
-
 /// A directory entry for a freshly written segment run, with the next
 /// generation number. Generations never repeat within an index identity.
-fn new_entry(meta: &mut Meta, run: Run, map: Run, built: &Built, origin: Origin) -> SegmentEntry {
+fn new_entry(meta: &mut Meta, run: Run, map: Run, built: Holds, origin: Origin) -> SegmentEntry {
     let generation = meta.next_generation;
     meta.next_generation = meta
         .next_generation
@@ -3086,6 +3120,119 @@ fn new_entry(meta: &mut Meta, run: Run, map: Run, built: &Built, origin: Origin)
         total_length: built.total_length,
         generation,
         origin,
+    }
+}
+
+/// What a written segment holds, as its directory entry records it.
+#[derive(Clone, Copy, Debug)]
+struct Holds {
+    documents: u32,
+    total_length: u64,
+}
+
+impl From<&Built> for Holds {
+    fn from(built: &Built) -> Self {
+        Self {
+            documents: built.documents,
+            total_length: built.total_length,
+        }
+    }
+}
+
+/// A merged segment written to its run: the run, its page table, and what
+/// it holds.
+struct Written {
+    run: Run,
+    map: Run,
+    holds: Holds,
+    postings: u64,
+}
+
+/// Merges `entries` without their dead documents, reading each input's run
+/// a range at a time and writing the merged run page by page as it is laid
+/// out (see [`streaming`]): `None` when every document was dead. A failure
+/// to read or decode an input is the message, for the caller to report as
+/// corruption or, unlocked, as a race when an input was retired meanwhile.
+/// `checkpoint` names the race point of the merge's checkpoints, where
+/// interrupts are taken unless the caller holds them off.
+///
+/// # Safety
+/// `index` is a live LDP2 index; the caller holds no buffer lock but, at
+/// most, the meta page's.
+unsafe fn merge_runs(
+    index: pg_sys::Relation,
+    entries: &[SegmentEntry],
+    checkpoint: &'static str,
+) -> Result<Option<Written>, String> {
+    let mut sources = Vec::with_capacity(entries.len());
+    let mut dead = Vec::with_capacity(entries.len());
+    for entry in entries {
+        pgrx::check_for_interrupts!();
+        let label = generation_label(entry.generation);
+        let table = decode_page_table(&unsafe {
+            try_read_run(index, entry.map, &format!("{label} page table"))
+        }?);
+        if table.len() != entry.run.blocks as usize {
+            return Err(format!(
+                "Stannum {label}: page table lists {} pages for a run of {}",
+                table.len(),
+                entry.run.blocks
+            ));
+        }
+        dead.push(unsafe { try_dead_docs(index, entry) }?);
+        sources.push(unsafe { streaming::RunInput::new(index, entry.run, table, label) });
+    }
+    #[cfg(feature = "pg_test")]
+    if testing::CORRUPT_MAINTENANCE_INPUT.with(|flag| flag.replace(false)) {
+        sources[0].corrupt_first_byte();
+    }
+    race_point("maintenance:loaded");
+    let inputs: Vec<segment::tinshape::merge::SourceInput<'_>> = sources
+        .iter()
+        .zip(&dead)
+        .map(|(source, dead)| segment::tinshape::merge::SourceInput { source, dead })
+        .collect();
+    let mut spill = streaming::TempSpill::new();
+    let mut writer = streaming::RunWriter::new(index);
+    let merged = segment::tinshape::merge::merge_streaming(
+        &inputs,
+        encoding(),
+        &mut spill,
+        &mut writer,
+        || {
+            race_point(checkpoint);
+            pgrx::check_for_interrupts!();
+            Ok(())
+        },
+    );
+    drop(spill);
+    match merged {
+        Ok(Some(merged)) => {
+            let (run, map) = writer.finish();
+            Ok(Some(Written {
+                run,
+                map,
+                holds: Holds {
+                    documents: merged.documents,
+                    total_length: merged.total_length,
+                },
+                postings: merged.postings,
+            }))
+        }
+        Ok(None) => {
+            writer.discard();
+            Ok(None)
+        }
+        Err(error) => {
+            writer.discard();
+            let generations: Vec<u32> = entries.iter().map(|entry| entry.generation).collect();
+            Err(sources
+                .iter()
+                .find_map(streaming::RunInput::failure)
+                .unwrap_or_else(|| {
+                    format!("merge of segment generations {generations:?}: {error}")
+                }))
+        }
     }
 }
 
@@ -3198,8 +3345,12 @@ fn smallest_entries(docs: &[u32], limit: usize) -> Vec<usize> {
     by_size
 }
 
-/// The most input bytes a merge takes; a merged segment is at most about as
-/// large as its inputs. A run's length has 64 bits on the meta page, so the
+/// TIN's default `max_merged_segment_size`, 2000 MB: what a maintenance
+/// merge takes at most unless the index sets the option.
+const MERGED_SEGMENT_BYTES: u64 = 2000 << 20;
+
+/// The most input bytes any merge takes; a merged segment is at most about
+/// as large as its inputs. A run's length has 64 bits on the meta page, so the
 /// bound is the work one merge may take on, not the format: 16 GiB holds a
 /// quarter of a 150M-row index (TIN's build gives four equal segments).
 const SEGMENT_BYTES_CAP: u64 = 16 << 30;
@@ -3386,9 +3537,8 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
             old.push(meta.segments.remove(position));
         }
         old.reverse();
-        if let Some(built) = merge_segments(index, &old) {
-            let (run, map) = write_segment_run(index, &built.blob);
-            let entry = new_entry(meta, run, map, &built, Origin::Merge);
+        if let Some(written) = merge_segments(index, &old) {
+            let entry = new_entry(meta, written.run, written.map, written.holds, Origin::Merge);
             meta.segments.push(entry);
         }
         for entry in old {
@@ -3401,37 +3551,15 @@ unsafe fn merge(index: pg_sys::Relation, meta: &mut Meta, mut positions: Vec<usi
 }
 
 /// Merges `entries`, which the caller has taken out of the directory under
-/// the exclusive metadata lock it holds through publication; `None` when
-/// every document was dead.
-unsafe fn merge_segments(index: pg_sys::Relation, entries: &[SegmentEntry]) -> Option<Built> {
-    // Owned input bytes are released when this function returns, before WAL
-    // output allocation. The merger never borrows a PostgreSQL buffer page.
-    let mut owned = Vec::with_capacity(entries.len());
-    for entry in entries {
-        pgrx::check_for_interrupts!();
-        let label = generation_label(entry.generation);
-        let bytes = unsafe { read_run(index, entry.run, &label) };
-        let dead =
-            unsafe { try_dead_docs(index, entry) }.unwrap_or_else(|message| corrupt(message));
-        owned.push((bytes, dead));
-    }
-    let built = merge_blobs(&owned, || {
-        // PostgreSQL defers interrupts while the metadata LWLock is held.
-        // Do not bypass that protection; insert checks again after release.
-        race_point("merge:checkpoint");
-        pgrx::check_for_interrupts!();
-    })
-    .unwrap_or_else(|error| {
-        let generations = entries
-            .iter()
-            .map(|entry| entry.generation)
-            .collect::<Vec<_>>();
-        corrupt(format!(
-            "merge of segment generations {generations:?}: {error}"
-        ))
-    });
+/// the exclusive metadata lock it holds through publication, and writes the
+/// merged run; `None` when every document was dead. PostgreSQL defers
+/// interrupts while that lock is held; the insert checks again after
+/// release.
+unsafe fn merge_segments(index: pg_sys::Relation, entries: &[SegmentEntry]) -> Option<Written> {
+    let written = unsafe { merge_runs(index, entries, "merge:checkpoint") }
+        .unwrap_or_else(|message| corrupt(message));
     race_point("merge:built");
-    built
+    written
 }
 
 // --- Sealing and promotion ------------------------------------------------------
@@ -3623,7 +3751,7 @@ pub unsafe fn promote_sealed(
         }
         meta.sealed.remove(0);
         for ((run, map), built) in runs.into_iter().zip(&promoted.built) {
-            let entry = new_entry(&mut meta, run, map, built, Origin::Promotion);
+            let entry = new_entry(&mut meta, run, map, built.into(), Origin::Promotion);
             meta.segments.push(entry);
         }
         let retired = Run {
@@ -3835,14 +3963,14 @@ impl Builder {
             make_room(index, identity);
             let (run, map) = write_segment_run(index, &built.blob);
             let (meta_buffer, mut meta) = read_meta(index, true);
-            let entry = new_entry(&mut meta, run, map, &built, Origin::Build);
+            let entry = new_entry(&mut meta, run, map, (&built).into(), Origin::Build);
             drop(built);
             meta.segments.push(entry);
             write_meta(index, &meta_buffer, &meta);
             drop(meta_buffer);
             let factor = merge_tier_factor();
             let limit = max_segments(index);
-            let cap = segment_bytes_cap(index);
+            let cap = build_bytes_cap();
             merge_unlocked(index, |docs, bytes| {
                 merge_candidates(docs, factor, limit)
                     .and_then(|positions| within_run(positions, bytes, cap))
@@ -3858,7 +3986,7 @@ impl Builder {
             unsafe {
                 self.flush(index);
                 lock_maintenance(index);
-                compact(index);
+                merge_to_count(index, initial_segment_count(index));
                 unlock_maintenance(index);
                 let (meta_buffer, mut meta) = read_meta(index, true);
                 // No reader holds a view of an index being created, so every
@@ -3924,14 +4052,31 @@ unsafe fn pack(index: pg_sys::Relation) {
                 // Already below every free page: nothing to gain by moving.
                 continue;
             }
-            let bytes = read_run(index, entry.run, &label);
-            let (run, run_blocks) = write_run_into(index, &bytes, &mut free);
-            drop(bytes);
+            // Copied a page at a time: a segment is gigabytes. The table is
+            // read afresh, not through the backend's cache of page tables,
+            // which knows a segment by its generation, and a moved segment
+            // keeps its generation.
+            let pages =
+                decode_page_table(&read_run(index, entry.map, &format!("{label} page table")));
+            if pages.len() != entry.run.blocks as usize {
+                corrupt(format!(
+                    "Stannum {label}: page table lists {} pages for a run of {}",
+                    pages.len(),
+                    entry.run.blocks
+                ));
+            }
+            let (run, run_blocks) = write_run_into(index, entry.run.bytes, &mut free, |i, out| {
+                let buffer = Buffer::read(index, pages[i], false);
+                expect_run_page(&buffer, &label);
+                out.extend_from_slice(buffer.chain().1);
+            });
             let mut table = Vec::with_capacity(run_blocks.len() * 4);
             for block in run_blocks {
                 table.extend_from_slice(&block.to_le_bytes());
             }
-            let (map, _) = write_run_into(index, &table, &mut free);
+            let (map, _) = write_run_into(index, table.len() as u64, &mut free, |i, out| {
+                out.extend_from_slice(table.chunks(CHAIN_CAPACITY).nth(i).unwrap_or(&[]));
+            });
             for old in [entry.run, entry.map] {
                 let (pages, _) = verify::chain_pages(index, old.first, old.blocks, &[KIND_RUN]);
                 free_pages(index, &pages, stamp);
@@ -3970,24 +4115,21 @@ unsafe fn pack(index: pg_sys::Relation) {
     }
 }
 
-/// Writes a run into the lowest blocks of `free`, ascending, extending the
-/// relation once they run out; returns the run and its blocks in order.
+/// Writes a run of `bytes` into the lowest blocks of `free`, ascending,
+/// extending the relation once they run out; `page(i, out)` appends page
+/// `i`'s bytes to `out`. Returns the run and its blocks in order.
 unsafe fn write_run_into(
     index: pg_sys::Relation,
-    data: &[u8],
+    bytes: u64,
     free: &mut BTreeSet<u32>,
+    mut page: impl FnMut(usize, &mut Vec<u8>),
 ) -> (Run, Vec<u32>) {
-    run_pages(data.len() as u64);
+    let pages = run_pages(bytes) as usize;
     unsafe {
-        let chunks: Vec<&[u8]> = if data.is_empty() {
-            vec![&[][..]]
-        } else {
-            data.chunks(CHAIN_CAPACITY).collect()
-        };
-        // Choose the blocks first, holding no page: a run is up to half a
+        // Choose the blocks first, holding no page: a run is up to two
         // million pages, and a backend may hold only a few hundred locks.
-        let mut blocks: Vec<u32> = Vec::with_capacity(chunks.len());
-        while blocks.len() < chunks.len() {
+        let mut blocks: Vec<u32> = Vec::with_capacity(pages);
+        while blocks.len() < pages {
             pgrx::check_for_interrupts!();
             match free.pop_first() {
                 Some(block) => {
@@ -4011,8 +4153,20 @@ unsafe fn write_run_into(
                 }
             }
         }
-        for (i, chunk) in chunks.iter().enumerate() {
+        let mut data = Vec::with_capacity(CHAIN_CAPACITY);
+        let mut written = 0u64;
+        for i in 0..pages {
             pgrx::check_for_interrupts!();
+            data.clear();
+            page(i, &mut data);
+            let expected = (bytes - written).min(CHAIN_CAPACITY as u64) as usize;
+            if data.len() != expected {
+                corrupt(format!(
+                    "Stannum run being packed: page {i} holds {} bytes; {expected} expected",
+                    data.len()
+                ));
+            }
+            written += expected as u64;
             let next = blocks.get(i + 1).copied().unwrap_or(NONE);
             let buffer = Buffer::read(index, blocks[i], true);
             write_page(
@@ -4020,14 +4174,14 @@ unsafe fn write_run_into(
                 &buffer,
                 true,
                 KIND_RUN,
-                &layout::chain_payload(next, chunk),
+                &layout::chain_payload(next, &data),
             );
         }
         (
             Run {
                 first: blocks[0],
-                blocks: chunks.len() as u32,
-                bytes: data.len() as u64,
+                blocks: pages as u32,
+                bytes,
                 last: *blocks.last().expect("a run has a page"),
             },
             blocks,
@@ -4035,22 +4189,76 @@ unsafe fn write_run_into(
     }
 }
 
-/// Merges the directory down to the fewest segments the segment byte cap
-/// allows: repeatedly the smallest entries that fit one run together. Every
-/// query pays a dictionary lookup and a stream head per term per segment, so
-/// a build ends with as few segments as the cap permits; tier merges alone
-/// leave the leftovers of every tier behind. The merges run without the meta
-/// lock (see [`merge_unlocked`]): at the segment byte cap one takes minutes.
+/// Ends a build with `count` segments of about equal size: fewer when the
+/// directory holds fewer or the index is too small for each to hold
+/// [`FINAL_SEGMENT_FLOOR`], more when `count` would not fit the build's byte
+/// cap. The directory's entries are dealt into that many groups, largest
+/// first into the lightest group, and each group of two or more is merged
+/// into one segment. Every query pays a term-map lookup and a stream head
+/// per term per segment, so fewer segments answer faster; TIN's default
+/// build gives four. The merges run without the meta lock (see
+/// [`replace_entries`]) and stream their inputs and output, so a build's
+/// memory does not grow with its segments' size.
 ///
 /// # Safety
 /// The caller holds the maintenance lock of `index` and no buffer lock.
-unsafe fn compact(index: pg_sys::Relation) {
-    let cap = unsafe { segment_bytes_cap(index) };
-    unsafe {
-        merge_unlocked(index, |_, bytes| {
-            within_run((0..bytes.len()).collect(), bytes, cap)
-        })
-    };
+unsafe fn merge_to_count(index: pg_sys::Relation, count: usize) {
+    let meta = unsafe { read_meta(index, false) }.1;
+    let bytes: Vec<u64> = meta.segments.iter().map(|entry| entry.run.bytes).collect();
+    let floor = final_segment_floor().max(1);
+    let count = count.min((bytes.iter().sum::<u64>() / floor).max(1) as usize);
+    for mut group in final_groups(&bytes, count, build_bytes_cap()) {
+        if group.len() < 2 {
+            continue;
+        }
+        pgrx::check_for_interrupts!();
+        group.sort_unstable();
+        let inputs: Vec<SegmentEntry> = group.iter().map(|p| meta.segments[*p]).collect();
+        race_point("build:final-merge");
+        if unsafe { replace_entries(index, meta.identity, &inputs, false) }.is_none() {
+            pgrx::error!("Stannum index changed while its build merged it");
+        }
+    }
+}
+
+/// The groups of directory positions a build's final merges make of
+/// segments of `bytes`: `count` groups, or as many more as it takes for each
+/// to hold at most `cap` bytes (a segment over `cap` alone), dealt largest
+/// first into the lightest group, ties by position. Groups come back by
+/// their first position; a group of one is left as it is.
+fn final_groups(bytes: &[u64], count: usize, cap: u64) -> Vec<Vec<usize>> {
+    let mut order: Vec<usize> = (0..bytes.len()).collect();
+    order.sort_by_key(|&p| (std::cmp::Reverse(bytes[p]), p));
+    let mut groups = count.clamp(1, bytes.len().max(1));
+    loop {
+        let mut dealt: Vec<(u64, Vec<usize>)> = vec![(0, Vec::new()); groups];
+        let mut fits = true;
+        for &p in &order {
+            let lightest = (0..groups)
+                .min_by_key(|&g| (dealt[g].0, g))
+                .expect("at least one group");
+            let (total, members) = &mut dealt[lightest];
+            if !members.is_empty() && *total + bytes[p] > cap {
+                fits = false;
+                break;
+            }
+            *total += bytes[p];
+            members.push(p);
+        }
+        if fits || groups >= bytes.len() {
+            let mut out: Vec<Vec<usize>> = dealt
+                .into_iter()
+                .map(|(_, mut members)| {
+                    members.sort_unstable();
+                    members
+                })
+                .filter(|members| !members.is_empty())
+                .collect();
+            out.sort_by_key(|members| members[0]);
+            return out;
+        }
+        groups += 1;
+    }
 }
 
 // --- Insert -------------------------------------------------------------------
@@ -5137,10 +5345,28 @@ unsafe fn try_read_documents(
     entry: &SegmentEntry,
     label: &str,
 ) -> Result<Vec<Tid>, String> {
-    let bytes = unsafe { try_read_run(index, entry.run, label) }?;
-    segment::tinshape::segment::Segment::parse(&bytes)
-        .map(|segment| segment.docs.tids())
-        .map_err(|error| format!("Stannum {label}: {error}"))
+    use segment::source::Source;
+    use segment::tinshape::index::{HEADER_MAX, Header};
+    use segment::tinshape::segment::Area;
+    // The header and the document set only: a segment is gigabytes.
+    let table = decode_page_table(&unsafe {
+        try_read_run(index, entry.map, &format!("{label} page table"))
+    }?);
+    let source = unsafe { streaming::RunInput::new(index, entry.run, table, label.to_owned()) };
+    let docs = (|| {
+        let head = source.read(0, (HEADER_MAX as u64).min(source.len()) as usize)?;
+        let header = Header::parse(&head, source.len())?;
+        let area = Area::DocSet as usize;
+        let docs = segment::tinshape::docs::DocSet::decode(
+            &source.read(header.at(area), header.len(area))?,
+        )?;
+        Ok(docs.tids())
+    })();
+    docs.map_err(|error: segment::Error| {
+        source
+            .failure()
+            .unwrap_or_else(|| format!("Stannum {label}: {error}"))
+    })
 }
 
 /// Records dead tuples: per segment as a dead list, and by rewriting the write
@@ -5433,30 +5659,10 @@ unsafe fn maintenance_merge(
     index: pg_sys::Relation,
     identity: u64,
     inputs: &[SegmentEntry],
-) -> Option<Option<Built>> {
-    let mut owned = Vec::with_capacity(inputs.len());
-    for entry in inputs {
-        pgrx::check_for_interrupts!();
-        let label = generation_label(entry.generation);
-        let read = unsafe { try_read_run(index, entry.run, &label) }.and_then(|bytes| {
-            let dead = unsafe { try_dead_docs(index, entry) }?;
-            Ok((bytes, dead))
-        });
-        owned.push(unsafe { unlocked(index, identity, entry, read) }?);
-    }
-    race_point("maintenance:loaded");
-    #[cfg(feature = "pg_test")]
-    if testing::CORRUPT_MAINTENANCE_INPUT.with(|flag| flag.replace(false)) {
-        owned[0].0[0] ^= 0xff;
-    }
-    let result = merge_blobs(&owned, || {
-        race_point("maintenance:checkpoint");
-        pgrx::check_for_interrupts!();
-    });
-    drop(owned);
-    match result {
-        Ok(built) => Some(built),
-        Err(error) => {
+) -> Option<Option<Written>> {
+    match unsafe { merge_runs(index, inputs, "maintenance:checkpoint") } {
+        Ok(written) => Some(written),
+        Err(message) => {
             let (guard, meta) = unsafe { read_meta(index, false) };
             let applies = meta.identity == identity
                 && inputs.iter().all(|entry| meta.segments.contains(entry));
@@ -5464,7 +5670,7 @@ unsafe fn maintenance_merge(
             if !applies {
                 return None;
             }
-            corrupt(format!("unlocked segment merge: {error}"));
+            corrupt(format!("unlocked segment merge: {message}"));
         }
     }
 }
@@ -5490,26 +5696,21 @@ unsafe fn replace_entries(
     inputs: &[SegmentEntry],
     count_postings: bool,
 ) -> Option<Published> {
-    let built = unsafe { maintenance_merge(index, identity, inputs) }?;
-    let docs = built.as_ref().map_or(0, |built| built.documents);
+    let output = unsafe { maintenance_merge(index, identity, inputs) }?;
+    let docs = output.as_ref().map_or(0, |written| written.holds.documents);
     let postings = if count_postings {
-        built.as_ref().map_or(0, |built| built.postings)
+        output.as_ref().map_or(0, |written| written.postings)
     } else {
         0
     };
-    let output = built.map(|mut built| {
-        let (run, map) = unsafe { write_segment_run(index, &built.blob) };
-        built.blob = Vec::new();
-        (run, map, built)
-    });
     race_point("maintenance:built");
     let (guard, mut meta) = unsafe { read_meta(index, true) };
     if meta.identity != identity || !inputs.iter().all(|entry| meta.segments.contains(entry)) {
         drop(guard);
-        if let Some((run, map, _)) = output {
+        if let Some(written) = output {
             unsafe {
-                discard_run(index, run);
-                discard_run(index, map);
+                discard_run(index, written.run);
+                discard_run(index, written.map);
             }
         }
         return None;
@@ -5520,8 +5721,14 @@ unsafe fn replace_entries(
         .position(|entry| *entry == inputs[0])
         .expect("every input is present");
     meta.segments.retain(|entry| !inputs.contains(entry));
-    if let Some((run, map, built)) = output {
-        let entry = new_entry(&mut meta, run, map, &built, Origin::Merge);
+    if let Some(written) = output {
+        let entry = new_entry(
+            &mut meta,
+            written.run,
+            written.map,
+            written.holds,
+            Origin::Merge,
+        );
         if inputs.len() == 1 {
             meta.segments.insert(position, entry);
         } else {
@@ -5749,6 +5956,9 @@ pub mod testing {
         /// A merge input ceiling in bytes below the smallest
         /// `max_merged_segment_size` (100 MB), for builds of test size.
         pub static SEGMENT_BYTES_CAP_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+        /// Replaces [`super::FINAL_SEGMENT_FLOOR`], so that a small build
+        /// ends with `initial_segment_count` segments.
+        pub static FINAL_SEGMENT_FLOOR_OVERRIDE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
         /// `stannum.reader_cache_mb` in bytes, for budgets finer than the
         /// GUC's megabytes.
         pub static READER_CACHE_BYTES: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
@@ -6351,9 +6561,58 @@ pub unsafe fn document_count(index: pg_sys::Relation) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_SEGMENTS, SEGMENT_BYTES_CAP, bounded_merge_candidates, merge_candidates,
+        MAX_SEGMENTS, SEGMENT_BYTES_CAP, bounded_merge_candidates, final_groups, merge_candidates,
         room_candidates, tier, within_run,
     };
+
+    #[test]
+    fn a_build_deals_its_segments_into_groups_of_about_equal_size() {
+        let gib = 1u64 << 30;
+        let check = |bytes: &[u64], groups: &[Vec<usize>]| {
+            let mut seen: Vec<usize> = groups.iter().flatten().copied().collect();
+            seen.sort_unstable();
+            assert_eq!(seen, (0..bytes.len()).collect::<Vec<_>>(), "{groups:?}");
+            groups
+                .iter()
+                .map(|group| group.iter().map(|p| bytes[*p]).sum::<u64>())
+                .collect::<Vec<u64>>()
+        };
+        // Fourteen segments of 1.5 to 3.2 GiB, as the 150M build left them:
+        // four groups past what a 32-bit length records, none over the cap,
+        // the heaviest within a segment of the lightest.
+        let bytes = [32, 30, 29, 28, 26, 25, 24, 22, 20, 19, 18, 17, 16, 15].map(|t| t * gib / 10);
+        let groups = final_groups(&bytes, 4, SEGMENT_BYTES_CAP);
+        assert_eq!(groups.len(), 4);
+        let sums = check(&bytes, &groups);
+        assert!(
+            sums.iter()
+                .all(|sum| *sum > 4 * gib && *sum <= SEGMENT_BYTES_CAP),
+            "{sums:?}"
+        );
+        let (min, max) = (sums.iter().min().unwrap(), sums.iter().max().unwrap());
+        assert!(max - min <= 32 * gib / 10, "{sums:?}");
+        // Groups come back by their first position.
+        assert!(groups.windows(2).all(|w| w[0][0] < w[1][0]), "{groups:?}");
+        // Four groups would not fit the cap: as many more as it takes.
+        let bytes = [10 * gib; 6];
+        let groups = final_groups(&bytes, 4, SEGMENT_BYTES_CAP);
+        assert_eq!(groups.len(), 6);
+        check(&bytes, &groups);
+        // A segment over the cap stays alone; the rest still group.
+        let bytes = [20 * gib, gib, gib, gib];
+        let groups = final_groups(&bytes, 2, SEGMENT_BYTES_CAP);
+        assert_eq!(groups, vec![vec![0], vec![1, 2, 3]]);
+        // Fewer segments than groups, or none at all.
+        assert_eq!(
+            final_groups(&[gib, gib], 4, SEGMENT_BYTES_CAP),
+            vec![vec![0], vec![1]]
+        );
+        assert!(final_groups(&[], 4, SEGMENT_BYTES_CAP).is_empty());
+        assert_eq!(
+            final_groups(&[1, 2, 3], 1, SEGMENT_BYTES_CAP),
+            vec![vec![0, 1, 2]]
+        );
+    }
 
     #[test]
     fn merge_budget_is_cumulative_and_overflow_merges_are_budgeted() {

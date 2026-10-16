@@ -28,7 +28,11 @@ a race point, after flushing WAL, and checks the recovered index:
   which documents are dead, before publishing them (bulk_delete:scanned);
 - bound: an insert into a full directory (96 entries) whose promotion
   merges the two smallest entries without the meta lock first
-  (maintenance:built).
+  (maintenance:built);
+- build: a CREATE INDEX in the middle of the final merges that bring it to
+  its initial_segment_count (maintenance:checkpoint), its inputs open and
+  its output under way: no index and no temporary file is left, and the
+  build run again ends with the segments it asks for.
 
 One case terminates instead of crashing:
 
@@ -127,15 +131,15 @@ def main():
             assert time.monotonic() < deadline, 'snapshot holder did not start'
             time.sleep(.05)
         sql(tuned + '\n' + '\n'.join(f"INSERT INTO drained VALUES ({n}, 'needle w{n}');" for n in range(1, 121)))
-        assert sql("SELECT tests.pending_entries('drained_idx'::regclass::oid);") == '48'
+        assert sql("SELECT tests.pending_entries('drained_idx'::regclass::oid);") == '40'
         sql("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name='stannum-crash-holder';")
         holder.wait(timeout=10)
         assert_clean('drained_idx')
         crash(tuned, "INSERT INTO drained VALUES (121, 'needle w121');", 'merge:released')
-        assert sql("SELECT tests.pending_entries('drained_idx'::regclass::oid);") == '48'
+        assert sql("SELECT tests.pending_entries('drained_idx'::regclass::oid);") == '40'
         orphans = assert_only_orphans('drained_idx')
         sql(tuned + "INSERT INTO drained VALUES (121, 'needle w121');")
-        assert int(sql("SELECT tests.pending_entries('drained_idx'::regclass::oid);")) < 48
+        assert int(sql("SELECT tests.pending_entries('drained_idx'::regclass::oid);")) < 40
         sql('VACUUM (INDEX_CLEANUP ON) drained;')
         assert_clean('drained_idx')
         assert sql("SELECT count(*) FROM drained WHERE body ==> 'needle';") == '121'
@@ -312,7 +316,7 @@ def main():
         restarts = 'all server processes terminated'
         before = log.read_text()
         # Twenty build segments, no tier that fills: the only merge is the
-        # compaction that ends the build.
+        # final one that ends the build (one segment: the index is small).
         result = subprocess.run(
             ['psql', '-X', '-qAt'], env=env, text=True, capture_output=True,
             input="SET stannum.build_segment_docs=20; SET stannum.merge_tier_factor=64;\n"
@@ -330,8 +334,36 @@ def main():
         assert sql("SELECT count(*) FROM stannum.segment_info('terminated_idx');") == '1'
         return 0
 
+    def build():
+        """A CREATE INDEX crashed in the middle of a final merge leaves no
+        index and no temporary file, and run again it ends with the segments
+        it asks for."""
+        sql("CREATE TABLE rebuilt(id int, body text);"
+            "INSERT INTO rebuilt SELECT n, (SELECT string_agg('w' || (n * k % 997), ' ') "
+            "FROM generate_series(1, 20) k) FROM generate_series(1, 2000) n;")
+        # Forty build segments and no tier that fills: the build's only
+        # merges are the final ones, three of them (the floor that keeps a
+        # small index whole is lifted), and the crash comes at the first
+        # checkpoint of the first.
+        tuned = ('SET stannum.build_segment_docs=50; SET stannum.merge_tier_factor=64; '
+                 'SELECT tests.set_final_segment_floor(1);')
+        statement = 'CREATE INDEX rebuilt_idx ON rebuilt USING stannum(body) WITH (initial_segment_count=3);'
+        crash(tuned, statement, 'maintenance:checkpoint')
+        assert sql("SELECT to_regclass('rebuilt_idx') IS NULL;") == 't'
+        assert sql("SELECT count(*) FROM pg_ls_tmpdir();") == '0'
+        sql(tuned + statement)
+        assert_clean('rebuilt_idx')
+        assert sql("SELECT count(*) FROM stannum.segment_info('rebuilt_idx') "
+                   "WHERE kind = 'immutable' AND source_state = 'current';") == '3'
+        assert sql("SELECT count(*) FROM pg_ls_tmpdir();") == '0'
+        for n in (1, 5, 996):
+            expected = sql(f"SELECT count(*) FROM rebuilt WHERE ' ' || body || ' ' LIKE '% w{n} %';")
+            assert sql(f"SELECT count(*) FROM rebuilt WHERE body ==> 'w{n}';") == expected, n
+        return 0
+
     cases = {'drain': drain, 'fold': fold, 'seal': seal, 'promote': promote, 'vacuum': vacuum,
-             'sealed': sealed, 'liveness': liveness, 'bound': bound, 'terminate': terminate}
+             'sealed': sealed, 'liveness': liveness, 'bound': bound, 'terminate': terminate,
+             'build': build}
     selected = sys.argv[1:] or list(cases)
     try:
         command(['initdb', '-D', str(data), '-U', 'postgres', '-A', 'trust', '--no-locale',
