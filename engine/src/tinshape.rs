@@ -1581,6 +1581,37 @@ pub fn top_k_into(
         scorers,
         top,
         visibility,
+        &[],
+        touch,
+        &mut answer,
+    )?;
+    Ok(answer)
+}
+
+/// [`top_k_into`] over only the groups in `groups` (ascending, disjoint
+/// ranges `[start, end)` of the segment's group indexes): walks over
+/// complementary ranges keep the rows one walk over every group keeps, in
+/// any order, as walks over segments do.
+#[expect(clippy::too_many_arguments, reason = "top_k_into's and the ranges")]
+pub fn top_k_into_groups(
+    segment: &Segment<'_>,
+    node: &Node,
+    names: &[String],
+    scorers: &[(String, TermScorer)],
+    top: &mut crate::walk::TopRows,
+    visibility: &mut dyn crate::walk::Visibility,
+    groups: &[(u32, u32)],
+    touch: &mut impl Touch,
+) -> Result<RankedAnswer> {
+    let mut answer = RankedAnswer::default();
+    rank::walk_into(
+        segment,
+        node,
+        names,
+        scorers,
+        top,
+        visibility,
+        groups,
         touch,
         &mut answer,
     )?;
@@ -3001,8 +3032,32 @@ mod tests {
                 for &part in &order {
                     top_k_into(&segments[part], &node, &names, &scorers, &mut top, &mut AllVisible, &mut NoTouch).unwrap();
                 }
+                // The same walks over each segment's groups in pieces
+                // (complementary ranges), the pieces of every segment in
+                // any order: a prepass over some groups, the rest after.
+                let mut pieces: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+                for &part in &order {
+                    let groups = segments[part].docs.geometry.groups.len() as u32;
+                    let cuts = 1 + (next() % 3) as usize;
+                    let mut ranges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); cuts];
+                    for g in 0..groups {
+                        ranges[(next() % cuts as u64) as usize].push((g, g + 1));
+                    }
+                    for r in ranges.into_iter().filter(|r| !r.is_empty()) {
+                        pieces.push((part, r));
+                    }
+                }
+                for i in (1..pieces.len()).rev() {
+                    pieces.swap(i, (next() % (i as u64 + 1)) as usize);
+                }
+                let mut pieced = crate::walk::TopRows::new(k, ties);
+                for (part, groups) in &pieces {
+                    top_k_into_groups(&segments[*part], &node, &names, &scorers, &mut pieced, &mut AllVisible, groups, &mut NoTouch).unwrap();
+                }
                 let bits = |rows: Vec<(f32, Tid)>| rows.into_iter().map(|(s, t)| (s.to_bits(), t)).collect::<Vec<_>>();
-                prop_assert_eq!(bits(top.into_rows()), bits(want.into_rows()), "top {} ties {} parts {:?} of {:?}", k, ties, order, node);
+                let want = bits(want.into_rows());
+                prop_assert_eq!(bits(pieced.into_rows()), want.clone(), "pieces {:?} top {} ties {} of {:?}", pieces, k, ties, node);
+                prop_assert_eq!(bits(top.into_rows()), want, "top {} ties {} parts {:?} of {:?}", k, ties, order, node);
             }
         }
     }

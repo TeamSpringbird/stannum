@@ -112,6 +112,13 @@ struct Args {
     full: bool,
     memory: bool,
     seed: bool,
+    /// `--seed-rank R`: seeded instead with the rows ranked `R-k+1..=R`
+    /// (a true lower bound of the final threshold, below it from `R >= 2k`),
+    /// to measure what a walk started from a lower threshold costs.
+    seed_rank: Option<usize>,
+    /// `--prepass SPEC`: some groups of one segment walked before the
+    /// others (see [`Prepass`]).
+    prepass: Option<Prepass>,
     pin_ns: u64,
     /// Pages a walk keeps pinned between groups (`LazyBlob::set_keep`);
     /// the blob's default when unset.
@@ -149,6 +156,75 @@ struct Args {
     mmap: bool,
 }
 
+/// `--prepass WHICH:KIND:N`: before the walks over the segments, the walk
+/// over some groups of the largest (`big`) or the smallest (`small`)
+/// segment; that segment's own walk then takes the other groups. KIND:
+/// `stride` every Nth group, `head` / `tail` the first / last N per mille
+/// of its groups. Exact: the two walks cover each group once.
+#[derive(Clone, Copy)]
+struct Prepass {
+    big: bool,
+    kind: PrepassKind,
+    n: u32,
+}
+
+#[derive(Clone, Copy)]
+enum PrepassKind {
+    Stride,
+    Head,
+    Tail,
+}
+
+impl Prepass {
+    fn parse(spec: &str) -> Option<Self> {
+        let f: Vec<&str> = spec.split(':').collect();
+        let [which, kind, n] = f[..] else { return None };
+        let big = match which {
+            "big" => true,
+            "small" => false,
+            _ => return None,
+        };
+        let kind = match kind {
+            "stride" => PrepassKind::Stride,
+            "head" => PrepassKind::Head,
+            "tail" => PrepassKind::Tail,
+            _ => return None,
+        };
+        let n: u32 = n.parse().ok()?;
+        (n > 0).then_some(Self { big, kind, n })
+    }
+
+    /// The sampled ranges of a segment of `groups` groups, and the others.
+    fn split(&self, groups: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+        let sample: Vec<(u32, u32)> = match self.kind {
+            PrepassKind::Stride => (0..groups)
+                .step_by(self.n as usize)
+                .map(|g| (g, g + 1))
+                .collect(),
+            PrepassKind::Head => {
+                let m = (u64::from(groups) * u64::from(self.n)).div_ceil(1000) as u32;
+                vec![(0, m.clamp(1, groups))]
+            }
+            PrepassKind::Tail => {
+                let m = (u64::from(groups) * u64::from(self.n)).div_ceil(1000) as u32;
+                vec![(groups - m.clamp(1, groups), groups)]
+            }
+        };
+        let mut rest = Vec::new();
+        let mut at = 0;
+        for &(start, end) in &sample {
+            if start > at {
+                rest.push((at, start));
+            }
+            at = end;
+        }
+        if at < groups {
+            rest.push((at, groups));
+        }
+        (sample, rest)
+    }
+}
+
 /// Which of a style's queries a `--plan` slice replays.
 enum PlanSlice {
     /// The first N.
@@ -184,7 +260,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
-         [--order engine|gen|gen-desc|docs-asc|small-first|bound|matches|density|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|matches|density|final] [--seed | --seed-rank R] [--prepass big|small:stride|head|tail:N] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
          [--plan STYLE:score|full:N|full:@FILE,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,...] [--mmap]"
     );
     std::process::exit(2)
@@ -205,6 +281,8 @@ fn args() -> Args {
         full: false,
         memory: false,
         seed: false,
+        seed_rank: None,
+        prepass: None,
         pin_ns: 0,
         keep_pins: None,
         threads: 0,
@@ -237,6 +315,12 @@ fn args() -> Args {
             "--memory" => a.memory = true,
             "--mmap" => a.mmap = true,
             "--seed" => a.seed = true,
+            "--prepass" => {
+                a.prepass = Some(Prepass::parse(&value(&mut it)).unwrap_or_else(|| usage()))
+            }
+            "--seed-rank" => {
+                a.seed_rank = Some(value(&mut it).parse().unwrap_or_else(|_| usage()));
+            }
             "--pin-ns" => a.pin_ns = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--keep-pins" => {
                 a.keep_pins = Some(value(&mut it).parse().unwrap_or_else(|_| usage()));
@@ -757,6 +841,7 @@ struct Reader {
     stop: Option<String>,
     /// Rank as `full_score` (set per query with `--plan`).
     full: std::cell::Cell<bool>,
+    prepass: Option<Prepass>,
     segs: Vec<Seg>,
 }
 
@@ -832,6 +917,7 @@ impl Reader {
             params: loaded.params,
             stop: loaded.stop_words.clone(),
             full: std::cell::Cell::new(args.full),
+            prepass: args.prepass,
             segs,
         })
     }
@@ -901,7 +987,7 @@ impl Reader {
     ) -> Option<Instrumented> {
         let mut names = Vec::new();
         let node = tin::lower(&scorer.query, &mut names)?;
-        let visit = self.visit(&names, scorer, order, answer);
+        let visit = self.schedule(self.visit(&names, scorer, order, answer));
         let mut top = TopRows::new(k, false);
         // A measurement aid: the final rows kept from the start, so the
         // walk prunes against the final threshold throughout. A walk finding
@@ -913,19 +999,20 @@ impl Reader {
         let mut visibility = Unseeded(seed.unwrap_or(&[]).iter().map(|row| row.1).collect());
         let mut total = tin::RankedAnswer::default();
         let mut work = Vec::with_capacity(visit.len());
-        for i in visit {
+        for (i, groups) in visit {
             let seg = &self.segs[i];
             let (bar, pages0, pins0) = (top.bar(), pages.total(), PINS.get());
             pages.touch_meta(i);
             let a = seg
                 .with(&names, |segment| {
-                    tin::top_k_into(
+                    tin::top_k_into_groups(
                         segment,
                         &node,
                         &names,
                         &scorer.terms,
                         &mut top,
                         &mut visibility,
+                        &groups,
                         &mut Offset {
                             pages: &mut *pages,
                             base: i << 40,
@@ -966,22 +1053,23 @@ impl Reader {
     ) -> Option<Vec<(f32, Tid)>> {
         let mut names = Vec::new();
         let node = tin::lower(&scorer.query, &mut names)?;
-        let visit = self.visit(&names, scorer, order, answer);
+        let visit = self.schedule(self.visit(&names, scorer, order, answer));
         let mut top = TopRows::new(k, false);
         for row in seed.unwrap_or(&[]) {
             top.push(engine::walk::Ranked(row.0, row.1));
         }
         let mut visibility = Unseeded(seed.unwrap_or(&[]).iter().map(|row| row.1).collect());
-        for i in visit {
+        for (i, groups) in visit {
             self.segs[i]
                 .with(&names, |segment| {
-                    tin::top_k_into(
+                    tin::top_k_into_groups(
                         segment,
                         &node,
                         &names,
                         &scorer.terms,
                         &mut top,
                         &mut visibility,
+                        &groups,
                         &mut NoTouch,
                     )
                 })
@@ -1053,6 +1141,40 @@ impl Reader {
             Ok((rows, a))
         })
         .ok()
+    }
+
+    /// The walks of a query: per walk, a segment and the ranges of its
+    /// groups it takes (every group when empty), the prepass first.
+    fn schedule(&self, visit: Vec<usize>) -> Vec<(usize, Vec<(u32, u32)>)> {
+        let mut walks: Vec<(usize, Vec<(u32, u32)>)> =
+            visit.iter().map(|&i| (i, Vec::new())).collect();
+        let Some(p) = self.prepass else {
+            return walks;
+        };
+        let pick = if p.big {
+            visit
+                .iter()
+                .copied()
+                .max_by_key(|&i| (self.segs[i].segment.documents, std::cmp::Reverse(i)))
+        } else {
+            visit
+                .iter()
+                .copied()
+                .min_by_key(|&i| (self.segs[i].segment.documents, i))
+        };
+        let Some(pick) = pick else { return walks };
+        let groups = self.segs[pick].segment.docs.geometry.groups.len() as u32;
+        let (sample, rest) = p.split(groups);
+        if rest.is_empty() {
+            return walks;
+        }
+        for walk in &mut walks {
+            if walk.0 == pick {
+                walk.1 = rest.clone();
+            }
+        }
+        walks.insert(0, (pick, sample));
+        walks
     }
 
     /// The segments in `order`.
@@ -1716,6 +1838,15 @@ fn run() -> Result<bool, String> {
             .or_default()
             .add(&engine::tinshape::census::take());
         let memo = segment::tinshape::segment::memo_counts();
+        // `--seed-rank R`: the rows ranked R-k+1..=R (or the last k of
+        // fewer, when at least 2k match), found untimed.
+        let ranked_seed: Option<Vec<(f32, Tid)>> = args.seed_rank.and_then(|r| {
+            let deep = reader.ranked(&scorer, r)?;
+            (deep.len() >= 2 * args.k).then(|| deep[deep.len() - args.k..].to_vec())
+        });
+        let seed_rows: Option<&[(f32, Tid)]> = ranked_seed
+            .as_deref()
+            .or(args.seed.then_some(answer.as_slice()));
         let mut times = Vec::with_capacity(args.repeat);
         let (mut scorer_allocs, mut walk_allocs) = (Allocs::default(), Allocs::default());
         let untimed = (args.warm.is_some() && args.warm_untimed).then(|| {
@@ -1748,13 +1879,9 @@ fn run() -> Result<bool, String> {
                     &answer,
                 ));
             } else if args.timed_walk {
-                std::hint::black_box(reader.walked(
-                    &scorer,
-                    args.k,
-                    args.seed.then_some(answer.as_slice()),
-                    args.order,
-                    &answer,
-                ));
+                std::hint::black_box(
+                    reader.walked(&scorer, args.k, seed_rows, args.order, &answer),
+                );
             } else {
                 std::hint::black_box(reader.ranked(&scorer, args.k));
             }
@@ -1808,7 +1935,7 @@ fn run() -> Result<bool, String> {
                 &scorer,
                 args.k,
                 &mut pages,
-                warm.as_deref().or(args.seed.then_some(answer.as_slice())),
+                warm.as_deref().or(seed_rows),
                 args.order,
                 &answer,
             )

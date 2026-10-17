@@ -1433,6 +1433,8 @@ struct Walk<'s, 'a, T: Touch> {
     /// largest bucket ([`NO_BUCKET`] when it holds nothing from the slot
     /// on).
     window_end: Option<u32>,
+    /// The groups the walk visits (all when empty).
+    groups: Groups,
     window_bound: f32,
     window_buckets: Vec<u8>,
     /// Per scoring term, its bound over the window.
@@ -1685,6 +1687,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             ) else {
                 break;
             };
+            match self.groups.admit(g) {
+                Admit::Yes => {}
+                Admit::From(start) => {
+                    from = start;
+                    continue;
+                }
+                Admit::Done => break,
+            }
             from = g + 1;
             let group = self.geometry.groups[g as usize];
             let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
@@ -3178,6 +3188,51 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     }
 }
 
+/// The groups a walk visits: ascending, disjoint ranges `[start, end)` of
+/// group indexes, every group when there are none.
+struct Groups {
+    ranges: Vec<(u32, u32)>,
+    at: usize,
+}
+
+/// Whether a walk visits a group.
+enum Admit {
+    Yes,
+    /// Not this group: the next one visited is no earlier than this.
+    From(u32),
+    /// Nor any later one.
+    Done,
+}
+
+impl Groups {
+    fn new(ranges: &[(u32, u32)]) -> Self {
+        debug_assert!(ranges.windows(2).all(|w| w[0].1 <= w[1].0));
+        Self {
+            ranges: ranges.to_vec(),
+            at: 0,
+        }
+    }
+
+    /// Whether group `g` is visited; asked in ascending order.
+    #[inline]
+    fn admit(&mut self, g: u32) -> Admit {
+        if self.ranges.is_empty() {
+            return Admit::Yes;
+        }
+        while let Some(&(_, end)) = self.ranges.get(self.at) {
+            if g < end {
+                break;
+            }
+            self.at += 1;
+        }
+        match self.ranges.get(self.at) {
+            None => Admit::Done,
+            Some(&(start, _)) if g < start => Admit::From(start),
+            Some(_) => Admit::Yes,
+        }
+    }
+}
+
 /// Every row is visible.
 struct Everything;
 
@@ -3205,6 +3260,7 @@ pub(super) fn top_k(
         scorers,
         &mut top,
         &mut Everything,
+        &[],
         touch,
         &mut answer,
     )?;
@@ -3239,6 +3295,7 @@ pub(super) fn walk_into<'s, 'a>(
     scorers: &[(String, TermScorer)],
     top: &mut TopRows,
     visibility: &mut dyn Visibility,
+    groups: &[(u32, u32)],
     touch: &mut impl Touch,
     answer: &mut RankedAnswer,
 ) -> Result<Option<Vec<Option<TermSet<'a>>>>> {
@@ -3324,6 +3381,7 @@ pub(super) fn walk_into<'s, 'a>(
         term_sc: Vec::new(),
         cand_floor: 0,
         window_end: None,
+        groups: Groups::new(groups),
         window_bound: 0.0,
         window_parts: (0.0, f64::INFINITY, f64::INFINITY),
         window_buckets: vec![NO_BUCKET; n],
@@ -3700,6 +3758,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             if g == u32::MAX {
                 break;
+            }
+            match self.groups.admit(g) {
+                Admit::Yes => {}
+                // Terms are read in order: the groups before the next
+                // range are passed one at a time.
+                Admit::From(_) => {
+                    from = g + 1;
+                    continue;
+                }
+                Admit::Done => break,
             }
             self.present_list.clear();
             for (i, (present, next)) in self.present.iter_mut().zip(&next).enumerate() {
