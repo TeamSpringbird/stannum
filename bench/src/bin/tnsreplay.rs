@@ -136,6 +136,14 @@ struct Args {
     perf_ctl: Option<(PathBuf, PathBuf)>,
     /// `--cpus`: sets of CPUs, each measured with one pinned thread per CPU.
     cpus: Vec<Vec<usize>>,
+    /// `--lencode`: the instrumented pass reports its length and bucket
+    /// reads to the census of length codes in the TF tail
+    /// ([`bench::lencode`]), which prints the codes' sizes first.
+    lencode: bool,
+    /// `--mmap`: map the segments' files rather than read them, and drop
+    /// their resident pages every few queries (a census over a dump larger
+    /// than the memory it may hold).
+    mmap: bool,
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -160,7 +168,7 @@ fn usage() -> ! {
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
          [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
-         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,...]"
+         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,...] [--lencode] [--mmap]"
     );
     std::process::exit(2)
 }
@@ -194,6 +202,8 @@ fn args() -> Args {
         plan: Vec::new(),
         perf_ctl: None,
         cpus: Vec::new(),
+        lencode: false,
+        mmap: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -234,6 +244,8 @@ fn args() -> Args {
                 }
             }
             "--out" => a.out = Some(value(&mut it).into()),
+            "--lencode" => a.lencode = true,
+            "--mmap" => a.mmap = true,
             "--plan" => {
                 for slice in value(&mut it).split(',') {
                     let f: Vec<&str> = slice.split(':').collect();
@@ -352,7 +364,7 @@ struct Loaded {
     segments: Vec<Dumped>,
 }
 
-fn load(dir: &std::path::Path) -> Result<Loaded, String> {
+fn load(dir: &std::path::Path, mmap: bool) -> Result<Loaded, String> {
     let manifest = std::fs::read_to_string(dir.join("manifest.tsv")).map_err(|e| e.to_string())?;
     let mut spec = None;
     let mut params = engine::bm25::Bm25Params::default_bm25();
@@ -376,21 +388,22 @@ fn load(dir: &std::path::Path) -> Result<Loaded, String> {
             }
             ["segment", generation, _docs, blob, dead] => {
                 let start = Instant::now();
-                let bytes = std::fs::read(dir.join(blob)).map_err(|e| format!("{blob}: {e}"))?;
+                let bytes: &'static [u8] = if mmap {
+                    mapped::map(&dir.join(blob)).map_err(|e| format!("{blob}: {e}"))?
+                } else {
+                    Vec::leak(std::fs::read(dir.join(blob)).map_err(|e| format!("{blob}: {e}"))?)
+                };
                 eprintln!(
-                    "{blob}: {} bytes read in {:.1} s",
+                    "{blob}: {} bytes {} in {:.1} s",
                     bytes.len(),
+                    if mmap { "mapped" } else { "read" },
                     start.elapsed().as_secs_f64()
                 );
                 let dead = match *dead {
                     "-" => None,
                     name => Some(std::fs::read(dir.join(name)).map_err(|e| e.to_string())?),
                 };
-                segments.push((
-                    generation.parse().map_err(|_| "generation")?,
-                    &*Vec::leak(bytes),
-                    dead,
-                ));
+                segments.push((generation.parse().map_err(|_| "generation")?, bytes, dead));
             }
             _ => {}
         }
@@ -1059,6 +1072,95 @@ impl tin::Touch for Offset<'_> {
     fn touch(&mut self, part: Part, at: usize, len: usize) {
         self.pages.touch(part, self.base + at, len);
     }
+
+    fn census(&self) -> bool {
+        LENCODE_ON.get()
+    }
+
+    fn census_length(&mut self, read: &tin::LengthRead<'_>) {
+        LENCODE.with_borrow_mut(|c| {
+            if let Some(c) = c {
+                c.segment = self.base >> 40;
+                c.length(read);
+            }
+        });
+    }
+
+    fn census_tf(&mut self, read: &tin::TfRead) {
+        LENCODE.with_borrow_mut(|c| {
+            if let Some(c) = c {
+                c.segment = self.base >> 40;
+                c.tf(read);
+            }
+        });
+    }
+}
+
+thread_local! {
+    /// Whether the instrumented pass reports to [`LENCODE`] (`--lencode`).
+    static LENCODE_ON: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static LENCODE: std::cell::RefCell<Option<bench::lencode::Census>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Segments' files mapped rather than read (`--mmap`), and their resident
+/// pages dropped on demand by mapping the same file over them again.
+mod mapped {
+    use std::os::fd::AsRawFd;
+    use std::sync::Mutex;
+
+    const PROT_READ: i32 = 1;
+    const MAP_PRIVATE: i32 = 2;
+    const MAP_FIXED: i32 = 0x10;
+
+    unsafe extern "C" {
+        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
+    }
+
+    /// Per mapping: its address, length and file.
+    static MAPS: Mutex<Vec<(usize, usize, std::fs::File)>> = Mutex::new(Vec::new());
+
+    pub fn map(path: &std::path::Path) -> std::io::Result<&'static [u8]> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len() as usize;
+        // SAFETY: a fresh private read-only mapping of the whole file, never
+        // unmapped; the dump's files are not written while it is replayed.
+        let at = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ,
+                MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if at as isize == -1 {
+            return Err(std::io::Error::last_os_error());
+        }
+        MAPS.lock().expect("maps").push((at as usize, len, file));
+        // SAFETY: the mapping lives as long as the process.
+        Ok(unsafe { std::slice::from_raw_parts(at, len) })
+    }
+
+    /// Maps every file again over itself: the same bytes at the same
+    /// addresses, none of them resident.
+    pub fn drop_resident() {
+        for (at, len, file) in MAPS.lock().expect("maps").iter() {
+            // SAFETY: the same file over its own mapping, read-only: every
+            // slice into it reads the same bytes.
+            let got = unsafe {
+                mmap(
+                    *at as *mut u8,
+                    *len,
+                    PROT_READ,
+                    MAP_PRIVATE | MAP_FIXED,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            assert_eq!(got as usize, *at, "a remap moved");
+        }
+    }
 }
 
 trait Meta {
@@ -1507,7 +1609,7 @@ fn run() -> Result<bool, String> {
         }
         trace = sliced;
     }
-    let loaded = load(&args.dump)?;
+    let loaded = load(&args.dump, args.mmap)?;
     if args.threads > 0 {
         throughput(&args, &loaded, &trace)?;
         return Ok(true);
@@ -1523,6 +1625,25 @@ fn run() -> Result<bool, String> {
         start.elapsed().as_secs_f64()
     );
     let mut perf = PerfCtl::open(args.perf_ctl.as_ref()).map_err(|e| format!("--perf-ctl: {e}"))?;
+    if args.lencode {
+        let mut sizes = Vec::new();
+        for (generation, blob, _) in &loaded.segments {
+            let at = Instant::now();
+            let segment = Segment::parse(blob).map_err(|e| e.to_string())?;
+            sizes.push(bench::lencode::sizes(&segment, blob.len() as u64));
+            drop(segment);
+            if args.mmap {
+                mapped::drop_resident();
+            }
+            eprintln!(
+                "lencode sizes: gen{generation} in {:.0} s",
+                at.elapsed().as_secs_f64()
+            );
+        }
+        print!("{}", bench::lencode::sizes_report(&sizes));
+        LENCODE.with_borrow_mut(|c| *c = Some(bench::lencode::Census::new(sizes)));
+        LENCODE_ON.set(true);
+    }
     let mut rows = Vec::new();
     let mut warm_out = String::from(
         "name\tstyle\twarm_rows\ttheta_warm\ttheta_final\twarm_in_final\tand_examined\tand_scored\n",
@@ -1639,6 +1760,11 @@ fn run() -> Result<bool, String> {
             }
             None => None,
         };
+        LENCODE.with_borrow_mut(|c| {
+            if let Some(c) = c {
+                c.begin(&q.style);
+            }
+        });
         let (direct, counters, segments) = reader
             .instrumented(
                 &scorer,
@@ -1649,6 +1775,14 @@ fn run() -> Result<bool, String> {
                 &answer,
             )
             .ok_or("an instrumented walk failed")?;
+        LENCODE.with_borrow_mut(|c| {
+            if let Some(c) = c {
+                c.end();
+            }
+        });
+        if args.mmap && (n + 1) % 20 == 0 {
+            mapped::drop_resident();
+        }
         if direct != answer && !args.seed {
             mismatched += 1;
             eprintln!("instrumented walk differs: {}", q.name);
@@ -1675,6 +1809,11 @@ fn run() -> Result<bool, String> {
         }
     }
     let _ = NoTouch;
+    LENCODE.with_borrow(|c| {
+        if let Some(c) = c {
+            print!("{}", c.report());
+        }
+    });
     if let Some(path) = &args.warm {
         std::fs::write(path, &warm_out).map_err(|e| e.to_string())?;
     }
