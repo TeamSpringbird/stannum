@@ -15,7 +15,9 @@
 //!     [--plan STYLE:MODE:N,...] [--perf-ctl CTL,ACK] [--cpus SETS]
 //! ```
 //!
-//! Each segment is read from memory and kept across queries with its
+//! Each segment is read into memory (`--mmap`: mapped from its file, so
+//! only the pages the queries touch take memory, as a replay of a few
+//! forms over a dump larger than memory needs) and kept across queries with its
 //! decoded footers; after each query its parsed records are forgotten, as
 //! the extension's in-place reads forget them when a span closes (`--keep`
 //! keeps them, as a backend copying the blob would). The answer is the
@@ -143,6 +145,8 @@ struct Args {
     perf_ctl: Option<(PathBuf, PathBuf)>,
     /// `--cpus`: sets of CPUs, each measured with one pinned thread per CPU.
     cpus: Vec<Vec<usize>>,
+    /// `--mmap`: segments mapped from their files rather than read.
+    mmap: bool,
 }
 
 /// Which of a style's queries a `--plan` slice replays.
@@ -176,7 +180,7 @@ fn usage() -> ! {
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
          [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
-         [--plan STYLE:score|full:N,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,...]"
+         [--plan STYLE:score|full:N|full:@FILE,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,...] [--mmap]"
     );
     std::process::exit(2)
 }
@@ -210,6 +214,7 @@ fn args() -> Args {
         plan: Vec::new(),
         perf_ctl: None,
         cpus: Vec::new(),
+        mmap: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -225,6 +230,7 @@ fn args() -> Args {
             "--forget" => a.forget = true,
             "--full" => a.full = true,
             "--memory" => a.memory = true,
+            "--mmap" => a.mmap = true,
             "--seed" => a.seed = true,
             "--pin-ns" => a.pin_ns = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--keep-pins" => {
@@ -388,7 +394,48 @@ struct Loaded {
     segments: Vec<Dumped>,
 }
 
-fn load(dir: &std::path::Path) -> Result<Loaded, String> {
+/// The bytes of `path`, mapped read-only for the process's life (Unix).
+fn map_file(path: &std::path::Path) -> Result<&'static [u8], String> {
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        unsafe extern "C" {
+            fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, off: i64)
+            -> *mut u8;
+        }
+        const PROT_READ: i32 = 1;
+        const MAP_PRIVATE: i32 = 2;
+        let file = std::fs::File::open(path).map_err(|e| format!("{}: {e}", path.display()))?;
+        let len = file.metadata().map_err(|e| e.to_string())?.len() as usize;
+        if len == 0 {
+            return Ok(&[]);
+        }
+        // SAFETY: a fresh read-only private mapping of the whole file, never
+        // unmapped; the dump's files are not written while it is replayed.
+        let ptr = unsafe {
+            mmap(
+                std::ptr::null_mut(),
+                len,
+                PROT_READ,
+                MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if ptr as isize == -1 {
+            return Err(format!("{}: mmap failed", path.display()));
+        }
+        // SAFETY: the mapping above, `len` bytes, valid for the process's life.
+        Ok(unsafe { std::slice::from_raw_parts(ptr, len) })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        Err("--mmap needs a Unix".to_owned())
+    }
+}
+
+fn load(dir: &std::path::Path, mapped: bool) -> Result<Loaded, String> {
     let manifest = std::fs::read_to_string(dir.join("manifest.tsv")).map_err(|e| e.to_string())?;
     let mut spec = None;
     let mut params = engine::bm25::Bm25Params::default_bm25();
@@ -412,7 +459,11 @@ fn load(dir: &std::path::Path) -> Result<Loaded, String> {
             }
             ["segment", generation, _docs, blob, dead] => {
                 let start = Instant::now();
-                let bytes = std::fs::read(dir.join(blob)).map_err(|e| format!("{blob}: {e}"))?;
+                let bytes: &'static [u8] = if mapped {
+                    map_file(&dir.join(blob))?
+                } else {
+                    Vec::leak(std::fs::read(dir.join(blob)).map_err(|e| format!("{blob}: {e}"))?)
+                };
                 eprintln!(
                     "{blob}: {} bytes read in {:.1} s",
                     bytes.len(),
@@ -422,11 +473,7 @@ fn load(dir: &std::path::Path) -> Result<Loaded, String> {
                     "-" => None,
                     name => Some(std::fs::read(dir.join(name)).map_err(|e| e.to_string())?),
                 };
-                segments.push((
-                    generation.parse().map_err(|_| "generation")?,
-                    &*Vec::leak(bytes),
-                    dead,
-                ));
+                segments.push((generation.parse().map_err(|_| "generation")?, bytes, dead));
             }
             _ => {}
         }
@@ -1593,7 +1640,7 @@ fn run() -> Result<bool, String> {
         }
         trace = sliced;
     }
-    let loaded = load(&args.dump)?;
+    let loaded = load(&args.dump, args.mmap)?;
     if args.threads > 0 {
         throughput(&args, &loaded, &trace)?;
         return Ok(true);
