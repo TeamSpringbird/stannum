@@ -172,6 +172,29 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- A run page's data is found by arithmetic (its header and link, a chain's
+  capacity a page, the run's length on its last), and its header and
+  special area are checked once per backend, on its first pin; each run
+  page's page-table entry remembers the shared buffer it was last pinned
+  in and tries it before the shared hint table, so a repeat pin costs the
+  page-table line and the buffer's own state rather than a hint bucket's
+  miss too. The hint is still only a hint: the buffer's tag is checked and
+  a refused one falls through to the shared table and `ReadBuffer`. Debug
+  builds check every page and compare. A backend's page tables take 8
+  bytes a run page (about 36 MB at 150 million rows, within the reader
+  cache's budget). With PostgreSQL on one Sapphire Rapids core's two
+  hyperthreads, 2.1% more queries per cycle (every style 1.3% or more),
+  the same answers.
+- A ranked walk led by one word reads a candidate's score buckets from the
+  group's run of term frequencies, taken at the group's first read, rather
+  than finding each page of them again; a grid member a few words on is
+  ranked by counting those words inline; and a candidate's class bound
+  sums its terms' scores at the four class floors from per-term tables,
+  without a division (OR's late class check too). Built with their own
+  profiles (x86-64-v4, one core's two hyperthreads), `full_score` phrases
+  answer 2.9% more queries per cycle than before and the six styles 0.7%
+  on geometric mean; in the server, with this release's pin path and the
+  shipped profiles, 2.3% (`full_score` phrases 4.4%, conjunctions 3.1%).
 - A term lookup searches the term map's block index by each sampled block's
   first eight bytes, held in a dense array, comparing a term's bytes only
   among samples of its key; it read the probed samples' terms, a cache line
