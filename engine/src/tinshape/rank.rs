@@ -3422,6 +3422,7 @@ pub(super) fn walk_into<'s, 'a>(
     // holds what it pins. Otherwise the pages read to open the terms
     // (records, directories, decoded) are released with the
     // groups', but for the ranges the records keep slices of.
+    let mut keep = None;
     if let (Some(blob), Some(opened)) = (blob, opened)
         && !matches!(walk.verify, Verify::Node)
     {
@@ -3433,17 +3434,31 @@ pub(super) fn walk_into<'s, 'a>(
         // The pages those ranges lie on, read to open the terms, are held
         // to the walk's end before the mark the groups release to.
         walk.frame = Some((blob, blob.hold_since(opened, &walk.held)));
+        // A walk reads on from about two streams a scoring term (its
+        // containers and TF tail) and the DL sidecar's two areas: past
+        // eleven terms the pages kept by default are fewer than its streams,
+        // and each group pins again what the last released (research 5 F7).
+        // (A blob keeping none, as tests poisoning each page released set
+        // it, keeps none still.)
+        if blob.keep() > 0 {
+            keep = Some(blob.keep());
+            blob.set_keep(blob.keep().max(2 * walk.sc.len() + 6));
+        }
         // A footer's pages hold only its bytes: each is released once the
         // footer has read past it, not left pinned to the group's end.
         for s in &mut walk.sc {
             s.footer.release_passed();
         }
     }
-    if required.is_empty() {
-        walk.run_or()?;
+    let run = if required.is_empty() {
+        walk.run_or()
     } else {
-        walk.run()?;
+        walk.run()
+    };
+    if let (Some(blob), Some(keep)) = (blob, keep) {
+        blob.set_keep(keep);
     }
+    run?;
     #[cfg(feature = "census")]
     walk.census_finish();
     walk.count_metadata();

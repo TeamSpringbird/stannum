@@ -2437,6 +2437,45 @@ mod tests {
         );
     }
 
+    /// A disjunction of more scoring terms than the pages a walk keeps by
+    /// default covers keeps two a term (and the DL sidecar's) while it
+    /// walks, answers as the walk in memory does, and leaves the blob's
+    /// keep as it found it.
+    #[test]
+    fn a_wide_disjunction_keeps_a_page_per_stream_and_restores_the_keep() {
+        let density: Vec<u64> = (0..10).map(|t| 3 + t % 5).collect();
+        let (docs, members) = drawn(6_000, &density, 4);
+        let blob = build(&docs, &members, Options::default());
+        let parsed = Segment::parse(&blob).unwrap();
+        let source = segment::tinshape::blob::PinningSource::new(blob.clone(), 97);
+        let pinned = LazyBlob::new(Box::new(source.clone()));
+        let in_place = assembled_in_place(&pinned, &parsed, &blob);
+        pinned.set_keep(segment::tinshape::blob::KEEP_PINS);
+        let names: Vec<String> = (0..members.len()).map(|t| format!("t{t}")).collect();
+        let scorers: Vec<(String, TermScorer)> = (0..members.len())
+            .map(|t| {
+                let scorer = TermScorer::from_statistics(
+                    docs.len() as u64,
+                    members[t].len() as u64,
+                    1.0,
+                    Bm25Params::default(),
+                    50.0,
+                )
+                .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let node = Node::Or((0..members.len()).map(Node::Term).collect());
+        let want = top_k(&parsed, &node, &names, &scorers, 10, &mut NoTouch).unwrap();
+        pinned.open_span();
+        let got = top_k(&in_place, &node, &names, &scorers, 10, &mut NoTouch);
+        in_place.forget_borrowed();
+        // SAFETY: `got` is owned.
+        unsafe { pinned.close_span() };
+        assert_eq!(got.unwrap().rows, want.rows);
+        assert_eq!(pinned.keep(), segment::tinshape::blob::KEEP_PINS);
+    }
+
     /// A rare term's sparse list and inline lengths are borrowed by its
     /// record for the whole walk: held, not released, while a common
     /// term's pages are.
