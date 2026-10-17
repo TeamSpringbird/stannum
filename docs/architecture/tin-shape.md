@@ -2530,6 +2530,58 @@ The PGO profiles were retrained on it (`d07348e` aarch64, `b6cef80`
 x86-64, 40 of 40 hot functions each; every training answer equal to
 PostgreSQL's).
 
+## Sub-range codes for full_score conjunctions
+
+Branch `loop/subrange`, page layout 17 (beyond TIN's structure, by the
+owner's call for this lane; R10's codes, `loop/r10`, at a finer grain and
+read by one walk only). A `full_score` conjunction of common words spends
+its time on candidates: at 150M rows its slowest forms ("can use it in",
+"with the one which you") examine a million candidates and score a few
+thousand, and a group's one frontier per term cannot rule out a part of
+the group whose postings are all long or low.
+
+A grouped record of a term in at least one in 10 of its segment's documents
+(`Options::sub_codes_share`) holds sub-range codes for its grids ([grammar](#postings-record)):
+per 64-slot sub-range (one word of the group's candidate bitmap) and
+frontier pair, the least rounded length of the sub-range's postings at
+that pair's buckets. They lie apart from the containers, before the TF
+tail, so nothing but the walk that uses them reads them. A led walk's group
+of all grids with at least 32 candidates (`SUB_MIN`) bounds each candidate
+word by its scoring terms' codes, the best pair bucket at its code's length
+per term (at most its group bound; a term without codes at its group
+bound), summed in the scorer's order, and clears the words its bar cuts
+before its sieve: their candidates read no bucket, class or length. Exact
+as the walk's other cuts. A group whose uncoded terms' bounds alone reach
+the bar reads no code. Disjunctions never read them; a `score` walk elides
+the terms that carry them (both at a tenth of the documents).
+
+The census before the build (32.6M rows, whole trace, the bar when the
+group's candidates are listed, codes on terms of at least a tenth of the
+documents): 64-slot sub-ranges cut 88% of `full_score` conjunctions'
+candidates and 76% of phrases' (256 slots: 73% / 60%; R10's 1,024: 42% /
+32%); the 25 slowest conjunctions 95%, 97% at the final threshold. A
+sub-range's largest bucket alone, or with its shortest length, cuts 13-29%.
+Skipping the cut candidates (recorded, then replayed) took 17% of
+conjunctions' cycles and 11% of phrases', the slowest 25 48% and 24%;
+1,024-slot sub-ranges took none (R10's gain was its finer per-candidate
+length floors).
+
+| 150M rows, x86 paired gate (3 rounds) | full conj | full phrase | conj | phrase | disj | full disj |
+|---|---:|---:|---:|---:|---:|---:|
+| q/Gcyc, paired core | **+10.4%** | **+8.9%** | -0.9% | -0.5% | -0.3% | -0.2% |
+| instructions/q | -12.6% | -12.4% | +0.7% | +0.7% | +0.4% | +0.4% |
+| tail-25 (i16's slowest), paired cycles | **-24.0%** | **-18.1%** | | | | +1.2% |
+
+Index +1.66% (36.23 -> 36.83 GB). Answers identical (`--expect` 0
+different, `--full` byte-identical). On M4 (32.6M rows) `full_score`
+conjunctions' cycles fell 23% and phrases' 9% (the slowest 25: 49% and
+19%); `SUB_MIN` 256 / 96 / 32 / 16 / 8 cut conjunctions' cycles 4 / 15 /
+23 / 24 / 23%. Not kept by the paired gate: the targets pass, but score
+conjunctions and phrases fall 0.9% and 0.5% (rounds -1.4..+2.2 and
+-1.8..+0.4) with 0.4-0.7% more instructions in every untargeted style,
+disjunctions included, which never reach the cut: code layout of this
+build, to be judged again in an integration's PGO A/B.
+
 ## Open
 
 - OR counts are about 1.8 times `STN3`'s offline. A union reads every
