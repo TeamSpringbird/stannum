@@ -35,13 +35,14 @@ PAGE_SIZE = 8192
 PAGE_HEADER = 24
 SPECIAL_SIZE = 8
 MAGIC = 0x4C445032
-VERSION = 16
+# Page layout 18 (17 and 18 changed the segments' records, not the pages).
+VERSION = 18
 KIND_META = 1
 KIND_RUN = 3
 SPEC_BYTES = 8
 NONE = 0xFFFFFFFF
 FILE_BLOCKS = (1 << 30) // PAGE_SIZE
-# storage/layout.rs (page version 16): a run is its first page, its pages,
+# storage/layout.rs (pages as of version 16): a run is its first page, its pages,
 # its bytes and its last page. An entry is the segment's run (its bytes in 64
 # bits), its page table's run (no bytes: four a page of the segment), its
 # dead list's run (bytes in 32 bits), the dead list's stamp, documents, total
