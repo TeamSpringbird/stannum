@@ -453,10 +453,10 @@ impl Lead {
         }
         if self.gate > 0 {
             let (mut ll, mut ld, mut al, mut ad) = (0u64, 0u64, 0u64, 0u64);
-            for v in 0..n {
+            for (v, &leads) in lead.iter().enumerate() {
                 al += l(v);
                 ad += d(v);
-                if lead[v] {
+                if leads {
                     ll += l(v);
                     ld += d(v);
                 }
@@ -491,6 +491,12 @@ fn heap_perm(spec: &str) -> Option<Vec<u32>> {
     }
     Some(perm)
 }
+
+/// A segment's groups' documents and their summed lengths.
+type GroupLengths = (Vec<u32>, Vec<u64>);
+
+/// A segment's lead walks and its other walks, each its group ranges.
+type LeadWalks = (Vec<Ranges>, Vec<Ranges>);
 
 /// Which of a style's queries a `--plan` slice replays.
 enum PlanSlice {
@@ -1124,9 +1130,9 @@ struct Reader {
     lead: Option<Lead>,
     heap_perm: Option<Vec<u32>>,
     /// Per segment, its groups' documents and summed lengths (for `--lead`).
-    group_lengths: std::cell::RefCell<FxHashMap<usize, std::rc::Rc<(Vec<u32>, Vec<u64>)>>>,
+    group_lengths: std::cell::RefCell<FxHashMap<usize, std::rc::Rc<GroupLengths>>>,
     /// Per segment, its walks under `--lead` / `--heap-perm` (lead first).
-    lead_walks: std::cell::RefCell<FxHashMap<usize, std::rc::Rc<(Vec<Ranges>, Vec<Ranges>)>>>,
+    lead_walks: std::cell::RefCell<FxHashMap<usize, std::rc::Rc<LeadWalks>>>,
     /// `--short-first P` ([`WalkConfig::short_first_permille`]).
     short_first: u32,
     segs: Vec<Seg>,
@@ -1471,7 +1477,7 @@ impl Reader {
     }
 
     /// Segment `i`'s groups' documents and summed lengths.
-    fn group_lengths(&self, i: usize) -> std::rc::Rc<(Vec<u32>, Vec<u64>)> {
+    fn group_lengths(&self, i: usize) -> std::rc::Rc<GroupLengths> {
         if let Some(found) = self.group_lengths.borrow().get(&i) {
             return found.clone();
         }
@@ -1528,7 +1534,7 @@ impl Reader {
 
     /// Segment `pick`'s lead walks and its other walks (none of either
     /// when it is walked whole), computed once.
-    fn lead_walks(&self, pick: usize) -> std::rc::Rc<(Vec<Ranges>, Vec<Ranges>)> {
+    fn lead_walks(&self, pick: usize) -> std::rc::Rc<LeadWalks> {
         if let Some(found) = self.lead_walks.borrow().get(&pick) {
             return found.clone();
         }
