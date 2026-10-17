@@ -42,6 +42,7 @@ pub const DEFAULT_CONFIG: WalkConfig = WalkConfig {
     seed: None,
     tail_first_permille: engine::walk::TAIL_FIRST_PERMILLE,
     tail_first_min: engine::walk::TAIL_FIRST_MIN,
+    dense_first: engine::walk::DENSE_FIRST,
 };
 
 /// Dictionary lookups a memo holds before it is emptied, as the

@@ -975,6 +975,7 @@ impl IndexScorer {
             seed: seeded_threshold(),
             tail_first_permille: engine::walk::TAIL_FIRST_PERMILLE,
             tail_first_min: engine::walk::TAIL_FIRST_MIN,
+            dense_first: engine::walk::DENSE_FIRST,
         };
         let heap_oid = pg_sys::Oid::from(self.key.heap_oid);
         let index_oid = pg_sys::Oid::from(self.key.index_oid);
