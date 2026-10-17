@@ -133,6 +133,46 @@ pub struct Geometry {
 }
 
 impl Geometry {
+    /// [`DocSet::densest_first`], computed.
+    pub fn densest_first(&self, permille: u32) -> Lead {
+        let groups = &self.groups;
+        let n = groups.len();
+        if n < 2 {
+            return (Vec::new(), vec![(0, n as u32)]);
+        }
+        let docs: Vec<u32> = (0..n)
+            .map(|g| {
+                let next = groups
+                    .get(g + 1)
+                    .map_or(self.documents, |next| next.rank_base);
+                next - groups[g].rank_base
+            })
+            .collect();
+        let take =
+            ((n as u64 * u64::from(permille.min(1000))).div_ceil(1000) as usize).clamp(1, n - 1);
+        let mut sorted = docs.clone();
+        let (_, cut, _) = sorted.select_nth_unstable_by(take - 1, |a, b| b.cmp(a));
+        let cut = *cut;
+        // Groups above the cut lead, then those at it in order up to `take`.
+        let mut room = take - docs.iter().filter(|d| **d > cut).count();
+        let mut lead: Vec<(u32, u32)> = Vec::new();
+        let mut rest: Vec<(u32, u32)> = Vec::new();
+        for (g, d) in docs.iter().enumerate() {
+            let first = *d > cut
+                || (*d == cut && room > 0 && {
+                    room -= 1;
+                    true
+                });
+            let out = if first { &mut lead } else { &mut rest };
+            let g = g as u32;
+            match out.last_mut() {
+                Some(last) if last.1 == g => last.1 = g + 1,
+                _ => out.push((g, g + 1)),
+            }
+        }
+        (lead, rest)
+    }
+
     /// The grid of `tids`, which must be strictly increasing: each page's
     /// width is its largest offset.
     pub fn of(tids: &[Tid]) -> Result<Self> {
@@ -416,9 +456,31 @@ pub struct DocSet {
     pub word_base: Vec<usize>,
     /// Documents before each word.
     word_rank: Vec<u32>,
+    /// [`Self::densest_first`]'s last split, and the per mille it took.
+    lead: std::cell::RefCell<Option<(u32, std::rc::Rc<Lead>)>>,
 }
 
+/// Groups a walk takes first and the others, as ascending ranges
+/// `[start, end)` of group indexes.
+pub type Lead = (Vec<(u32, u32)>, Vec<(u32, u32)>);
+
 impl DocSet {
+    /// The `permille` per mille of the groups holding the most documents
+    /// (at least one, never all; ties in group order), and the others. A
+    /// group spans a fixed run of heap pages, so those are the groups of
+    /// the shortest rows, whose documents BM25 favours. Kept for the next
+    /// call with the same `permille`: the split is the set's, not a query's.
+    pub fn densest_first(&self, permille: u32) -> std::rc::Rc<Lead> {
+        if let Some((p, lead)) = &*self.lead.borrow()
+            && *p == permille
+        {
+            return lead.clone();
+        }
+        let lead = std::rc::Rc::new(self.geometry.densest_first(permille));
+        *self.lead.borrow_mut() = Some((permille, lead.clone()));
+        lead
+    }
+
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         let mut at = 0usize;
         let count = varint::get_u32(bytes, &mut at)? as usize;
@@ -502,6 +564,7 @@ impl DocSet {
             words,
             word_base,
             word_rank,
+            lead: Default::default(),
         })
     }
 
