@@ -172,6 +172,11 @@ enum SegmentOrder {
     SmallFirst,
     /// By the scoring terms' summed record bounds in the segment.
     Bound,
+    /// Fewest estimated matches first: the segment's documents times each
+    /// scoring term's share of them, as if independent (`matches`); or the
+    /// lowest such share alone, whatever the segment's size (`density`).
+    Matches,
+    Density,
     Final,
 }
 
@@ -179,7 +184,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
-         [--order engine|gen|gen-desc|docs-asc|small-first|bound|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|matches|density|final] [--seed] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
          [--plan STYLE:score|full:N|full:@FILE,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,...] [--mmap]"
     );
     std::process::exit(2)
@@ -251,6 +256,8 @@ fn args() -> Args {
                     "docs-asc" => SegmentOrder::DocsAscending,
                     "small-first" => SegmentOrder::SmallFirst,
                     "bound" => SegmentOrder::Bound,
+                    "matches" => SegmentOrder::Matches,
+                    "density" => SegmentOrder::Density,
                     "final" => SegmentOrder::Final,
                     _ => usage(),
                 }
@@ -1082,6 +1089,30 @@ impl Reader {
                     })
                     .collect();
                 visit.sort_by(|a, b| bound[*b].total_cmp(&bound[*a]));
+            }
+            SegmentOrder::Matches | SegmentOrder::Density => {
+                let estimate: Vec<f64> = self
+                    .segs
+                    .iter()
+                    .map(|seg| {
+                        let docs = f64::from(seg.segment.documents.max(1));
+                        let mut share = 1.0_f64;
+                        for (name, _) in &scorer.terms {
+                            let df = match seg.reader.term_entry(name) {
+                                Ok(Some(entry)) => entry.df,
+                                _ => 0,
+                            };
+                            share *= f64::from(df) / docs;
+                        }
+                        if order == SegmentOrder::Matches {
+                            share * docs
+                        } else {
+                            share
+                        }
+                    })
+                    .collect();
+                // Stable: ties keep the engine's order.
+                visit.sort_by(|a, b| estimate[*a].total_cmp(&estimate[*b]));
             }
             SegmentOrder::Engine => {}
             SegmentOrder::Generation => visit.sort_by_key(|&i| self.segs[i].generation),
