@@ -41,6 +41,29 @@ pub fn rank(a: &(f32, Tid), b: &(f32, Tid)) -> Ordering {
 /// the scoring it saves, and the scan scores every candidate instead.
 pub const PRUNE_MAX_K: usize = 4096;
 
+/// Per mille of the first native segment's groups, its last, that its walk
+/// takes first (zero: none; see [`WalkConfig::tail_first_permille`]).
+pub const TAIL_FIRST_PERMILLE: u32 = 200;
+
+/// The candidates a walk must expect in the first native segment for its
+/// tail to be taken first (see [`WalkConfig::tail_first_min`]).
+pub const TAIL_FIRST_MIN: f64 = 0.0;
+
+/// A first segment of fewer groups is walked in order.
+const TAIL_FIRST_MIN_GROUPS: usize = 1024;
+
+/// The first native segment's group ranges in the order its walk takes
+/// them (see [`TAIL_FIRST_PERMILLE`]); `None` for every group in order.
+pub fn tail_first(groups: usize, permille: u32) -> Option<[(u32, u32); 2]> {
+    if permille == 0 || groups < TAIL_FIRST_MIN_GROUPS {
+        return None;
+    }
+    let groups = u32::try_from(groups).ok()?;
+    let tail = (u64::from(groups) * u64::from(permille.min(1000))).div_ceil(1000) as u32;
+    let split = groups - tail.clamp(1, groups - 1);
+    Some([(split, groups), (0, split)])
+}
+
 thread_local! {
     /// Chunks walks evaluated in their warm-ups, before walking in order.
     static WARMUP_EVALUATED: Cell<i64> = const { Cell::new(0) };
@@ -298,6 +321,14 @@ pub struct WalkConfig {
     /// candidate, as if the top k were already known. It changes which rows
     /// a query returns.
     pub seed: Option<(f32, Tid)>,
+    /// Per mille of the first native segment's groups, its last, that its
+    /// walk takes first, when the query expects at least `tail_first_min`
+    /// candidates there ([`Scorer::expected_candidates`]); zero: none. The
+    /// threshold forms there before the walk turns to the segment's other
+    /// groups and the other segments; the rows kept are the same in any
+    /// order (see [`TopRows`]).
+    pub tail_first_permille: u32,
+    pub tail_first_min: f64,
 }
 
 /// Whether a candidate's tuple is visible: asked of each candidate as it
@@ -766,6 +797,22 @@ impl TopRows {
 }
 
 impl Scorer {
+    /// The candidates a walk over `index` is expected to meet, its terms
+    /// taken as independent: a conjunction's (a phrase's) documents holding
+    /// every scoring term, a disjunction's postings of them all.
+    pub fn expected_candidates(&self, index: &dyn Index) -> f64 {
+        let docs = f64::from(index.document_count().max(1));
+        let all = prunable_shape(&self.query).is_some_and(|(combine, _, _)| combine == Combine::All);
+        let mut share = 1.0_f64;
+        let mut sum = 0.0_f64;
+        for (term, _) in &self.terms {
+            let df = segment_error(index.term(term)).map_or(0, |t| t.df());
+            share *= f64::from(df) / docs;
+            sum += f64::from(df);
+        }
+        if all { share * docs } else { sum }
+    }
+
     /// True when no term scores: every leaf is absent or an elided dense
     /// term, so every match scores zero and ranks in heap order.
     pub fn scores_nothing(&self) -> bool {
@@ -918,23 +965,46 @@ impl Scorer {
             loop {
                 let mut visibility = open(shortcut);
                 rest.clear();
+                let mut first = true;
                 for &i in &order {
                     let source = &sources[i];
                     let walked = match (&node, source.native) {
                         (Some(node), Some(native)) => {
+                            let lead = std::mem::take(&mut first)
+                                && config.tail_first_permille > 0
+                                && self.expected_candidates(source.index) >= config.tail_first_min;
                             native.walk(&names, positions, &mut |segment| {
-                                let answer = crate::tinshape::top_k_into(
-                                    segment,
-                                    node,
-                                    &names,
-                                    &self.terms,
-                                    &mut top,
-                                    &mut visibility,
-                                    &mut crate::tinshape::NoTouch,
-                                )?;
-                                scored += answer.scored as usize;
-                                POSITION_CHECKS
-                                    .set(POSITION_CHECKS.get() + answer.position_checks as i64);
+                                let groups = segment.docs.geometry.groups.len();
+                                let split = lead
+                                    .then(|| tail_first(groups, config.tail_first_permille))
+                                    .flatten();
+                                // Every group in one walk, or the tail's
+                                // walk then the rest's.
+                                let whole: [&[(u32, u32)]; 1] = [&[]];
+                                let parts: [&[(u32, u32)]; 2];
+                                let walks: &[&[(u32, u32)]] = match &split {
+                                    Some(split) => {
+                                        parts = [&split[..1], &split[1..]];
+                                        &parts
+                                    }
+                                    None => &whole,
+                                };
+                                for groups in walks {
+                                    let answer = crate::tinshape::top_k_into_groups(
+                                        segment,
+                                        node,
+                                        &names,
+                                        &self.terms,
+                                        &mut top,
+                                        &mut visibility,
+                                        groups,
+                                        &mut crate::tinshape::NoTouch,
+                                    )?;
+                                    scored += answer.scored as usize;
+                                    POSITION_CHECKS.set(
+                                        POSITION_CHECKS.get() + answer.position_checks as i64,
+                                    );
+                                }
                                 Ok(())
                             })
                         }
@@ -3989,6 +4059,18 @@ impl<'a> OrdinalWalk<'a, '_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The first segment's tail is its last groups, at least one and never
+    /// all, then the rest: together every group once.
+    #[test]
+    fn tail_first_splits_every_group_once() {
+        assert_eq!(tail_first(1023, 100), None);
+        assert_eq!(tail_first(5000, 0), None);
+        assert_eq!(tail_first(1024, 100), Some([(921, 1024), (0, 921)]));
+        assert_eq!(tail_first(14445, 100), Some([(13000, 14445), (0, 13000)]));
+        assert_eq!(tail_first(2000, 1), Some([(1998, 2000), (0, 1998)]));
+        assert_eq!(tail_first(2000, 1000), Some([(1, 2000), (0, 1)]));
+    }
 
     /// A small linear congruential generator: deterministic, no dependency.
     struct Lcg(u64);
