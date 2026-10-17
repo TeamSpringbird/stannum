@@ -119,11 +119,20 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
          | sparse:  form u8, [footer_len], payload_len, [lengths_len],
                     [footer], list, [lengths], tf
          | grouped: form u8, directory_len, payload_len, [lengths_len],
-                    directory, container*, [lengths], tf
+                    [subs_len], directory, container*, [lengths], tf, [subs]
                     (directory_len: the bytes of the payload before its
                     containers, layout 10)
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
-           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped)
+           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped),
+           | 0x08 when sub-range codes (grouped, layout 17)
+subs    := (offset u32 LE) per directory entry (u32::MAX: none; else where
+           its codes start after the offsets), then per grid entry, per
+           64-slot sub-range in order, per pair k of its group frontier one
+           byte: the least round_length code (at most 254) of the
+           sub-range's postings whose bucket lies above pair k-1's and at
+           most pair k's, 255 for none (a term in at least one in 10 of the
+           segment's documents, `Options::sub_codes_share`; see
+           [sub-range codes](#sub-range-codes-for-full_score-conjunctions))
 lengths := base varint, width u8, (length - base) packed at width, by posting
 list    := Elias-Fano over the term's slots, universe = all slots
 directory := groups varint, widths u8 * 4, presence, base*, row*,
@@ -2520,6 +2529,61 @@ host busy with other work throughout, so not a measure of the build.
 The PGO profiles were retrained on it (`d07348e` aarch64, `b6cef80`
 x86-64, 40 of 40 hot functions each; every training answer equal to
 PostgreSQL's).
+
+## Sub-range codes for full_score conjunctions
+
+Branch `loop/subrange`, page layout 17 (beyond TIN's structure, by the
+owner's call for this lane; R10's codes, `loop/r10`, at a finer grain and
+read by one walk only). A `full_score` conjunction of common words spends
+its time on candidates: at 150M rows its slowest forms ("can use it in",
+"with the one which you") examine a million candidates and score a few
+thousand, and a group's one frontier per term cannot rule out a part of
+the group whose postings are all long or low.
+
+A grouped record of a term in at least one in 10 of its segment's documents
+(`Options::sub_codes_share`) holds sub-range codes for its grids ([grammar](#postings-record)):
+per 64-slot sub-range (one word of the group's candidate bitmap) and
+frontier pair, the least rounded length of the sub-range's postings at
+that pair's buckets. They end the record, after the TF tail, so nothing
+but the walk that uses them reads them and every other area lies where it
+would without them. A led walk's group
+of all grids with at least 32 candidates (`SUB_MIN`) bounds each candidate
+word by its scoring terms' codes, the best pair bucket at its code's length
+per term (at most its group bound; a term without codes at its group
+bound), summed in the scorer's order, and clears the words its bar cuts
+before its sieve: their candidates read no bucket, class or length. Exact
+as the walk's other cuts. A group whose uncoded terms' bounds alone reach
+the bar reads no code. Disjunctions never read them; a `score` walk elides
+the terms that carry them (both at a tenth of the documents).
+
+The census before the build (32.6M rows, whole trace, the bar when the
+group's candidates are listed, codes on terms of at least a tenth of the
+documents): 64-slot sub-ranges cut 88% of `full_score` conjunctions'
+candidates and 76% of phrases' (256 slots: 73% / 60%; R10's 1,024: 42% /
+32%); the 25 slowest conjunctions 95%, 97% at the final threshold. A
+sub-range's largest bucket alone, or with its shortest length, cuts 13-29%.
+Skipping the cut candidates (recorded, then replayed) took 17% of
+conjunctions' cycles and 11% of phrases', the slowest 25 48% and 24%;
+1,024-slot sub-ranges took none (R10's gain was its finer per-candidate
+length floors).
+
+| 150M rows, x86 paired gate (3 rounds, f3dcd3f vs 990e51c) | full conj | full phrase | conj | phrase | disj | full disj |
+|---|---:|---:|---:|---:|---:|---:|
+| q/Gcyc, paired core | **+12.6%** | **+10.7%** | +0.5% | +2.8% | +1.0% | +0.0% |
+| instructions/q | -13.6% | -13.4% | +0.1% | -0.1% | -0.0% | -0.0% |
+| tail-25 (i16's slowest), paired cycles | **-25.8%** | **-19.4%** | | | | +0.1% |
+
+Index +1.66% (36.23 -> 36.83 GB). Answers identical (`--expect` 0
+different, `--full` byte-identical). On M4 (32.6M rows) `full_score`
+conjunctions' cycles fell 23% and phrases' 9% (the slowest 25: 49% and
+19%); `SUB_MIN` 256 / 96 / 32 / 16 / 8 cut conjunctions' cycles 4 / 15 /
+23 / 24 / 23%. Kept by the paired gate (geomean +4.48%, rounds +3.6 / +4.5 / +5.5,
+worst style +0.04%). A first gate of an earlier build had dropped it: score
+conjunctions and phrases fell 0.9% and 0.5% with 0.4-0.7% more
+instructions in every untargeted style, disjunctions included, which never
+reach the cut. Bisected on M4: iterating a group frontier in the cut
+compiled the walks' hot frontier folds differently; the cut now decodes its
+buckets with its own function (`frontier_buckets`).
 
 ## Open
 

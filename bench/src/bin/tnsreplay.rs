@@ -1895,6 +1895,35 @@ fn throughput(args: &Args, loaded: &Loaded, trace: &[bench::TraceQuery]) -> Resu
     Ok(())
 }
 
+/// One query's (or a style's, as `ALL`) sub-range census: a `subq` line of
+/// the candidates listed and, per size and encoding, the candidates in cut
+/// sub-ranges; then what a skip dropped.
+#[cfg(feature = "census")]
+#[allow(clippy::needless_range_loop, reason = "parallel arrays")]
+fn print_sub_query(name: &str, style: &str, t: &engine::tinshape::census::SubTally) {
+    use engine::tinshape::census::{ENC_NAMES, ENCS, SUB_SHIFTS, SUBS};
+    let mut line = format!(
+        "subq\t{name}\t{style}\tgroups\t{}\tcands\t{}\tgrid_terms\t{}\tother_terms\t{}",
+        t.groups, t.cands, t.grid_terms, t.other_terms
+    );
+    for k in 0..SUBS {
+        let _ = write!(line, "\ts{}_subs\t{}", 1u32 << SUB_SHIFTS[k], t.subs[k]);
+        for e in 0..ENCS {
+            let _ = write!(
+                line,
+                "\ts{}{}\t{}\t{}\t{}",
+                1u32 << SUB_SHIFTS[k],
+                ENC_NAMES[e],
+                t.cut_cands[k][e],
+                t.cut_subs[k][e],
+                t.cut_groups[k][e]
+            );
+        }
+    }
+    let _ = write!(line, "\tskipped\t{}\tlate\t{}", t.skipped, t.skipped_late);
+    println!("{line}");
+}
+
 /// The window bounds census per style (`--features census`, with
 /// `STANNUM_WIN_CENSUS` set): the answer pass's walks only.
 #[cfg(feature = "census")]
@@ -2346,6 +2375,9 @@ fn run() -> Result<bool, String> {
     let mut mismatched = 0usize;
     #[cfg(feature = "census")]
     let mut census = std::collections::BTreeMap::<String, engine::tinshape::census::Tally>::new();
+    #[cfg(feature = "census")]
+    let mut sub_census =
+        std::collections::BTreeMap::<String, engine::tinshape::census::SubTally>::new();
     for (n, q) in trace.iter().enumerate() {
         reader.full.set(fulls[n]);
         let scorer = reader.scorer(&q.text)?;
@@ -2357,6 +2389,11 @@ fn run() -> Result<bool, String> {
         }
         #[cfg(feature = "census")]
         engine::tinshape::census::take();
+        #[cfg(feature = "census")]
+        {
+            engine::tinshape::census::take_sub();
+            engine::tinshape::census::record();
+        }
         let Some(answer) = reader.ranked(&scorer, args.k) else {
             unsupported += 1;
             continue;
@@ -2366,6 +2403,20 @@ fn run() -> Result<bool, String> {
             .entry(q.style.clone())
             .or_default()
             .add(&engine::tinshape::census::take());
+        #[cfg(feature = "census")]
+        {
+            let t = engine::tinshape::census::take_sub();
+            // Seeded, the census is the (one) timed pass's, at the final
+            // threshold; else the answer pass's, and timed passes replay its
+            // cuts.
+            if !args.seed {
+                if t.walks > 0 && engine::tinshape::census::sub_enabled() {
+                    print_sub_query(&q.name, &q.style, &t);
+                    sub_census.entry(q.style.clone()).or_default().add(&t);
+                }
+                engine::tinshape::census::replay();
+            }
+        }
         let memo = segment::tinshape::segment::memo_counts();
         // `--seed-rank R`: the rows ranked R-k+1..=R (or the last k of
         // fewer, when at least 2k match), found untimed.
@@ -2421,6 +2472,15 @@ fn run() -> Result<bool, String> {
         }
         let counters1 = process_counters();
         let timed: [u64; 3] = std::array::from_fn(|i| counters1[i] - counters0[i]);
+        #[cfg(feature = "census")]
+        if args.seed {
+            let t = engine::tinshape::census::take_sub();
+            if t.walks > 0 && engine::tinshape::census::sub_enabled() {
+                print_sub_query(&q.name, &q.style, &t);
+                sub_census.entry(q.style.clone()).or_default().add(&t);
+            }
+            engine::tinshape::census::replay();
+        }
         let mut pages = Pages::default();
         let pins0 = PINS.get();
         let hash0 = REFS.with_borrow_mut(|refs| {
@@ -2548,6 +2608,10 @@ fn run() -> Result<bool, String> {
     );
     #[cfg(feature = "census")]
     print_census(&census);
+    #[cfg(feature = "census")]
+    for (style, t) in &sub_census {
+        print_sub_query("ALL", style, t);
+    }
     let mut styles: Vec<String> = rows.iter().map(|r| r.style.clone()).collect();
     styles.sort();
     styles.dedup();
@@ -2772,12 +2836,12 @@ fn run() -> Result<bool, String> {
     }
     if let Some(path) = &args.per_query {
         let mut text = String::from(
-            "name\tstyle\tus\texamined\tscored\tchecks\tpages\tdl\tpayload\tfooter\ttf\tpositions\tpins\tallocs\treallocs\tdlclass\tclasscuts\tins\tcyc\n",
+            "name\tstyle\tus\texamined\tscored\tchecks\tpages\tdl\tpayload\tfooter\ttf\tpositions\tpins\tallocs\treallocs\tdlclass\tclasscuts\tins\tcyc\ttfreads\tdlreads\tclassreads\tpayloadreads\n",
         );
         for r in &rows {
             let _ = writeln!(
                 text,
-                "{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}",
+                "{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}\t{}\t{}\t{}\t{}",
                 r.name,
                 r.style,
                 r.ns as f64 / 1e3,
@@ -2797,6 +2861,10 @@ fn run() -> Result<bool, String> {
                 r.answer.class_cuts,
                 r.timed[0] as f64 / args.repeat.max(1) as f64,
                 r.timed[1] as f64 / args.repeat.max(1) as f64,
+                r.pages.accesses.get(&Part::TfTail).copied().unwrap_or(0),
+                r.pages.accesses.get(&Part::DlSidecar).copied().unwrap_or(0),
+                r.pages.accesses.get(&Part::DlClasses).copied().unwrap_or(0),
+                r.pages.accesses.get(&Part::Payload).copied().unwrap_or(0),
             );
         }
         std::fs::write(path, text).map_err(|e| e.to_string())?;

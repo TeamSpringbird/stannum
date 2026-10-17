@@ -33,7 +33,8 @@ use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::{Block, Positions};
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, InOrder, KIND_ARRAY, KIND_EF, KIND_GRID,
-    LazyFooter, array_bytes, fold_group_frontier, higher, lower,
+    LazyFooter, SUB_NONE, SubCodes, array_bytes, fold_group_frontier, higher, lower,
+    rounded_length,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -65,6 +66,14 @@ const COMMON_RATIO: u64 = 10;
 /// that is still low early in a walk rises between chunks rather than
 /// letting a whole group's candidates be bounded and sorted against it.
 const STAGE_CHUNK: usize = 256;
+
+/// A led walk's group of all grids holding at least this many candidates
+/// is cut by its scoring terms' sub-range codes first ([`Walk::sub_cut`]):
+/// the cut reads a byte per term, frontier pair and word holding one. At
+/// 32.6M rows (M4, whole trace) 32 cut `full_score` conjunctions' cycles
+/// 23% and phrases' 10%, 96 15% and 9%, 256 4% and 7%: a dense
+/// conjunction's group holds about 100 candidates.
+const SUB_MIN: u64 = 32;
 
 /// A group with at least this many candidates has them sieved by their
 /// buckets ([`Walk::sieve`]) this many at a time ([`SIEVE_CHUNK`]) before
@@ -1371,6 +1380,89 @@ enum Verify<'a> {
 
 /// A ranked walk over one segment: led by required terms (`run`) or a
 /// disjunction of the scoring terms (`run_or`).
+/// A scoring term's sub-range codes ([`SubCodes`]), for a led walk's
+/// sub-range cut ([`Walk::sub_cut`]), and per frontier bucket and code the
+/// term's bound at that bucket and the code's length, filled as asked (NaN
+/// until then; allocated at the first cut).
+struct SubTerm<'a> {
+    codes: SubCodes<'a>,
+    table: Vec<f32>,
+}
+
+impl SubTerm<'_> {
+    /// What a posting of bucket at most `bucket`, at least as long as `code`
+    /// says, scores at most by `scorer`; zero for [`SUB_NONE`].
+    #[inline]
+    fn bound(&mut self, scorer: &TermScorer, bucket: u8, code: u8) -> f32 {
+        let at = usize::from(bucket) % BUCKET_COUNT * 256 + usize::from(code);
+        let v = self.table[at];
+        if !v.is_nan() {
+            return v;
+        }
+        let v = if code == SUB_NONE {
+            0.0
+        } else {
+            scorer.bound_through(
+                TfBucket::new(bucket).expect("a valid bucket"),
+                rounded_length(u32::from(code)),
+            )
+        };
+        self.table[at] = v;
+        v
+    }
+}
+
+/// The buckets of the group frontier at `at` of a directory's bytes (its
+/// head, then a varint per further pair whose low four bits are the bucket
+/// gap less one) into `out`, and how many; 0 for a malformed one (the cut
+/// then bounds the term by its group). Its own decoder: iterating a
+/// [`GroupFrontier`] here as well cost every walk ~1% more instructions
+/// (aarch64 and x86-64: the hot frontier folds compiled differently).
+#[inline(never)]
+fn frontier_buckets(bytes: &[u8], at: usize, out: &mut [u8; 16]) -> usize {
+    let varint = |p: &mut usize| -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = *bytes.get(*p)?;
+            *p += 1;
+            value |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    };
+    let Some(&head) = bytes.get(at) else {
+        return 0;
+    };
+    let n = usize::from(head >> 4) + 1;
+    let mut bucket = head & 15;
+    out[0] = bucket;
+    let mut p = at + 1;
+    if varint(&mut p).is_none() {
+        return 0;
+    }
+    for slot in out.iter_mut().take(n).skip(1) {
+        let Some(d) = varint(&mut p) else {
+            return 0;
+        };
+        bucket = bucket.wrapping_add(1 + (d & 15) as u8) & 15;
+        *slot = bucket;
+    }
+    n
+}
+
+/// A led walk's sub-range cut ([`Walk::sub_cut`]): per scoring term (by
+/// index into `sc`) its codes, if its record has them, and the group at
+/// hand's sub-ranges' bounds.
+struct SubCut<'a> {
+    terms: Vec<Option<SubTerm<'a>>>,
+    sums: Vec<f32>,
+    /// Per scoring term in the group at hand: its bound over the group, and
+    /// whether its codes bound it per sub-range.
+    bounds: Vec<(f32, bool)>,
+}
+
 struct Walk<'s, 'a, T: Touch> {
     segment: &'s Segment<'a>,
     geometry: &'s Geometry,
@@ -1413,6 +1505,9 @@ struct Walk<'s, 'a, T: Touch> {
     cand_base: Vec<u32>,
     blocks: Vec<usize>,
     sub_bounds: Vec<f32>,
+    /// A led walk's sub-range cut ([`Walk::sub_cut`]), when a scoring term
+    /// has codes: boxed, so walks without them carry a pointer.
+    subs: Option<Box<SubCut<'a>>>,
     plan: Plan,
     /// A disjunction's group at hand: per scoring term room for a row of
     /// the group's words holding its members (unless read in place, see
@@ -1470,6 +1565,9 @@ struct Walk<'s, 'a, T: Touch> {
     /// The window bounds census, when built and enabled.
     #[cfg(feature = "census")]
     census: Option<Box<super::census::WalkCensus>>,
+    /// The sub-range census, when built and enabled.
+    #[cfg(feature = "census")]
+    sub: Option<Box<super::census::SubWalk>>,
     verify: Verify<'a>,
     /// A span's candidate at hand: its posting index in each span slot's
     /// term.
@@ -1590,6 +1688,261 @@ impl<T: Touch> Walk<'_, '_, T> {
         }
         c.tally.walks += 1;
         super::census::add(&c.tally);
+    }
+}
+
+#[cfg(feature = "census")]
+impl<'a, T: Touch> Walk<'_, 'a, T> {
+    /// The sub-range census ([`super::census::SubWalk`]) of group `g`,
+    /// whose candidates are `cands` (local slots, ascending), at the
+    /// threshold now. With a skip asked, its size's shift (its cuts in the
+    /// census's `skip_cut`).
+    #[allow(clippy::needless_range_loop, reason = "lab code: parallel arrays")]
+    fn sub_census(&mut self, g: u32, cands: &[u32]) -> Result<Option<u32>> {
+        use super::census::{ENCS, RECORDED, REPLAY, SUB_SHIFTS, SUBS};
+        use segment::tinshape::postings::{round_length, rounded_length};
+        let n = self.sc.len();
+        if n == 0 {
+            return Ok(None);
+        }
+        let Some(mut c) = self.sub.take() else {
+            return Ok(None);
+        };
+        let key = (std::ptr::from_ref(self.segment) as usize, g);
+        if super::census::mode() == REPLAY {
+            let shift = RECORDED.with(|r| {
+                let r = r.borrow();
+                let (shift, sums, cut) = r.get(&key)?;
+                c.skip_sums.clone_from(sums);
+                c.skip_cut.clone_from(cut);
+                Some(*shift)
+            });
+            c.skip_g = if shift.is_some() { g + 1 } else { 0 };
+            self.sub = Some(c);
+            return Ok(shift);
+        }
+        let group = self.geometry.groups[g as usize];
+        let slots = group.slots();
+        let chunks = slots.div_ceil(64) as usize;
+        c.stairs.clear();
+        c.stairs.resize(n * chunks, [u32::MAX; BUCKET_COUNT]);
+        c.fixed.clear();
+        c.fixed.resize(n, None);
+        c.gbound.clear();
+        c.gbound.resize(n, 0.0);
+        c.mb.clear();
+        c.mb.resize(n, [0.0; BUCKET_COUNT]);
+        c.pairs.clear();
+        c.pairs.resize(n, ([0; 16], 0));
+        let least_df = super::census::sub_df() * f64::from(self.segment.documents);
+        for i in 0..n {
+            let t = self.sc[i].term;
+            let dense = f64::from(self.terms[t].as_ref().expect("scoring").df) >= least_df;
+            let grid = match self.mems[t].kind {
+                Kind::Grid(bytes)
+                    if dense
+                        && self.mems[t].loaded == g + 1
+                        && self.sc[i].grouped()
+                        && self.mems[t].entry != usize::MAX =>
+                {
+                    Some(bytes)
+                }
+                _ => None,
+            };
+            let Some(bytes) = grid else {
+                let base = group.slot_base;
+                let v = self.sc[i].range_bound(g, base, base + slots - 1);
+                c.fixed[i] = Some(v);
+                c.tally.other_terms += 1;
+                continue;
+            };
+            c.tally.grid_terms += 1;
+            let (first, entry) = (self.mems[t].first, self.mems[t].entry);
+            let tf = self.terms[t].as_ref().expect("scoring").postings.tf;
+            let mut rank = 0u32;
+            for (w, chunk) in bytes.chunks(8).enumerate() {
+                let mut word = [0u8; 8];
+                word[..chunk.len()].copy_from_slice(chunk);
+                let mut word = u64::from_le_bytes(word);
+                while word != 0 {
+                    let local = w as u32 * 64 + word.trailing_zeros();
+                    word &= word - 1;
+                    let bucket = self.sc[i].bucket_in(entry, tf, first + rank)?;
+                    rank += 1;
+                    let Some(doc) = self.segment.docs.rank_in(g as usize, local) else {
+                        continue;
+                    };
+                    let length = self.segment.lengths.get(doc)?;
+                    // R10's u8 code: at most 254.
+                    let code = rounded_length(round_length(length).min(254));
+                    let at = &mut c.stairs[i * chunks + local as usize / 64][usize::from(bucket)];
+                    *at = (*at).min(code);
+                }
+            }
+            c.gbound[i] = higher(0.0, self.sc[i].bound(entry));
+            if let Bounds::Groups(gb) = &self.sc[i].footer {
+                let (buckets, count) = &mut c.pairs[i];
+                for (bucket, _) in gb.frontier(entry) {
+                    if *count < 16 {
+                        buckets[*count] = bucket;
+                        *count += 1;
+                    }
+                }
+            }
+            let mut best = 0.0_f32;
+            for b in 0..BUCKET_COUNT {
+                best = higher(best, self.sc[i].floor_kept(entry, b as u8).1);
+                c.mb[i][b] = best;
+            }
+        }
+        c.tally.groups += 1;
+        c.tally.cands += cands.len() as u64;
+        let skip = super::census::sub_skip();
+        let mut out = None;
+        let geometry = self.geometry;
+        for k in 0..SUBS {
+            let shift = SUB_SHIFTS[k];
+            let per = 1usize << (shift - 6);
+            let subs = chunks.div_ceil(per);
+            let mut counts = vec![0u32; subs];
+            for l in cands {
+                counts[(*l >> shift) as usize] += 1;
+            }
+            let mut sums = vec![[0.0_f32; ENCS]; subs];
+            for (j, sum) in sums.iter_mut().enumerate() {
+                if counts[j] == 0 {
+                    continue;
+                }
+                for i in 0..n {
+                    if let Some(v) = c.fixed[i] {
+                        for e in sum.iter_mut() {
+                            *e += v;
+                        }
+                        continue;
+                    }
+                    let mut stair = [u32::MAX; BUCKET_COUNT];
+                    for ch in
+                        &c.stairs[i * chunks + j * per..i * chunks + ((j + 1) * per).min(chunks)]
+                    {
+                        for b in 0..BUCKET_COUNT {
+                            stair[b] = stair[b].min(ch[b]);
+                        }
+                    }
+                    // R10's codes: per frontier pair, the shortest of its
+                    // buckets above the pair before's.
+                    let pr_codes = {
+                        let (buckets, count) = c.pairs[i];
+                        let mut codes = [u32::MAX; 16];
+                        let mut from = 0usize;
+                        for k in 0..count {
+                            let to = usize::from(buckets[k]);
+                            for b in from..=to.min(BUCKET_COUNT - 1) {
+                                codes[k] = codes[k].min(stair[b]);
+                            }
+                            from = to + 1;
+                        }
+                        (codes, buckets, count)
+                    };
+                    // Shortest at the bucket or above.
+                    let mut least = u32::MAX;
+                    let mut top = None;
+                    for b in (0..BUCKET_COUNT).rev() {
+                        if stair[b] != u32::MAX && top.is_none() {
+                            top = Some(b);
+                        }
+                        least = least.min(stair[b]);
+                        stair[b] = least;
+                    }
+                    let Some(top) = top else {
+                        continue;
+                    };
+                    let scorer = &self.sc[i].scorer;
+                    let bucket = |b: usize| TfBucket::new(b as u8).expect("a valid bucket");
+                    let mut st = 0.0_f32;
+                    for b in 0..=top {
+                        st = higher(st, scorer.bound_through(bucket(b), stair[b]));
+                    }
+                    let bl = scorer.bound_through(bucket(top), stair[0]);
+                    let mut pr = 0.0_f32;
+                    let (codes, buckets, count) = pr_codes;
+                    for k in 0..count {
+                        if codes[k] != u32::MAX {
+                            pr = higher(
+                                pr,
+                                scorer.bound_through(bucket(usize::from(buckets[k])), codes[k]),
+                            );
+                        }
+                    }
+                    let gb = c.gbound[i];
+                    sum[0] += lower(st, gb);
+                    sum[1] += lower(bl, gb);
+                    sum[2] += lower(c.mb[i][top], gb);
+                    sum[3] += lower(pr, gb);
+                }
+            }
+            c.tally.subs[k] += counts.iter().filter(|n| **n > 0).count() as u64;
+            let mut cut = vec![[false; ENCS]; subs];
+            for j in 0..subs {
+                if counts[j] == 0 {
+                    continue;
+                }
+                let from = (j << shift) as u32;
+                for e in 0..ENCS {
+                    if self.cut(sums[j][e], || geometry.tid_in(g as usize, from)) {
+                        cut[j][e] = true;
+                        c.tally.cut_subs[k][e] += 1;
+                        c.tally.cut_cands[k][e] += u64::from(counts[j]);
+                    }
+                }
+            }
+            for e in 0..ENCS {
+                if (0..subs).all(|j| counts[j] == 0 || cut[j][e]) {
+                    c.tally.cut_groups[k][e] += 1;
+                }
+            }
+            if let Some((sk, se)) = skip
+                && sk == k
+            {
+                c.skip_g = g + 1;
+                c.skip_sums = sums.iter().map(|s| s[se]).collect();
+                c.skip_cut = cut.iter().map(|s| s[se]).collect();
+                RECORDED.with(|r| {
+                    r.borrow_mut()
+                        .insert(key, (shift, c.skip_sums.clone(), c.skip_cut.clone()))
+                });
+                out = Some(shift);
+            }
+        }
+        self.sub = Some(c);
+        Ok(out)
+    }
+
+    /// With a sub-range skip, whether the candidate at slot `local` of
+    /// group `g` lies in a sub-range the threshold now cuts (counted once
+    /// per candidate).
+    #[inline]
+    fn sub_late(&mut self, g: u32, local: u32) -> bool {
+        let Some(c) = self.sub.as_ref() else {
+            return false;
+        };
+        if c.skip_g != g + 1 {
+            return false;
+        }
+        let Some((k, _)) = super::census::sub_skip() else {
+            return false;
+        };
+        let shift = super::census::SUB_SHIFTS[k];
+        let j = (local >> shift) as usize;
+        let sum = c.skip_sums[j];
+        let geometry = self.geometry;
+        let from = (j << shift) as u32;
+        if !self.cut(sum, || geometry.tid_in(g as usize, from)) {
+            return false;
+        }
+        if let Some(c) = self.sub.as_mut() {
+            c.tally.skipped_late += 1;
+        }
+        true
     }
 }
 
@@ -1914,6 +2267,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
             }
         }
+        #[cfg(feature = "census")]
+        if self.sub.is_some()
+            && !cands.is_empty()
+            && let Some(shift) = self.sub_census(g, &cands)?
+            && let Some(c) = self.sub.as_mut()
+        {
+            let before = cands.len();
+            let cut = &c.skip_cut;
+            cands.retain(|l| !cut[(*l >> shift) as usize]);
+            c.tally.skipped += (before - cands.len()) as u64;
+        }
         let more = self.walk_candidates(g, &cands)?;
         self.cands = cands;
         Ok(more)
@@ -1954,6 +2318,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     _ => break,
                 }
             }
+            #[cfg(feature = "census")]
+            if self.sub_late(g, local) {
+                continue;
+            }
             if staging {
                 self.stage_into(g, local)?;
                 if self.staged.len() >= STAGE_CHUNK {
@@ -1989,6 +2357,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                         Some(e) if e < u32::MAX => continue,
                         _ => break 'chunks,
                     }
+                }
+                #[cfg(feature = "census")]
+                if self.sub_late(g, local) {
+                    continue;
                 }
                 if staging {
                     self.stage_into(g, local)?;
@@ -2565,6 +2937,43 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if let Some(dead) = self.segment.liveness.groups[g as usize].as_deref() {
             kernels::andnot_words(words, dead);
         }
+        if self.subs.is_some() && self.bar.is_some() && kernels::popcount(&self.words) >= SUB_MIN {
+            self.sub_cut(g)?;
+        }
+        #[cfg(feature = "census")]
+        if self.sub.is_some() {
+            // Replaying, only the recorded cuts are looked up.
+            let skip = if super::census::mode() == super::census::REPLAY {
+                self.sub_census(g, &[])?
+            } else {
+                let mut listed = std::mem::take(&mut self.cands);
+                listed.clear();
+                kernels::set_bits(&self.words, &mut listed);
+                let skip = if listed.is_empty() {
+                    None
+                } else {
+                    self.sub_census(g, &listed)?
+                };
+                self.cands = listed;
+                skip
+            };
+            if let Some(shift) = skip
+                && let Some(c) = self.sub.as_mut()
+            {
+                let per = 1usize << (shift - 6);
+                let mut dropped = 0u64;
+                for (j, cut) in c.skip_cut.iter().enumerate() {
+                    if *cut {
+                        let end = ((j + 1) * per).min(self.words.len());
+                        for w in &mut self.words[j * per..end] {
+                            dropped += u64::from(w.count_ones());
+                            *w = 0;
+                        }
+                    }
+                }
+                c.tally.skipped += dropped;
+            }
+        }
         // A group the sieve takes is sieved by its first term's buckets
         // before its candidates are listed.
         let sieved = kernels::popcount(&self.words) >= SIEVE_MIN as u64 && self.sieve_led(g)?;
@@ -2585,6 +2994,117 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         };
         self.cands = cands;
         more
+    }
+
+    /// Clears from [`Walk::words`], group `g`'s candidates (a bit per slot,
+    /// every required term a grid there, loaded), the words no match in
+    /// which can be kept: each word is a sub-range of [`SUB_SLOTS`] slots,
+    /// bounded by the scoring terms' bounds there summed in the scorer's
+    /// order, a term's by its sub-range codes where its grid has them (the
+    /// best of its frontier pairs' buckets at their codes' lengths, at
+    /// most its group bound), any other's by its bound over the group.
+    /// Exact as [`Walk::cut`] is: each term's bound covers its postings in
+    /// the sub-range. A cut word's candidates read no bucket and no length.
+    ///
+    /// [`SUB_SLOTS`]: segment::tinshape::postings::SUB_SLOTS
+    #[inline(never)]
+    fn sub_cut(&mut self, g: u32) -> Result<()> {
+        let group = self.geometry.groups[g as usize];
+        let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
+        let words = self.words.len();
+        debug_assert_eq!(
+            words,
+            segment::tinshape::postings::sub_ranges(group.slots())
+        );
+        let SubCut {
+            terms,
+            sums,
+            bounds,
+        } = self.subs.as_deref_mut().expect("codes");
+        // Each term's bound over the group, and whether codes bound it: the
+        // others' bounds alone at the bar or above leave no word to cut
+        // (a word's bound is at least theirs), and no code is read.
+        bounds.clear();
+        let mut fixed = 0.0_f32;
+        let mut any = false;
+        for (i, term) in terms.iter().enumerate() {
+            let t = self.sc[i].term;
+            let entry = self.mems[t].entry;
+            let held = self.mems[t].loaded == g + 1 && entry != usize::MAX;
+            let gb = if held && self.sc[i].grouped() {
+                higher(0.0, self.sc[i].bound(entry))
+            } else {
+                self.sc[i].range_bound(g, base, end)
+            };
+            let coded = held && term.is_some() && matches!(self.mems[t].kind, Kind::Grid(_));
+            if !coded {
+                fixed += gb;
+            }
+            any |= coded;
+            bounds.push((gb, coded));
+        }
+        if !any || self.bar.is_none_or(|(theta, _)| fixed >= theta) {
+            return Ok(());
+        }
+        sums.clear();
+        sums.resize(words, 0.0);
+        let mut coded = false;
+        for (i, term) in terms.iter_mut().enumerate() {
+            let t = self.sc[i].term;
+            let entry = self.mems[t].entry;
+            let (gb, codable) = bounds[i];
+            if codable
+                && let Some(st) = term.as_mut()
+                && let Bounds::Groups(groups) = &self.sc[i].footer
+            {
+                let mut buckets = [0u8; 16];
+                let pairs = frontier_buckets(
+                    groups.dir.bytes(),
+                    groups.entry(entry).frontier as usize,
+                    &mut buckets,
+                );
+                if pairs > 0
+                    && let Some((codes, at)) = st.codes.of(entry, words * pairs)?
+                {
+                    if st.table.is_empty() {
+                        st.table = vec![f32::NAN; BUCKET_COUNT * 256];
+                    }
+                    let set = self.terms[t].as_ref().expect("scoring");
+                    self.touch
+                        .touch(Part::Footer, set.at + st.codes.at + at, codes.len());
+                    coded = true;
+                    let scorer = &self.sc[i].scorer;
+                    for (j, sum) in sums.iter_mut().enumerate() {
+                        if self.words[j] == 0 {
+                            continue;
+                        }
+                        let row = &codes[j * pairs..(j + 1) * pairs];
+                        let mut v = 0.0_f32;
+                        for k in 0..pairs {
+                            v = higher(v, st.bound(scorer, buckets[k], row[k]));
+                        }
+                        *sum += lower(v, gb);
+                    }
+                    continue;
+                }
+            }
+            for sum in sums.iter_mut() {
+                *sum += gb;
+            }
+        }
+        if coded {
+            let geometry = self.geometry;
+            for (j, sum) in sums.iter().enumerate() {
+                if self.words[j] != 0
+                    && cut_by(self.bar, *sum, || {
+                        geometry.tid_in(g as usize, (j * 64) as u32)
+                    })
+                {
+                    self.words[j] = 0;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Moves the window to slot `local` of group `g` (whose first slot is
@@ -3417,6 +3937,7 @@ pub(super) fn walk_into<'s, 'a>(
         cand_base: Vec::with_capacity(n),
         blocks: vec![0; n],
         sub_bounds: Vec::new(),
+        subs: None,
         plan: Plan::default(),
         rows: Vec::new(),
         row_state: vec![Row::default(); n],
@@ -3474,6 +3995,8 @@ pub(super) fn walk_into<'s, 'a>(
         held: Vec::new(),
         #[cfg(feature = "census")]
         census: super::census::WalkCensus::start(),
+        #[cfg(feature = "census")]
+        sub: super::census::SubWalk::start(),
     };
     walk.term_sc = vec![usize::MAX; walk.terms.len()];
     for i in 0..n {
@@ -3515,6 +4038,31 @@ pub(super) fn walk_into<'s, 'a>(
                 }
             }
         }
+    }
+    // A led walk bounds a group's sub-ranges by its terms' codes.
+    if !walk.req.is_empty()
+        && walk.sc.iter().any(|s| {
+            walk.terms[s.term]
+                .as_ref()
+                .is_some_and(|set| set.postings.subs.is_some())
+        })
+    {
+        let terms = walk
+            .sc
+            .iter()
+            .map(|s| {
+                let set = walk.terms[s.term].as_ref().expect("scoring");
+                set.postings.subs.as_deref().map(|codes| SubTerm {
+                    codes: *codes,
+                    table: Vec::new(),
+                })
+            })
+            .collect();
+        walk.subs = Some(Box::new(SubCut {
+            terms,
+            sums: Vec::new(),
+            bounds: Vec::new(),
+        }));
     }
     if walk.common_terms {
         walk.sc_order = (0..walk.sc.len()).collect();
@@ -3574,6 +4122,11 @@ pub(super) fn walk_into<'s, 'a>(
     }
     #[cfg(feature = "census")]
     walk.census_finish();
+    #[cfg(feature = "census")]
+    if let Some(mut c) = walk.sub.take() {
+        c.tally.walks += 1;
+        super::census::add_sub(&c.tally);
+    }
     walk.count_metadata();
     let done = walk.answer;
     answer.scored += done.scored;
