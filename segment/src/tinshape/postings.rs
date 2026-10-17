@@ -103,6 +103,24 @@ pub const FORM_COMPACT: u8 = 0x40;
 /// Set in a grouped record's form when its frontiers' lengths are rounded
 /// down to six significant bits ([`round_length`]).
 pub const FORM_ROUNDED: u8 = 0x10;
+/// Set in a grouped record's form when it holds sub-range codes for its
+/// grid containers ([`SubCodes`]; page layout 17 on, a term in at least
+/// [`Options::sub_codes_share`] of its segment's documents).
+pub const FORM_SUBS: u8 = 0x08;
+
+/// Slots of a sub-range of a group: a grid's sub-range codes bound its
+/// postings per 64 slots, one word of the group's bitmap.
+pub const SUB_SHIFT: u32 = 6;
+pub const SUB_SLOTS: u32 = 1 << SUB_SHIFT;
+
+/// A sub-range code of no posting.
+pub const SUB_NONE: u8 = u8::MAX;
+
+/// Sub-ranges of a group of `slots` slots.
+#[inline]
+pub const fn sub_ranges(slots: u32) -> usize {
+    slots.div_ceil(SUB_SLOTS) as usize
+}
 
 /// Postings a footer-less record holds at most.
 pub const COMPACT_MAX: u32 = 8;
@@ -167,6 +185,10 @@ pub struct Options {
     /// ([`super::docs::LENGTH_CLASSES`]), which a ranked walk bounds a
     /// candidate by before it reads the exact length.
     pub length_classes: bool,
+    /// A grouped term in at least one in this many of the segment's
+    /// documents holds sub-range codes for its grids ([`SubCodes`]); 0 for
+    /// none.
+    pub sub_codes_share: u32,
 }
 
 /// [`Options::group_frontiers`].
@@ -184,6 +206,12 @@ impl Options {
     /// Whether a term of `df` postings in a segment of `documents` documents
     /// has its groups of at least one slot in [`Self::grid_density`] forced
     /// into grids.
+    /// Whether a grouped term of `df` postings in a segment of `documents`
+    /// documents holds sub-range codes ([`Self::sub_codes_share`]).
+    pub fn carries_subs(&self, df: u64, documents: u32) -> bool {
+        self.sub_codes_share > 0 && df * u64::from(self.sub_codes_share) >= u64::from(documents)
+    }
+
     pub fn forces_grids(&self, df: u64, documents: u32) -> bool {
         df >= u64::from(self.grid_min_postings)
             && (self.grid_min_share == 0
@@ -207,6 +235,7 @@ impl Default for Options {
             inline_lengths_min_documents: 1 << 16,
             group_frontiers: GroupFrontiers::Rounded,
             length_classes: true,
+            sub_codes_share: 10,
         }
     }
 }
@@ -247,11 +276,13 @@ pub struct Stats {
     /// Bytes the array containers take less what their members would take
     /// as Elias-Fano lists (negative for a few lists of one to four).
     pub array_excess: isize,
+    /// Bytes of the sub-range codes ([`SubCodes`]), their index included.
+    pub subs: usize,
 }
 
 impl Stats {
     pub fn total(&self) -> usize {
-        self.header + self.footer + self.payload + self.tf + self.lengths
+        self.header + self.footer + self.payload + self.tf + self.lengths + self.subs
     }
 }
 
@@ -345,6 +376,96 @@ pub fn put_group_frontier(out: &mut Vec<u8>, pairs: &[(u8, u32)]) {
         let ((pb, pl), (b, l)) = (w[0], w[1]);
         debug_assert!(b > pb && l > pl);
         varint::put(out, (u64::from(l - pl - 1) << 4) | u64::from(b - pb - 1));
+    }
+}
+
+/// Appends a grid group's sub-range codes: per sub-range of [`SUB_SLOTS`]
+/// slots in order, per pair `k` of the group's frontier (buckets
+/// `buckets`, ascending), one byte: the least [`round_length`] code (at
+/// most 254) of the sub-range's postings whose bucket lies above pair
+/// `k - 1`'s (any, for the first) and at most pair `k`'s, or [`SUB_NONE`]
+/// for none. Such a posting scores at most pair `k`'s bucket at the code's
+/// length (a score rises with the bucket and falls with the length), so
+/// the best of a sub-range's pairs bounds its postings. `locals` are the
+/// members' local slots (ascending), `postings` their buckets and lengths.
+/// (R10's codes, page layout 13, kept apart from the containers here.)
+pub fn put_sub_codes(
+    buckets: &[u8],
+    slots: u32,
+    locals: &[u32],
+    postings: impl Iterator<Item = (u8, u32)>,
+    out: &mut Vec<u8>,
+) {
+    let n = buckets.len();
+    debug_assert!((1..=16).contains(&n));
+    let start = out.len();
+    out.resize(start + sub_ranges(slots) * n, SUB_NONE);
+    let codes = &mut out[start..];
+    for (&local, (bucket, length)) in locals.iter().zip(postings) {
+        let r = (local >> SUB_SHIFT) as usize;
+        // The pair whose bucket is the first at least the posting's.
+        let k = buckets.partition_point(|b| *b < bucket);
+        debug_assert!(k < n, "a bucket past the group's frontier");
+        let code = round_length(length).min(u32::from(SUB_NONE) - 1) as u8;
+        let cell = &mut codes[r * n + k.min(n - 1)];
+        *cell = (*cell).min(code);
+    }
+}
+
+/// A grouped record's sub-range codes ([`FORM_SUBS`]): per directory entry
+/// a little-endian `u32`, where its codes start after the index
+/// (`u32::MAX` for an entry without: any but a grid), then each grid
+/// entry's codes ([`put_sub_codes`]), a byte per sub-range and frontier
+/// pair, the pairs of a sub-range together. Read only by the walks that
+/// bound a group's candidates per sub-range: no other reads it, so it lies
+/// apart from the containers, before the TF tail.
+///
+/// ```text
+/// subs := (offset u32le){entries} codes*
+/// ```
+#[derive(Clone, Copy, Debug)]
+pub struct SubCodes<'a> {
+    area: Bytes<'a>,
+    entries: usize,
+    /// Where the area starts in the record.
+    pub at: usize,
+}
+
+impl<'a> SubCodes<'a> {
+    /// Directory entry `b`'s codes, `len` bytes (its group's sub-ranges
+    /// times its frontier's pairs), and where they start in the area;
+    /// `None` for an entry without.
+    #[inline]
+    pub fn of(&self, b: usize, len: usize) -> Result<Option<(&'a [u8], usize)>> {
+        if b >= self.entries {
+            return Err(Error::Corrupt("sub-range codes entry"));
+        }
+        let offset = self.area.window(4 * b, 4)?;
+        let offset = u32::from_le_bytes(
+            offset
+                .get(..4)
+                .ok_or(Error::Truncated)?
+                .try_into()
+                .expect("four bytes"),
+        );
+        if offset == u32::MAX {
+            return Ok(None);
+        }
+        let from = 4 * self.entries + offset as usize;
+        let codes = self.area.window(from, len)?;
+        if codes.len() != len {
+            return Err(Error::Truncated);
+        }
+        Ok(Some((codes, from)))
+    }
+
+    /// Bytes of the area.
+    pub fn len(&self) -> usize {
+        self.area.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.area.len() == 0
     }
 }
 
@@ -631,6 +752,8 @@ pub fn encode_reusing<'r>(
     }
     let mut grouped_stats = Stats::default();
     let mut grouped_tf = Vec::new();
+    let mut subs = Vec::new();
+    let carries_subs = options.carries_subs(slots.len() as u64, geometry.documents);
     let (grouped, directory_len) = encode_groups(
         geometry,
         slots,
@@ -640,6 +763,7 @@ pub fn encode_reusing<'r>(
         reuse,
         &mut grouped_stats,
         &mut grouped_tf,
+        carries_subs.then_some(&mut subs),
     );
     // A sparse record's footer and TF tail, per block.
     let mut footer = Vec::new();
@@ -691,6 +815,11 @@ pub fn encode_reusing<'r>(
     let use_sparse =
         options.sparse && grouped_stats.dense == 0 && sparse.len() as isize <= grouped_len;
     let payload = if use_sparse { &sparse } else { &grouped };
+    // Codes only where a grid holds them (a grouped record of a common term
+    // without a grid holds none).
+    if use_sparse || grouped_stats.kinds[usize::from(KIND_GRID)] == 0 {
+        subs.clear();
+    }
     let mut inline_bytes = Vec::new();
     if inline {
         encode_inline_lengths(lengths, &mut inline_bytes);
@@ -709,6 +838,7 @@ pub fn encode_reusing<'r>(
             } else {
                 0
             }
+            | if subs.is_empty() { 0 } else { FORM_SUBS }
     });
     if !use_sparse {
         footer.clear();
@@ -722,10 +852,15 @@ pub fn encode_reusing<'r>(
     if inline {
         varint::put(out, inline_bytes.len() as u64);
     }
+    if !subs.is_empty() {
+        varint::put(out, subs.len() as u64);
+    }
     stats.header = out.len() - start;
     out.extend_from_slice(&footer);
     out.extend_from_slice(payload);
     out.extend_from_slice(&inline_bytes);
+    out.extend_from_slice(&subs);
+    stats.subs = subs.len();
     stats.lengths = inline_bytes.len();
     let tf_bytes = if use_sparse { &tf_bytes } else { &grouped_tf };
     out.extend_from_slice(tf_bytes);
@@ -826,8 +961,14 @@ fn encode_groups<'r>(
     reuse: &mut dyn FnMut(usize) -> Option<Reused<'r>>,
     stats: &mut Stats,
     tf: &mut Vec<u8>,
+    subs: Option<&mut Vec<u8>>,
 ) -> (Vec<u8>, usize) {
     let mut entries: Vec<GroupEntry> = Vec::new();
+    // Sub-range codes ([`SubCodes`]): per entry where its codes start, and
+    // the codes.
+    let mut sub_index: Vec<u32> = Vec::new();
+    let mut sub_codes: Vec<u8> = Vec::new();
+    let mut sub_buckets: Vec<u8> = Vec::new();
     let mut frontiers = Vec::new();
     let mut bodies = Vec::new();
     let mut previous: Option<usize> = None;
@@ -943,6 +1084,26 @@ fn encode_groups<'r>(
         let frontier = frontiers.len();
         put_group_frontier(&mut frontiers, &pairs);
         stats.frontiers += 1;
+        if subs.is_some() {
+            if kind == KIND_GRID {
+                sub_index
+                    .push(u32::try_from(sub_codes.len()).expect("a record's codes fit 32 bits"));
+                sub_buckets.clear();
+                sub_buckets.extend(pairs.iter().map(|p| p.0));
+                put_sub_codes(
+                    &sub_buckets,
+                    group.slots(),
+                    &locals,
+                    buckets[from..at]
+                        .iter()
+                        .copied()
+                        .zip(lengths[from..at].iter().copied()),
+                    &mut sub_codes,
+                );
+            } else {
+                sub_index.push(u32::MAX);
+            }
+        }
         // A group's buckets are always packed at the group's own width.
         let max_bucket = pairs.last().expect("a pair").0;
         let width = tf_width(max_bucket, true);
@@ -966,6 +1127,13 @@ fn encode_groups<'r>(
         stats.kind_bytes[kind as usize] += best;
     }
     *tf = tf_bits.finish();
+    if let Some(area) = subs {
+        area.clear();
+        for offset in &sub_index {
+            area.extend_from_slice(&offset.to_le_bytes());
+        }
+        area.extend_from_slice(&sub_codes);
+    }
     stats.entry_varints += varint_len(entries.len() as u64);
     stats.frontier_bytes += frontiers.len();
     let mut out = Vec::with_capacity(bodies.len() + frontiers.len() + 16 * entries.len());
@@ -1044,6 +1212,9 @@ pub struct Postings<'a> {
     /// Whether a grouped record's frontiers' lengths are rounded
     /// ([`FORM_ROUNDED`]).
     pub rounded: bool,
+    /// A grouped record's sub-range codes ([`FORM_SUBS`]), boxed: few
+    /// records have them.
+    pub subs: Option<Box<SubCodes<'a>>>,
 }
 
 /// A rare term's documents' lengths, in posting order: a base, a width
@@ -1171,16 +1342,18 @@ impl<'a> Postings<'a> {
                 tf: Bytes::default(),
                 tf_at: at,
                 rounded: false,
+                subs: None,
             });
         }
-        // The form and three varints.
-        let record = bytes.window(0, 1 + 3 * 10)?;
+        // The form and up to four varints.
+        let record = bytes.window(0, 1 + 4 * 10)?;
         let mut directory_len = 0;
         let form = *record.first().ok_or(Error::Truncated)?;
         let mut at = 1;
         let grouped = form & 3 == FORM_GROUPED;
         let rounded = form & FORM_ROUNDED != 0;
-        if rounded && !grouped {
+        let has_subs = form & FORM_SUBS != 0;
+        if (rounded || has_subs) && !grouped {
             return Err(Error::Corrupt("postings form"));
         }
         let footer_len = if form & FORM_COMPACT != 0 {
@@ -1200,12 +1373,18 @@ impl<'a> Postings<'a> {
         } else {
             0
         };
+        let subs_len = if has_subs {
+            varint::get_u32(record, &mut at)? as usize
+        } else {
+            0
+        };
         let compact = form & FORM_COMPACT != 0;
-        let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_ROUNDED);
+        let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_ROUNDED | FORM_SUBS);
         let footer_at = at;
         let payload_at = footer_at + footer_len;
         let lengths_at = payload_at + payload_len;
-        let tf_at = lengths_at + lengths_len;
+        let subs_at = lengths_at + lengths_len;
+        let tf_at = subs_at + subs_len;
         if tf_at > bytes.len() {
             return Err(Error::Truncated);
         }
@@ -1213,7 +1392,7 @@ impl<'a> Postings<'a> {
         let payload = bytes.sub(payload_at, lengths_at)?;
         let lengths = if lengths_len > 0 {
             Some(InlineLengths::parse(
-                bytes.tag(Kind::InlineLengths).get(lengths_at, tf_at)?,
+                bytes.tag(Kind::InlineLengths).get(lengths_at, subs_at)?,
                 lengths_at,
                 df,
             )?)
@@ -1260,6 +1439,19 @@ impl<'a> Postings<'a> {
             }
             _ => return Err(Error::Corrupt("postings form")),
         };
+        let subs = match &form {
+            Form::Grouped(dir) if has_subs => {
+                if subs_len < 4 * dir.len() {
+                    return Err(Error::Corrupt("sub-range codes length"));
+                }
+                Some(Box::new(SubCodes {
+                    area: bytes.sub(subs_at, tf_at)?.tag(Kind::Footer),
+                    entries: dir.len(),
+                    at: subs_at,
+                }))
+            }
+            _ => None,
+        };
         Ok(Self {
             df,
             form,
@@ -1273,6 +1465,7 @@ impl<'a> Postings<'a> {
             lengths,
             compact,
             rounded,
+            subs,
         })
     }
 
@@ -4280,6 +4473,8 @@ mod tests {
                                 GroupFrontiers::Exact
                             },
                             length_classes: grid_density == 0,
+                            // Codes on every grouped term, and none.
+                            sub_codes_share: if adaptive_tf { 1 } else { 0 },
                         });
                     }
                 }

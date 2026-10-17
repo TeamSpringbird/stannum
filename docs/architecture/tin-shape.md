@@ -119,11 +119,20 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
          | sparse:  form u8, [footer_len], payload_len, [lengths_len],
                     [footer], list, [lengths], tf
          | grouped: form u8, directory_len, payload_len, [lengths_len],
-                    directory, container*, [lengths], tf
+                    [subs_len], directory, container*, [lengths], [subs], tf
                     (directory_len: the bytes of the payload before its
                     containers, layout 10)
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
-           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped)
+           (sparse), | 0x10 when the frontiers' lengths are rounded (grouped),
+           | 0x08 when sub-range codes (grouped, layout 17)
+subs    := (offset u32 LE) per directory entry (u32::MAX: none; else where
+           its codes start after the offsets), then per grid entry, per
+           64-slot sub-range in order, per pair k of its group frontier one
+           byte: the least round_length code (at most 254) of the
+           sub-range's postings whose bucket lies above pair k-1's and at
+           most pair k's, 255 for none (a term in at least one in 10 of the
+           segment's documents, `Options::sub_codes_share`; see
+           [sub-range codes](#sub-range-codes-for-full_score-conjunctions))
 lengths := base varint, width u8, (length - base) packed at width, by posting
 list    := Elias-Fano over the term's slots, universe = all slots
 directory := groups varint, widths u8 * 4, presence, base*, row*,

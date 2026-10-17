@@ -490,3 +490,68 @@ fn a_corrupted_length_is_found() {
     broken[segment.length_at(2).0] = 3;
     assert!(!verify_segment(&broken).is_clean());
 }
+
+/// A dense term's grids carry sub-range codes (page layout 17), a rarer
+/// term's do not: each grid posting is bounded by its sub-range's code at
+/// its frontier pair, which the verifier checks, so a code past a
+/// posting's length is found.
+#[test]
+fn sub_range_codes_bound_their_postings_and_a_bad_one_is_found() {
+    use super::postings::{Form, KIND_GRID, SUB_NONE, sub_ranges};
+    let docs: Vec<Doc> = (0..6_000u32)
+        .map(|i| {
+            let tid = Tid::new(i / 20, (i % 20) as u16 + 1).unwrap();
+            let mut tokens = Vec::new();
+            if i % 7 != 0 {
+                for _ in 0..1 + i % 3 {
+                    tokens.push("w".to_owned());
+                }
+            }
+            if i % 50 == 0 {
+                tokens.push("x".to_owned());
+            }
+            for f in 0..(i * 13) % 40 {
+                tokens.push(format!("f{}", (i + f) % 97));
+            }
+            tokens.push("z".to_owned());
+            let tokens = tokens
+                .into_iter()
+                .enumerate()
+                .map(|(p, t)| (t, p as u32))
+                .collect();
+            (tid, tokens)
+        })
+        .collect();
+    let options = Options {
+        grid_min_postings: 0,
+        ..Options::default()
+    };
+    let blob = tns(&docs, options);
+    assert!(verify_segment(&blob).is_clean());
+    let segment = super::segment::Segment::parse(&blob).unwrap();
+    let rare = segment.term("x").unwrap().unwrap();
+    assert!(rare.postings.subs.is_none());
+    let w = segment.term("w").unwrap().unwrap();
+    let subs = w.postings.subs.as_deref().expect("a dense term's codes");
+    let Form::Grouped(dir) = &w.postings.form else {
+        panic!("a grouped record")
+    };
+    let entries = dir.entries(&segment.docs.geometry.groups).unwrap();
+    let (b, entry) = entries
+        .iter()
+        .enumerate()
+        .find(|(_, e)| e.kind == KIND_GRID)
+        .expect("a grid");
+    let pairs = w.postings.group_frontier(entry).count();
+    let slots = segment.docs.geometry.groups[entry.index as usize].slots();
+    let (codes, at) = subs.of(b, sub_ranges(slots) * pairs).unwrap().unwrap();
+    // A code of a sub-range holding postings: raised to the longest, it
+    // no longer bounds them.
+    let k = codes
+        .iter()
+        .position(|c| *c != SUB_NONE && *c < 200)
+        .expect("a code");
+    let mut broken = blob.clone();
+    broken[w.at + subs.at + at + k] = 254;
+    assert!(!verify_segment(&broken).is_clean());
+}

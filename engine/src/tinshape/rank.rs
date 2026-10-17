@@ -33,7 +33,8 @@ use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::{Block, Positions};
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, InOrder, KIND_ARRAY, KIND_EF, KIND_GRID,
-    LazyFooter, array_bytes, fold_group_frontier, higher, lower,
+    LazyFooter, SUB_NONE, SubCodes, array_bytes, fold_group_frontier, higher, lower,
+    rounded_length,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -65,6 +66,11 @@ const COMMON_RATIO: u64 = 10;
 /// that is still low early in a walk rises between chunks rather than
 /// letting a whole group's candidates be bounded and sorted against it.
 const STAGE_CHUNK: usize = 256;
+
+/// A led walk's group of all grids holding at least this many candidates
+/// is cut by its scoring terms' sub-range codes first ([`Walk::sub_cut`]):
+/// the cut reads a byte per term, frontier pair and word holding one.
+const SUB_MIN: u64 = 256;
 
 /// A group with at least this many candidates has them sieved by their
 /// buckets ([`Walk::sieve`]) this many at a time ([`SIEVE_CHUNK`]) before
@@ -1353,6 +1359,46 @@ enum Verify<'a> {
 
 /// A ranked walk over one segment: led by required terms (`run`) or a
 /// disjunction of the scoring terms (`run_or`).
+/// A scoring term's sub-range codes ([`SubCodes`]), for a led walk's
+/// sub-range cut ([`Walk::sub_cut`]), and per frontier bucket and code the
+/// term's bound at that bucket and the code's length, filled as asked (NaN
+/// until then; allocated at the first cut).
+struct SubTerm<'a> {
+    codes: SubCodes<'a>,
+    table: Vec<f32>,
+}
+
+impl SubTerm<'_> {
+    /// What a posting of bucket at most `bucket`, at least as long as `code`
+    /// says, scores at most by `scorer`; zero for [`SUB_NONE`].
+    #[inline]
+    fn bound(&mut self, scorer: &TermScorer, bucket: u8, code: u8) -> f32 {
+        let at = usize::from(bucket) % BUCKET_COUNT * 256 + usize::from(code);
+        let v = self.table[at];
+        if !v.is_nan() {
+            return v;
+        }
+        let v = if code == SUB_NONE {
+            0.0
+        } else {
+            scorer.bound_through(
+                TfBucket::new(bucket).expect("a valid bucket"),
+                rounded_length(u32::from(code)),
+            )
+        };
+        self.table[at] = v;
+        v
+    }
+}
+
+/// A led walk's sub-range cut ([`Walk::sub_cut`]): per scoring term (by
+/// index into `sc`) its codes, if its record has them, and the group at
+/// hand's sub-ranges' bounds.
+struct SubCut<'a> {
+    terms: Vec<Option<SubTerm<'a>>>,
+    sums: Vec<f32>,
+}
+
 struct Walk<'s, 'a, T: Touch> {
     segment: &'s Segment<'a>,
     geometry: &'s Geometry,
@@ -1395,6 +1441,9 @@ struct Walk<'s, 'a, T: Touch> {
     cand_base: Vec<u32>,
     blocks: Vec<usize>,
     sub_bounds: Vec<f32>,
+    /// A led walk's sub-range cut ([`Walk::sub_cut`]), when a scoring term
+    /// has codes: boxed, so walks without them carry a pointer.
+    subs: Option<Box<SubCut<'a>>>,
     plan: Plan,
     /// A disjunction's group at hand: per scoring term room for a row of
     /// the group's words holding its members (unless read in place, see
@@ -2813,6 +2862,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if let Some(dead) = self.segment.liveness.groups[g as usize].as_deref() {
             kernels::andnot_words(words, dead);
         }
+        if self.subs.is_some() && self.bar.is_some() && kernels::popcount(&self.words) >= SUB_MIN {
+            self.sub_cut(g)?;
+        }
         #[cfg(feature = "census")]
         if self.sub.is_some() {
             // Replaying, only the recorded cuts are looked up.
@@ -2867,6 +2919,93 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         };
         self.cands = cands;
         more
+    }
+
+    /// Clears from [`Walk::words`], group `g`'s candidates (a bit per slot,
+    /// every required term a grid there, loaded), the words no match in
+    /// which can be kept: each word is a sub-range of [`SUB_SLOTS`] slots,
+    /// bounded by the scoring terms' bounds there summed in the scorer's
+    /// order, a term's by its sub-range codes where its grid has them (the
+    /// best of its frontier pairs' buckets at their codes' lengths, at
+    /// most its group bound), any other's by its bound over the group.
+    /// Exact as [`Walk::cut`] is: each term's bound covers its postings in
+    /// the sub-range. A cut word's candidates read no bucket and no length.
+    ///
+    /// [`SUB_SLOTS`]: segment::tinshape::postings::SUB_SLOTS
+    #[inline(never)]
+    fn sub_cut(&mut self, g: u32) -> Result<()> {
+        let group = self.geometry.groups[g as usize];
+        let (base, end) = (group.slot_base, group.slot_base + group.slots() - 1);
+        let words = self.words.len();
+        debug_assert_eq!(
+            words,
+            segment::tinshape::postings::sub_ranges(group.slots())
+        );
+        let SubCut { terms, sums } = self.subs.as_deref_mut().expect("codes");
+        sums.clear();
+        sums.resize(words, 0.0);
+        let mut coded = false;
+        for (i, term) in terms.iter_mut().enumerate() {
+            let t = self.sc[i].term;
+            let entry = self.mems[t].entry;
+            let held = self.mems[t].loaded == g + 1 && entry != usize::MAX;
+            let gb = if held && self.sc[i].grouped() {
+                higher(0.0, self.sc[i].bound(entry))
+            } else {
+                self.sc[i].range_bound(g, base, end)
+            };
+            if held
+                && matches!(self.mems[t].kind, Kind::Grid(_))
+                && let Some(st) = term.as_mut()
+                && let Bounds::Groups(groups) = &self.sc[i].footer
+            {
+                let mut buckets = [0u8; 16];
+                let mut pairs = 0usize;
+                for (bucket, _) in groups.frontier(entry) {
+                    buckets[pairs % 16] = bucket;
+                    pairs += 1;
+                }
+                let pairs = pairs.min(16);
+                if let Some((codes, at)) = st.codes.of(entry, words * pairs)? {
+                    if st.table.is_empty() {
+                        st.table = vec![f32::NAN; BUCKET_COUNT * 256];
+                    }
+                    let set = self.terms[t].as_ref().expect("scoring");
+                    self.touch
+                        .touch(Part::Footer, set.at + st.codes.at + at, codes.len());
+                    coded = true;
+                    let scorer = &self.sc[i].scorer;
+                    for (j, sum) in sums.iter_mut().enumerate() {
+                        if self.words[j] == 0 {
+                            continue;
+                        }
+                        let row = &codes[j * pairs..(j + 1) * pairs];
+                        let mut v = 0.0_f32;
+                        for k in 0..pairs {
+                            v = higher(v, st.bound(scorer, buckets[k], row[k]));
+                        }
+                        *sum += lower(v, gb);
+                    }
+                    continue;
+                }
+            }
+            for sum in sums.iter_mut() {
+                *sum += gb;
+            }
+        }
+        if coded {
+            let geometry = self.geometry;
+            for (j, sum) in sums.iter().enumerate() {
+                if self.words[j] != 0
+                    && cut_by(self.bar, *sum, || {
+                        geometry.tid_in(g as usize, (j * 64) as u32)
+                    })
+                {
+                    self.words[j] = 0;
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Moves the window to slot `local` of group `g` (whose first slot is
@@ -3620,6 +3759,7 @@ pub(super) fn walk_into<'s, 'a>(
         cand_base: Vec::with_capacity(n),
         blocks: vec![0; n],
         sub_bounds: Vec::new(),
+        subs: None,
         plan: Plan::default(),
         rows: Vec::new(),
         row_state: vec![Row::default(); n],
@@ -3719,6 +3859,30 @@ pub(super) fn walk_into<'s, 'a>(
                 }
             }
         }
+    }
+    // A led walk bounds a group's sub-ranges by its terms' codes.
+    if !walk.req.is_empty()
+        && walk.sc.iter().any(|s| {
+            walk.terms[s.term]
+                .as_ref()
+                .is_some_and(|set| set.postings.subs.is_some())
+        })
+    {
+        let terms = walk
+            .sc
+            .iter()
+            .map(|s| {
+                let set = walk.terms[s.term].as_ref().expect("scoring");
+                set.postings.subs.as_deref().map(|codes| SubTerm {
+                    codes: *codes,
+                    table: Vec::new(),
+                })
+            })
+            .collect();
+        walk.subs = Some(Box::new(SubCut {
+            terms,
+            sums: Vec::new(),
+        }));
     }
     if walk.common_terms {
         walk.sc_order = (0..walk.sc.len()).collect();
