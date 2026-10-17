@@ -169,6 +169,9 @@ struct Args {
 /// segment; that segment's own walk then takes the other groups. KIND:
 /// `stride` every Nth group, `head` / `tail` the first / last N per mille
 /// of its groups. Exact: the two walks cover each group once.
+/// Ascending ranges `[start, end)` of a segment's group indexes.
+type Ranges = Vec<(u32, u32)>;
+
 #[derive(Clone, Copy)]
 struct Prepass {
     big: bool,
@@ -203,7 +206,7 @@ impl Prepass {
     }
 
     /// The sampled ranges of a segment of `groups` groups, and the others.
-    fn split(&self, groups: u32) -> (Vec<(u32, u32)>, Vec<(u32, u32)>) {
+    fn split(&self, groups: u32) -> (Ranges, Ranges) {
         let sample: Vec<(u32, u32)> = match self.kind {
             PrepassKind::Stride => (0..groups)
                 .step_by(self.n as usize)
