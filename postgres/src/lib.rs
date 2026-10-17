@@ -6161,15 +6161,17 @@ mod tests {
         Spi::run("CREATE INDEX reproducible_whole ON reproducible USING stannum(body)").unwrap();
         assert_eq!(
             build_digest("reproducible_capped"),
-            "33,2250,69750,17,46,65600098aeba35c4e28782d08a6a4e4b;\
-             20,1500,46500,12,47,632086f117ba324fe5f612998867418c;\
-             2,2250,69750,17,48,9b28da87480a70525a600503080b821a size 417792"
+            "37,2250,69750,19,46,856bfe36646418ae41dd9a8b9f555783;\
+             22,1500,46500,14,47,ae5a4afa1f85ea02293acc763a24580d;\
+             2,2250,69750,19,48,c2590d2929bd70ce8a021331b432fade size 466944"
         );
         // Page layout 18: "common" (every document, a grid) holds sub-range
-        // codes; the capped segments hold no grid, so none.
+        // codes; the capped segments hold no grid, so none. Every "w" term
+        // (in about 3% of the documents) holds its postings' length codes in
+        // its TF tail, in both builds: 2 bits a posting.
         assert_eq!(
             build_digest("reproducible_whole"),
-            "2,6000,186000,41,46,72e1100bc3ba39196c472ce835a45bee size 360448"
+            "2,6000,186000,47,46,c44a9c53b30403a981d10f19b1ee1b1b size 409600"
         );
         assert_clean("reproducible_capped");
         assert_clean("reproducible_whole");
