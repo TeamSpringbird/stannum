@@ -32,8 +32,8 @@ use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::{Block, Positions};
 use segment::tinshape::postings::{
-    Directory, Form, GroupEntry, GroupFrontier, InOrder, KIND_ARRAY, KIND_EF, KIND_GRID,
-    LazyFooter, array_bytes, fold_group_frontier, higher, lower,
+    CODE_BITS, Directory, Form, GroupEntry, GroupFrontier, InOrder, KIND_ARRAY, KIND_EF, KIND_GRID,
+    LazyFooter, array_bytes, code_floor, fold_group_frontier, higher, lower,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
@@ -285,6 +285,20 @@ impl<'a> Bounds<'_, 'a> {
         }
     }
 
+    /// Where posting `index`, which block `b` holds, keeps its length code
+    /// in the record's TF tail, in bits; `None` when the record carries
+    /// none.
+    #[inline]
+    fn code_bit(&mut self, b: usize, index: u32) -> Result<Option<usize>> {
+        match self {
+            Self::Blocks(f) => f.code_bit(index),
+            Self::Groups(g) => {
+                let e = g.entry(b);
+                Ok((e.codes > 0).then(|| e.code_bit(index)))
+            }
+        }
+    }
+
     /// The bucket of posting `index`, which block `b` holds, from the
     /// record's TF tail.
     #[inline]
@@ -416,6 +430,8 @@ pub(super) struct Sc<'s, 'a> {
     floors_block: u32,
     /// A common term's bound over a group (see [`Sc::make_common`]).
     common: Option<f32>,
+    /// Whether the term's record carries its postings' length codes.
+    pub(super) codes: bool,
 }
 
 /// A footer block past what a walk could reach was asked for, or a block
@@ -466,6 +482,7 @@ impl<'s, 'a> Sc<'s, 'a> {
             floors: [0; BUCKET_COUNT],
             floors_block: u32::MAX,
             common: None,
+            codes: set.postings.codes,
         })
     }
 
@@ -3190,7 +3207,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if self.touch.census() {
             self.census_length(g, local, LengthKind::ClassLed, floor);
         }
-        let class = self.class_floor(g, local)?;
+        let class = self.length_floor(g, local, false)?;
         if class <= floor {
             return Ok(Some(reach));
         }
@@ -3204,6 +3221,45 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(None);
         }
         Ok(Some(bound))
+    }
+
+    /// The shortest length of the length class of the candidate at slot
+    /// `local` of group `g`, which holds scoring terms `held` (a
+    /// disjunction's [`Walk::held_list`], else the terms whose buckets were
+    /// read): from the length code of the first whose record carries codes,
+    /// beside its buckets in the TF tail (page layout 17: TIN's TF tail
+    /// keeps a length code a posting), else from the DL sidecar's class
+    /// plane ([`Walk::class_floor`]).
+    #[inline]
+    fn length_floor(&mut self, g: u32, local: u32, or: bool) -> Result<u32> {
+        let n = if or {
+            self.held_list.len()
+        } else {
+            self.sc.len()
+        };
+        for k in 0..n {
+            let i = if or { self.held_list[k] } else { k };
+            if !self.sc[i].codes || (!or && usize::from(self.buckets[i]) >= BUCKET_COUNT) {
+                continue;
+            }
+            let index = self.held_index[i];
+            let s = &mut self.sc[i];
+            let block = if or {
+                self.blocks[i]
+            } else {
+                s.block_of(index, self.mems[s.term].entry)
+            };
+            let Some(bit) = s.footer.code_bit(block, index)? else {
+                continue;
+            };
+            let set = self.terms[s.term].as_ref().expect("scoring");
+            let bytes = set.postings.tf.window(bit / 8, 8)?;
+            let code = bits::get_at(bytes, bit % 8, CODE_BITS)? as u8;
+            self.touch
+                .touch(Part::TfTail, set.at + set.postings.tf_at + bit / 8, 1);
+            return Ok(code_floor(code));
+        }
+        self.class_floor(g, local)
     }
 
     /// The shortest length of the length class of the document at slot
@@ -4601,7 +4657,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             if self.touch.census() {
                 self.census_length(g, local, LengthKind::ClassOrFirst, 0);
             }
-            let class = self.class_floor(g, local)?;
+            let class = self.length_floor(g, local, true)?;
             if class > 0 {
                 floor = class;
                 reach = self.or_rebound(class);
@@ -4663,7 +4719,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     if self.touch.census() {
                         self.census_length(g, local, LengthKind::ClassOrAfter, floor);
                     }
-                    let class = self.class_floor(g, local)?;
+                    let class = self.length_floor(g, local, true)?;
                     if class > floor {
                         reach = self.reach(self.held_list.iter().copied(), class);
                         if self.cut(reach, tid) {

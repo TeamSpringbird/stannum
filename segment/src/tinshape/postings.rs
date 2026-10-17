@@ -87,7 +87,7 @@
 
 use super::bits::{self, BitWriter};
 use super::blob::{Bytes, Kind};
-use super::docs::{Geometry, Group};
+use super::docs::{Geometry, Group, LENGTH_CLASSES, length_class};
 use super::ef::{self, Ef};
 use crate::{Error, Result, varint};
 
@@ -103,6 +103,44 @@ pub const FORM_COMPACT: u8 = 0x40;
 /// Set in a grouped record's form when its frontiers' lengths are rounded
 /// down to six significant bits ([`round_length`]).
 pub const FORM_ROUNDED: u8 = 0x10;
+/// Set in a record's form when each posting's length code (its document's
+/// length class, [`CODE_BITS`] bits) follows its block's or group's buckets
+/// in the TF tail ([`carries_codes`]).
+pub const FORM_CODES: u8 = 0x20;
+
+/// Bits of a posting's length code: its document's length class
+/// ([`super::docs::LENGTH_CLASSES`]).
+pub const CODE_BITS: u32 = 2;
+
+/// A record of at most one posting in this many of its segment's documents
+/// carries length codes (page layout 17): a walk scoring it reads its
+/// candidates' length classes from the TF tail it reads their buckets from.
+/// A denser term is elided from `score` ranking (its documents' share is
+/// past `stannum.dense_ratio`'s default), and its codes would cost most of
+/// their bytes: at 150M rows records of at most a tenth of the documents
+/// hold 4.4 of the 6.8 billion postings, and their codes 1.1 GB (+3.1%).
+pub const CODE_SHARE: u64 = 10;
+
+/// Whether a record of `df` postings in a segment of `documents` documents
+/// carries length codes (one carrying its documents' lengths inline, or of
+/// one posting, does not: it has their lengths).
+pub fn carries_codes(df: usize, documents: u32) -> bool {
+    df >= 2 && df as u64 * CODE_SHARE <= u64::from(documents)
+}
+
+/// The length codes of `lengths`, packed at [`CODE_BITS`] bits.
+fn put_codes(lengths: &[u32], out: &mut BitWriter) {
+    for length in lengths {
+        out.put(u32::from(length_class(&LENGTH_CLASSES, *length)), CODE_BITS);
+    }
+}
+
+/// The shortest length of length code `code` (a class's floor).
+#[inline]
+pub fn code_floor(code: u8) -> u32 {
+    const FLOORS: [u32; 4] = [0, LENGTH_CLASSES[0], LENGTH_CLASSES[1], LENGTH_CLASSES[2]];
+    FLOORS[usize::from(code & 3)]
+}
 
 /// Postings a footer-less record holds at most.
 pub const COMPACT_MAX: u32 = 8;
@@ -167,6 +205,9 @@ pub struct Options {
     /// ([`super::docs::LENGTH_CLASSES`]), which a ranked walk bounds a
     /// candidate by before it reads the exact length.
     pub length_classes: bool,
+    /// Whether records [`carries_codes`] picks hold their postings' length
+    /// codes in their TF tails ([`FORM_CODES`]).
+    pub length_codes: bool,
 }
 
 /// [`Options::group_frontiers`].
@@ -207,6 +248,7 @@ impl Default for Options {
             inline_lengths_min_documents: 1 << 16,
             group_frontiers: GroupFrontiers::Rounded,
             length_classes: true,
+            length_codes: true,
         }
     }
 }
@@ -623,6 +665,7 @@ pub fn encode_reusing<'r>(
         return stats;
     }
     let block = options.block_size as usize;
+    let codes = options.length_codes && !inline && carries_codes(slots.len(), geometry.documents);
     // Payload: the smaller of one list over the grid and per-group
     // containers (with their directory's frontiers and their TF tail).
     let mut sparse = Vec::new();
@@ -637,6 +680,7 @@ pub fn encode_reusing<'r>(
         buckets,
         lengths,
         options,
+        codes,
         reuse,
         &mut grouped_stats,
         &mut grouped_tf,
@@ -667,11 +711,15 @@ pub fn encode_reusing<'r>(
             }
             let max = front.last().expect("a nonempty frontier").0;
             let width = tf_width(max, options.adaptive_tf);
-            for bucket in &buckets[range] {
+            for bucket in &buckets[range.clone()] {
                 tf.put(u32::from(*bucket), width);
             }
-            // Each block's buckets start on a byte.
+            // Each block's buckets start on a byte, its codes after them.
             tf_bytes.extend_from_slice(&std::mem::take(&mut tf).finish());
+            if codes {
+                put_codes(&lengths[range], &mut tf);
+                tf_bytes.extend_from_slice(&std::mem::take(&mut tf).finish());
+            }
             blocks += 1;
         }
     }
@@ -700,10 +748,14 @@ pub fn encode_reusing<'r>(
         && slots.len() as u64 <= u64::from(COMPACT_MAX)
         && slots.len() <= block;
     out.push(if use_sparse {
-        FORM_SPARSE | if inline { FORM_LENGTHS } else { 0 } | if compact { FORM_COMPACT } else { 0 }
+        FORM_SPARSE
+            | if inline { FORM_LENGTHS } else { 0 }
+            | if compact { FORM_COMPACT } else { 0 }
+            | if codes { FORM_CODES } else { 0 }
     } else {
         FORM_GROUPED
             | if inline { FORM_LENGTHS } else { 0 }
+            | if codes { FORM_CODES } else { 0 }
             | if options.group_frontiers == GroupFrontiers::Rounded {
                 FORM_ROUNDED
             } else {
@@ -823,10 +875,12 @@ fn encode_groups<'r>(
     buckets: &[u8],
     lengths: &[u32],
     options: &Options,
+    codes: bool,
     reuse: &mut dyn FnMut(usize) -> Option<Reused<'r>>,
     stats: &mut Stats,
     tf: &mut Vec<u8>,
 ) -> (Vec<u8>, usize) {
+    let code_bits = if codes { CODE_BITS } else { 0 };
     let mut entries: Vec<GroupEntry> = Vec::new();
     let mut frontiers = Vec::new();
     let mut bodies = Vec::new();
@@ -949,6 +1003,10 @@ fn encode_groups<'r>(
         for bucket in &buckets[from..at] {
             tf_bits.put(u32::from(*bucket), width);
         }
+        // Then its codes.
+        if codes {
+            put_codes(&lengths[from..at], &mut tf_bits);
+        }
         entries.push(GroupEntry {
             index: index as u32,
             count: locals.len() as u32,
@@ -960,8 +1018,9 @@ fn encode_groups<'r>(
             tf_bit: u32::try_from(tf_total).expect("a record's TF tail fits 32 bits"),
             width: width as u8,
             max_bucket,
+            codes: code_bits as u8,
         });
-        tf_total += (at - from) as u64 * u64::from(width);
+        tf_total += (at - from) as u64 * u64::from(width + code_bits);
         stats.kinds[kind as usize] += 1;
         stats.kind_bytes[kind as usize] += best;
     }
@@ -996,6 +1055,9 @@ pub struct GroupEntry {
     pub tf_bit: u32,
     pub width: u8,
     pub max_bucket: u8,
+    /// Bits of each posting's length code after the group's buckets (0:
+    /// its record carries none).
+    pub codes: u8,
 }
 
 impl GroupEntry {
@@ -1004,6 +1066,21 @@ impl GroupEntry {
     #[inline]
     pub fn bucket_bit(&self, index: u32) -> usize {
         self.tf_bit as usize + (index - self.first) as usize * usize::from(self.width)
+    }
+
+    /// Where posting `index` of the group has its length code in the TF
+    /// tail, in bits (the group's record carries codes).
+    #[inline]
+    pub fn code_bit(&self, index: u32) -> usize {
+        self.tf_bit as usize
+            + self.count as usize * usize::from(self.width)
+            + (index - self.first) as usize * usize::from(self.codes)
+    }
+
+    /// The group's TF bits: its buckets' and its codes'.
+    #[inline]
+    pub fn tf_bits(&self) -> u64 {
+        u64::from(self.count) * u64::from(self.width + self.codes)
     }
 }
 
@@ -1044,6 +1121,9 @@ pub struct Postings<'a> {
     /// Whether a grouped record's frontiers' lengths are rounded
     /// ([`FORM_ROUNDED`]).
     pub rounded: bool,
+    /// Whether its postings' length codes follow its blocks' (groups')
+    /// buckets in the TF tail ([`FORM_CODES`]).
+    pub codes: bool,
 }
 
 /// A rare term's documents' lengths, in posting order: a base, a width
@@ -1171,6 +1251,7 @@ impl<'a> Postings<'a> {
                 tf: Bytes::default(),
                 tf_at: at,
                 rounded: false,
+                codes: false,
             });
         }
         // The form and three varints.
@@ -1201,7 +1282,11 @@ impl<'a> Postings<'a> {
             0
         };
         let compact = form & FORM_COMPACT != 0;
-        let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_ROUNDED);
+        let codes = form & FORM_CODES != 0;
+        if codes && form & FORM_LENGTHS != 0 {
+            return Err(Error::Corrupt("postings form"));
+        }
+        let form = form & !(FORM_LENGTHS | FORM_COMPACT | FORM_ROUNDED | FORM_CODES);
         let footer_at = at;
         let payload_at = footer_at + footer_len;
         let lengths_at = payload_at + payload_len;
@@ -1256,6 +1341,7 @@ impl<'a> Postings<'a> {
                     df,
                     (payload.len() - end) as u64,
                     tf_len as u64,
+                    if codes { CODE_BITS as u8 } else { 0 },
                 )?))
             }
             _ => return Err(Error::Corrupt("postings form")),
@@ -1273,6 +1359,7 @@ impl<'a> Postings<'a> {
             lengths,
             compact,
             rounded,
+            codes,
         })
     }
 
@@ -1460,7 +1547,7 @@ pub fn encode_directory(
     let end = [
         u64::from(last.first + last.count),
         u64::from(last.at + last.len),
-        u64::from(last.tf_bit) + u64::from(last.count) * u64::from(last.width),
+        u64::from(last.tf_bit) + last.tf_bits(),
         frontiers.len() as u64,
     ];
     let total = |r: usize| -> [u64; 4] {
@@ -1600,6 +1687,8 @@ pub struct Directory {
     df: u32,
     containers: u64,
     tf_bits: u64,
+    /// Bits of each posting's length code after its group's buckets.
+    codes: u8,
     /// Entries read since [`Self::take_read`] was last called.
     read: std::cell::Cell<u64>,
     /// The entry read last, and its position (`usize::MAX` before the
@@ -1624,13 +1713,15 @@ impl std::fmt::Debug for Directory {
 impl Directory {
     /// Parses a directory, `directory` its bytes from its group count on, of
     /// a record of `df` postings, `containers` container bytes and `tf_len`
-    /// TF bytes, in a segment of `groups` groups.
+    /// TF bytes (each posting's length code `codes` bits after its group's
+    /// buckets), in a segment of `groups` groups.
     fn parse(
         mut directory: Vec<u8>,
         groups: usize,
         df: u32,
         containers: u64,
         tf_len: u64,
+        codes: u8,
     ) -> Result<Self> {
         let corrupt = || Error::Corrupt("postings directory");
         let mut at = 0;
@@ -1693,6 +1784,7 @@ impl Directory {
             df,
             containers,
             tf_bits: tf_len * 8,
+            codes,
             read: std::cell::Cell::new(0),
             last: std::cell::Cell::new((usize::MAX, GroupEntry::default())),
             ahead: std::cell::Cell::new((usize::MAX, 0, [0; 4])),
@@ -2090,7 +2182,8 @@ impl Directory {
             && len == expected
             && len > 0
             && slots <= MOST_SLOTS[usize::from(kind)]
-            && u64::from(next[TF].wrapping_sub(v[TF])) == u64::from(count) * u64::from(width)
+            && u64::from(next[TF].wrapping_sub(v[TF]))
+                == u64::from(count) * u64::from(width + self.codes)
             && u64::from(next[TF]) <= self.tf_bits
             && u64::from(next[AT]) <= self.containers
             && next[FIRST] <= self.df
@@ -2110,6 +2203,7 @@ impl Directory {
             tf_bit: v[TF],
             width,
             max_bucket,
+            codes: self.codes,
         })
     }
 
@@ -2469,6 +2563,9 @@ pub struct Footer {
     pub firsts: Vec<u32>,
     /// A single posting's bucket, which the dictionary keeps.
     pub single: Option<u8>,
+    /// Where block `b`'s length codes start in the TF tail, in bits (empty
+    /// when the record carries none, [`FORM_CODES`]).
+    pub code_at: Vec<u32>,
 }
 
 impl Footer {
@@ -2496,12 +2593,16 @@ impl Footer {
                 entry_at: Vec::new(),
                 firsts: Vec::with_capacity(entries.len()),
                 single: None,
+                code_at: Vec::new(),
             };
             let mut largest = 0u8;
             for e in entries.iter() {
                 footer.starts.push(footer.frontier.len() as u32);
                 footer.frontier.extend(postings.group_frontier(e));
                 footer.tf_at.push(e.tf_bit);
+                if e.codes > 0 {
+                    footer.code_at.push(e.tf_bit + e.count * u32::from(e.width));
+                }
                 footer.widths.push(e.width);
                 footer.firsts.push(e.first);
                 // The group's index: a reader with the geometry turns it
@@ -2550,6 +2651,7 @@ impl Footer {
                 entry_at: vec![0],
                 firsts: Vec::new(),
                 single: None,
+                code_at: Vec::new(),
             });
         }
         if let Form::Single(slot) = postings.form {
@@ -2563,6 +2665,7 @@ impl Footer {
                 entry_at: vec![0],
                 firsts: Vec::new(),
                 single: Some(max_bucket),
+                code_at: Vec::new(),
             });
         }
         let blocks = df.div_ceil(block_size) as usize;
@@ -2582,6 +2685,7 @@ impl Footer {
             entry_at: Vec::with_capacity(blocks),
             firsts: Vec::new(),
             single: None,
+            code_at: Vec::new(),
         };
         let mut at = 0usize;
         let mut last = 0u64;
@@ -2618,6 +2722,11 @@ impl Footer {
             footer.tf_at.push((tf * 8) as u32);
             footer.widths.push(width as u8);
             tf += bits::packed_len(n as usize, width) as u64;
+            // A block's codes, after its buckets, start on a byte.
+            if postings.codes {
+                footer.code_at.push((tf * 8) as u32);
+                tf += bits::packed_len(n as usize, CODE_BITS) as u64;
+            }
         }
         footer.starts.push(footer.frontier.len() as u32);
         super::segment::count_memo(|c| {
@@ -2673,6 +2782,22 @@ impl Footer {
         let bit = self.tf_at[block] as usize + within * width as usize;
         let bytes = tf.window(bit / 8, 8)?;
         Ok(bits::get_at(bytes, bit % 8, width)? as u8)
+    }
+
+    /// The length code of posting `index`, from its record's TF tail; `None`
+    /// when the record carries none.
+    pub fn code(&self, tf: Bytes<'_>, index: u32) -> Result<Option<u8>> {
+        if self.code_at.is_empty() {
+            return Ok(None);
+        }
+        let (block, within) = self.block_of(index)?;
+        let at = *self
+            .code_at
+            .get(block)
+            .ok_or(Error::Corrupt("posting index"))?;
+        let bit = at as usize + within * CODE_BITS as usize;
+        let bytes = tf.window(bit / 8, 8)?;
+        Ok(Some(bits::get_at(bytes, bit % 8, CODE_BITS)? as u8))
     }
 }
 
@@ -2741,6 +2866,10 @@ pub struct LazyFooter<'a> {
     /// those pages, still pinned.
     release: bool,
     owned: Vec<usize>,
+    /// Whether each block's length codes follow its buckets, and their
+    /// bytes in a whole block ([`FORM_CODES`]).
+    codes: bool,
+    code_full: u64,
 }
 
 /// Most bytes a footer block's entry takes: a slot gap, the frontier's
@@ -3065,6 +3194,12 @@ impl<'a> LazyFooter<'a> {
             maxb: Vec::new(),
             release: false,
             owned: Vec::new(),
+            codes: postings.codes,
+            code_full: if postings.codes {
+                bits::packed_len(block_size as usize, CODE_BITS) as u64
+            } else {
+                0
+            },
         };
         if matches!(postings.form, Form::Single(_)) || postings.compact {
             // Derived from the record (a block at most): decoded whole as
@@ -3271,7 +3406,7 @@ impl<'a> LazyFooter<'a> {
                     full
                 } else {
                     bits::packed_len(self.block_size as usize, width) as u64
-                };
+                } + self.code_full;
                 at += len;
                 b += 1;
                 if b > from && last >= slot {
@@ -3323,7 +3458,7 @@ impl<'a> LazyFooter<'a> {
                     full
                 } else {
                     bits::packed_len(self.block_size as usize, width) as u64
-                };
+                } + self.code_full;
                 at += len;
                 b += 1;
                 if b > from && last >= slot {
@@ -3426,7 +3561,13 @@ impl<'a> LazyFooter<'a> {
         let max = self.frontier[end - 1].0;
         let width = tf_width(max, self.adaptive);
         let tf_at = self.next_tf;
-        let next_tf = tf_at + bits::packed_len(n as usize, width) as u64;
+        let next_tf = tf_at
+            + bits::packed_len(n as usize, width) as u64
+            + if self.codes {
+                bits::packed_len(n as usize, CODE_BITS) as u64
+            } else {
+                0
+            };
         let at = self.at + len;
         if b + 1 == self.blocks && (at != self.src.len() || next_tf != self.tf_len) {
             return Err(Error::Corrupt("footer length"));
@@ -3517,7 +3658,7 @@ impl<'a> LazyFooter<'a> {
                     full
                 } else {
                     bits::packed_len(self.block_size as usize, width) as u64
-                };
+                } + self.code_full;
                 at += len;
                 b += 1;
             }
@@ -3737,6 +3878,29 @@ impl<'a> LazyFooter<'a> {
         let bytes = tf.window(self.tf_at[block] as usize + bit / 8, 8)?;
         Ok(bits::get_at(bytes, bit % 8, width)? as u8)
     }
+
+    /// Where posting `index`'s length code lies in its record's TF tail, in
+    /// bits (decoding the footer through its block); `None` when the record
+    /// carries none.
+    #[inline]
+    pub fn code_bit(&mut self, index: u32) -> Result<Option<usize>> {
+        if !self.codes {
+            return Ok(None);
+        }
+        let block = (index / self.block_size) as usize;
+        if block >= self.blocks {
+            return Err(Error::Corrupt("posting index"));
+        }
+        if self.widths.get(block).is_none() {
+            self.ensure(block)?;
+        }
+        let n = (self.df - block as u32 * self.block_size).min(self.block_size);
+        let width = u32::from(self.widths[block]);
+        let at = self.tf_at[block] as usize + bits::packed_len(n as usize, width);
+        Ok(Some(
+            at * 8 + (index % self.block_size) as usize * CODE_BITS as usize,
+        ))
+    }
 }
 
 impl Drop for LazyFooter<'_> {
@@ -3801,8 +3965,38 @@ mod tests {
                 "posting {i}"
             );
         }
+        // A record carries its postings' length codes as the options and
+        // its share of the documents say (one carrying its lengths inline
+        // does not), each its document's length class.
+        let inline = parsed.lengths.is_some();
+        assert_eq!(
+            parsed.codes,
+            options.length_codes && !inline && carries_codes(slots.len(), geometry.documents),
+            "codes of a record of {} postings in {} documents",
+            slots.len(),
+            geometry.documents
+        );
+        for (i, length) in lengths.iter().enumerate() {
+            let want = parsed.codes.then(|| length_class(&LENGTH_CLASSES, *length));
+            assert_eq!(footer.code(parsed.tf, i as u32).unwrap(), want, "code {i}");
+            if let Some(code) = want {
+                assert!(code_floor(code) <= *length);
+            }
+        }
         if let Form::Grouped(dir) = &parsed.form {
             let entries = &dir.entries(&geometry.groups).unwrap();
+            if parsed.codes {
+                let tf = parsed.tf.all().unwrap();
+                for e in entries {
+                    assert_eq!(e.codes as u32, CODE_BITS);
+                    for i in e.first..e.first + e.count {
+                        let code =
+                            bits::get_at(&tf[e.code_bit(i) / 8..], e.code_bit(i) % 8, CODE_BITS)
+                                .unwrap() as u8;
+                        assert_eq!(code, length_class(&LENGTH_CLASSES, lengths[i as usize]));
+                    }
+                }
+            }
             dir.check_entries(&geometry.groups).unwrap();
             for (b, e) in entries.iter().enumerate() {
                 assert_eq!(dir.find(e.index), Some(b));
@@ -4066,6 +4260,20 @@ mod tests {
             // A block is decoded only once the walk reaches it.
             assert_eq!(l.decoded(), start.max(b + 1));
         }
+        // Each posting's length code where the whole footer has it.
+        let mut fresh = lazy();
+        for i in 0..parsed.df {
+            let bit = fresh.code_bit(i).unwrap();
+            let want = footer.code(parsed.tf, i).unwrap();
+            assert_eq!(bit.is_some(), want.is_some(), "code of {i}");
+            if let (Some(bit), Some(code)) = (bit, want) {
+                let tf = parsed.tf.all().unwrap();
+                assert_eq!(
+                    bits::get_at(&tf[bit / 8..], bit % 8, CODE_BITS).unwrap() as u8,
+                    code
+                );
+            }
+        }
         assert_eq!(l.seek(0, u32::MAX).unwrap(), footer.blocks());
         assert_eq!(l.seek(0, 0).unwrap(), 0);
         // A bucket asked for first decodes its block's prefix only.
@@ -4280,6 +4488,7 @@ mod tests {
                                 GroupFrontiers::Exact
                             },
                             length_classes: grid_density == 0,
+                            length_codes: block_size != 3 || adaptive_tf,
                         });
                     }
                 }
@@ -4308,6 +4517,46 @@ mod tests {
             let without = round_trip(&geometry, &slots, buckets, &lengths, &lists);
             assert_eq!(stats.sparse, without.sparse);
             assert_eq!(without.array_excess, 0);
+        }
+    }
+
+    /// A record of at most a tenth of the documents carries each posting's
+    /// length class after its block's (or group's) buckets, sparse or
+    /// grouped, at every width; a denser one carries none.
+    #[test]
+    fn rare_records_carry_their_postings_length_codes() {
+        let tids: Vec<Tid> = (0..4_000u32)
+            .map(|i| Tid {
+                block: i / 7 * 3,
+                offset: (i % 7) as u16 + 1,
+            })
+            .collect();
+        let geometry = geometry(&tids);
+        for (step, max_tf) in [(13usize, 1u8), (11, 2), (17, 5), (9, 15), (3, 4)] {
+            let members: Vec<Tid> = tids.iter().step_by(step).copied().collect();
+            let slots: Vec<u32> = members
+                .iter()
+                .map(|t| geometry.slot_of(*t).unwrap())
+                .collect();
+            let buckets: Vec<u8> = (0..slots.len())
+                .map(|i| (i % (max_tf as usize + 1)) as u8)
+                .collect();
+            // Lengths across the classes' floors (16, 64, 256).
+            let lengths: Vec<u32> = (0..slots.len() as u32)
+                .map(|i| [3, 16, 40, 63, 64, 200, 256, 900][i as usize % 8])
+                .collect();
+            let mut coded = 0;
+            for options in all_options() {
+                round_trip(&geometry, &slots, &buckets, &lengths, &options);
+                let mut out = Vec::new();
+                encode(&geometry, &slots, &buckets, &lengths, &options, &mut out);
+                let parsed = Postings::parse(&out, slots.len() as u32, &geometry).unwrap();
+                coded += usize::from(parsed.codes);
+                if options.length_codes && options.inline_lengths_max_df == 0 {
+                    assert_eq!(parsed.codes, slots.len() * 10 <= tids.len(), "{step}");
+                }
+            }
+            assert_eq!(coded > 0, slots.len() * 10 <= tids.len(), "{step}");
         }
     }
 

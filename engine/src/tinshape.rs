@@ -3436,6 +3436,96 @@ mod tests {
         }
     }
 
+    /// A candidate holding a scoring term whose record carries length codes
+    /// (page layout 17, at most a tenth of the documents) is bounded by its
+    /// length class read beside its buckets in the TF tail, not from the DL
+    /// sidecar's class plane; the answers are the same as without codes.
+    #[test]
+    fn length_codes_in_the_tf_tail_replace_class_reads() {
+        let n = 6_000u32;
+        let docs: Vec<Tid> = (0..n)
+            .map(|i| Tid {
+                block: i / 10,
+                offset: (i % 10) as u16 + 1,
+            })
+            .collect();
+        // Mostly long documents, a few short ones that win.
+        let lengths: Vec<u32> = (0..n).map(|i| if i % 97 == 0 { 3 } else { 300 }).collect();
+        // Term t holds positions 0..tf: "t0 t1" needs t1 at 1, so tf 2.
+        let members = vec![
+            (0..n as usize)
+                .filter(|r| r % 13 == 0 || r % 97 == 0)
+                .map(|r| (r, 1 + (r % 3) as u32))
+                .collect::<Vec<_>>(),
+            (0..n as usize)
+                .filter(|r| r % 17 == 0 || r % 97 == 0)
+                .map(|r| (r, 2 + (r % 2) as u32))
+                .collect(),
+        ];
+        assert!(members.iter().all(|m| m.len() * 10 <= n as usize));
+        let all: Vec<usize> = (0..n as usize).collect();
+        let names = vec!["t0".to_owned(), "t1".to_owned()];
+        let scorers: Vec<(String, TermScorer)> = members
+            .iter()
+            .enumerate()
+            .map(|(t, m)| {
+                let scorer = TermScorer::from_statistics(
+                    u64::from(n),
+                    m.len() as u64,
+                    1.0,
+                    Bm25Params::default(),
+                    250.0,
+                )
+                .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let nodes = [
+            Node::And(vec![Node::Term(0), Node::Term(1)]),
+            Node::Or(vec![Node::Term(0), Node::Term(1)]),
+            Node::Span {
+                slots: vec![0, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+        ];
+        for node in &nodes {
+            let mut answers = Vec::new();
+            for length_codes in [false, true] {
+                let options = Options {
+                    grid_min_postings: 0,
+                    inline_lengths_min_documents: u32::MAX,
+                    length_codes,
+                    ..Options::default()
+                };
+                let blob = build_part(
+                    &docs,
+                    &lengths,
+                    &members,
+                    &all,
+                    &vec![false; n as usize],
+                    options,
+                );
+                let segment = Segment::parse(&blob).unwrap();
+                let mut reads = AreaReads::default();
+                let got = top_k(&segment, node, &names, &scorers, 10, &mut reads).unwrap();
+                let classes = reads.reads[Part::DlClasses as usize];
+                if length_codes {
+                    assert_eq!(classes, 0, "{node:?}: {classes} class reads with codes");
+                } else {
+                    assert!(classes > 0, "{node:?}: no class read without codes");
+                }
+                answers.push(
+                    got.rows
+                        .iter()
+                        .map(|(s, t)| (s.to_bits(), *t))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(answers[0], answers[1], "{node:?}");
+            assert_eq!(answers[0].len(), 10, "{node:?}");
+        }
+    }
+
     /// While the top k fill, a phrase's candidate is confirmed by its
     /// positions before its length is read: one that holds both words but
     /// not the phrase reads no DL (TIN reads lengths for phrase matches
