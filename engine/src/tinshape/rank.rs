@@ -1400,6 +1400,9 @@ impl SubTerm<'_> {
 struct SubCut<'a> {
     terms: Vec<Option<SubTerm<'a>>>,
     sums: Vec<f32>,
+    /// Per scoring term in the group at hand: its bound over the group, and
+    /// whether its codes bound it per sub-range.
+    bounds: Vec<(f32, bool)>,
 }
 
 struct Walk<'s, 'a, T: Touch> {
@@ -2944,11 +2947,18 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             words,
             segment::tinshape::postings::sub_ranges(group.slots())
         );
-        let SubCut { terms, sums } = self.subs.as_deref_mut().expect("codes");
-        sums.clear();
-        sums.resize(words, 0.0);
-        let mut coded = false;
-        for (i, term) in terms.iter_mut().enumerate() {
+        let SubCut {
+            terms,
+            sums,
+            bounds,
+        } = self.subs.as_deref_mut().expect("codes");
+        // Each term's bound over the group, and whether codes bound it: the
+        // others' bounds alone at the bar or above leave no word to cut
+        // (a word's bound is at least theirs), and no code is read.
+        bounds.clear();
+        let mut fixed = 0.0_f32;
+        let mut any = false;
+        for (i, term) in terms.iter().enumerate() {
             let t = self.sc[i].term;
             let entry = self.mems[t].entry;
             let held = self.mems[t].loaded == g + 1 && entry != usize::MAX;
@@ -2957,8 +2967,24 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             } else {
                 self.sc[i].range_bound(g, base, end)
             };
-            if held
-                && matches!(self.mems[t].kind, Kind::Grid(_))
+            let coded = held && term.is_some() && matches!(self.mems[t].kind, Kind::Grid(_));
+            if !coded {
+                fixed += gb;
+            }
+            any |= coded;
+            bounds.push((gb, coded));
+        }
+        if !any || self.bar.is_none_or(|(theta, _)| fixed >= theta) {
+            return Ok(());
+        }
+        sums.clear();
+        sums.resize(words, 0.0);
+        let mut coded = false;
+        for (i, term) in terms.iter_mut().enumerate() {
+            let t = self.sc[i].term;
+            let entry = self.mems[t].entry;
+            let (gb, codable) = bounds[i];
+            if codable
                 && let Some(st) = term.as_mut()
                 && let Bounds::Groups(groups) = &self.sc[i].footer
             {
@@ -3885,6 +3911,7 @@ pub(super) fn walk_into<'s, 'a>(
         walk.subs = Some(Box::new(SubCut {
             terms,
             sums: Vec::new(),
+            bounds: Vec::new(),
         }));
     }
     if walk.common_terms {
