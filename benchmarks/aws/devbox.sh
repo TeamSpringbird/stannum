@@ -22,7 +22,8 @@
 # laid out alike) on a gp3 root volume sized for it; tnsreplay reads every
 # segment into memory (37.5 GB), so --dump defaults to r7i.2xlarge (64 GiB).
 # --disk sizes the root volume (default 30 GiB, 90 with --dump): a command
-# that re-encodes the dump into two more formats on the box needs about 150.
+# that re-encodes the dump into two more formats on the box needs about 150,
+# one restoring three 150M databases beside two dumps about 380.
 #
 # The box is a one-time spot instance in the AZ with the lowest spot price
 # (on-demand if no AZ has spot capacity, or with --on-demand, for sessions
@@ -112,7 +113,7 @@ esac
 [ -n "$type" ] || { [ $dump = 1 ] && type=r7i.2xlarge || type=c7i.2xlarge; }
 [ -n "$(on_demand "$type")" ] || die "--type must be one of: $TYPES"
 case $hours in 1|2|3) ;; *) die "--hours must be 1, 2 or 3" ;; esac
-case $disk in "" | [3-9][0-9] | 1[0-9][0-9] | 200) ;; *) die "--disk must be 30 to 200 (GiB)" ;; esac
+case $disk in "" | [3-9][0-9] | [1-3][0-9][0-9] | 400) ;; *) die "--disk must be 30 to 400 (GiB)" ;; esac
 
 # --- the stack: role, instance profile, security group --------------------
 stack_output() {
