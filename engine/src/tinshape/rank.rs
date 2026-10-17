@@ -69,8 +69,11 @@ const STAGE_CHUNK: usize = 256;
 
 /// A led walk's group of all grids holding at least this many candidates
 /// is cut by its scoring terms' sub-range codes first ([`Walk::sub_cut`]):
-/// the cut reads a byte per term, frontier pair and word holding one.
-const SUB_MIN: u64 = 256;
+/// the cut reads a byte per term, frontier pair and word holding one. At
+/// 32.6M rows (M4, whole trace) 32 cut `full_score` conjunctions' cycles
+/// 23% and phrases' 10%, 96 15% and 9%, 256 4% and 7%: a dense
+/// conjunction's group holds about 100 candidates.
+const SUB_MIN: u64 = 32;
 
 /// A group with at least this many candidates has them sieved by their
 /// buckets ([`Walk::sieve`]) this many at a time ([`SIEVE_CHUNK`]) before
