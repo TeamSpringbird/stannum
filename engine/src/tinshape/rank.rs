@@ -1394,6 +1394,46 @@ impl SubTerm<'_> {
     }
 }
 
+/// The buckets of the group frontier at `at` of a directory's bytes (its
+/// head, then a varint per further pair whose low four bits are the bucket
+/// gap less one) into `out`, and how many; 0 for a malformed one (the cut
+/// then bounds the term by its group). Its own decoder: iterating a
+/// [`GroupFrontier`] here as well cost every walk ~1% more instructions
+/// (aarch64 and x86-64: the hot frontier folds compiled differently).
+#[inline(never)]
+fn frontier_buckets(bytes: &[u8], at: usize, out: &mut [u8; 16]) -> usize {
+    let varint = |p: &mut usize| -> Option<u64> {
+        let mut value = 0u64;
+        for shift in (0..64).step_by(7) {
+            let b = *bytes.get(*p)?;
+            *p += 1;
+            value |= u64::from(b & 0x7f) << shift;
+            if b & 0x80 == 0 {
+                return Some(value);
+            }
+        }
+        None
+    };
+    let Some(&head) = bytes.get(at) else {
+        return 0;
+    };
+    let n = usize::from(head >> 4) + 1;
+    let mut bucket = head & 15;
+    out[0] = bucket;
+    let mut p = at + 1;
+    if varint(&mut p).is_none() {
+        return 0;
+    }
+    for slot in out.iter_mut().take(n).skip(1) {
+        let Some(d) = varint(&mut p) else {
+            return 0;
+        };
+        bucket = bucket.wrapping_add(1 + (d & 15) as u8) & 15;
+        *slot = bucket;
+    }
+    n
+}
+
 /// A led walk's sub-range cut ([`Walk::sub_cut`]): per scoring term (by
 /// index into `sc`) its codes, if its record has them, and the group at
 /// hand's sub-ranges' bounds.
@@ -2989,13 +3029,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 && let Bounds::Groups(groups) = &self.sc[i].footer
             {
                 let mut buckets = [0u8; 16];
-                let mut pairs = 0usize;
-                for (bucket, _) in groups.frontier(entry) {
-                    buckets[pairs % 16] = bucket;
-                    pairs += 1;
-                }
-                let pairs = pairs.min(16);
-                if let Some((codes, at)) = st.codes.of(entry, words * pairs)? {
+                let pairs = frontier_buckets(
+                    groups.dir.bytes(),
+                    groups.entry(entry).frontier as usize,
+                    &mut buckets,
+                );
+                if pairs > 0
+                    && let Some((codes, at)) = st.codes.of(entry, words * pairs)?
+                {
                     if st.table.is_empty() {
                         st.table = vec![f32::NAN; BUCKET_COUNT * 256];
                     }
