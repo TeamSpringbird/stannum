@@ -26,7 +26,10 @@
 # NAME:BASE pairs for the summary (benchmarks/aws/htpair_summary.py, run on
 # the box into summary.txt). ROUNDS (3), PLAN, REPEAT (2), CPU (2: its
 # core is measured), WIDE (1: the first arm's first round also runs four
-# cores' eight hyperthreads).
+# cores' eight hyperthreads), TAIL (1: PLAN also runs the benchmark's 25
+# slowest forms of score disjunction and the full styles, the fixed sets in
+# benchmarks/aws/tail/, as STYLE@SET slices the gate shows as each style's
+# tail; 0: only the 25 slowest of each slice).
 set -u
 eval "$(head -1 /root/devbox.sh)" # RUN BUCKET PREFIX: for progress lines
 step() {
@@ -39,8 +42,12 @@ save() {
     /usr/local/bin/aws s3 cp --only-show-errors /work/partial.tar.gz "s3://$BUCKET/$PREFIX/results.tar.gz" || true
 }
 T=$DATA/trace.tsv
-ROUNDS=${ROUNDS:-3} REPEAT=${REPEAT:-2} CPU=${CPU:-2} WIDE=${WIDE:-1} COMPARE=${COMPARE:-}
+ROUNDS=${ROUNDS:-3} REPEAT=${REPEAT:-2} CPU=${CPU:-2} WIDE=${WIDE:-1} COMPARE=${COMPARE:-} TAIL=${TAIL:-1}
 PLAN=${PLAN:-conjunction:score:160,phrase:score:160,disjunction:score:80,conjunction:full:80,phrase:full:80,disjunction:full:40}
+if [ "$TAIL" = 1 ]; then
+  TS=$SRC1/benchmarks/aws/tail
+  [ -f $TS/fconj.tsv ] && PLAN="$PLAN,disjunction:score:@$TS/sdisj.tsv,conjunction:full:@$TS/fconj.tsv,phrase:full:@$TS/fphr.tsv,disjunction:full:@$TS/fdisj.tsv"
+fi
 FV=CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS
 LINK="-C link-arg=-Wl,--unresolved-symbols=ignore-all"
 
