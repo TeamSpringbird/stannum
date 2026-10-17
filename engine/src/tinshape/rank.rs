@@ -73,7 +73,7 @@ const STAGE_CHUNK: usize = 256;
 /// 32.6M rows (M4, whole trace) 32 cut `full_score` conjunctions' cycles
 /// 23% and phrases' 10%, 96 15% and 9%, 256 4% and 7%: a dense
 /// conjunction's group holds about 100 candidates.
-const SUB_MIN: u64 = 32;
+const SUB_MIN: u64 = 8;
 
 /// A group with at least this many candidates has them sieved by their
 /// buckets ([`Walk::sieve`]) this many at a time ([`SIEVE_CHUNK`]) before
