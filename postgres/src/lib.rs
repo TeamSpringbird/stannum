@@ -6165,9 +6165,11 @@ mod tests {
              20,1500,46500,12,47,632086f117ba324fe5f612998867418c;\
              2,2250,69750,17,48,9b28da87480a70525a600503080b821a size 417792"
         );
+        // Page layout 17: "common" (every document, a grid) holds sub-range
+        // codes; the capped segments hold no grid, so none.
         assert_eq!(
             build_digest("reproducible_whole"),
-            "2,6000,186000,41,46,11cc1c63fb19c960e8191411cee996f2 size 360448"
+            "2,6000,186000,41,46,72e1100bc3ba39196c472ce835a45bee size 360448"
         );
         assert_clean("reproducible_capped");
         assert_clean("reproducible_whole");
