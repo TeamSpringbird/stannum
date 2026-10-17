@@ -2580,8 +2580,12 @@ conjunctions' cycles fell 23% and phrases' 9% (the slowest 25: 49% and
 23 / 24 / 23%. Not kept by the paired gate: the targets pass, but score
 conjunctions and phrases fall 0.9% and 0.5% (rounds -1.4..+2.2 and
 -1.8..+0.4) with 0.4-0.7% more instructions in every untargeted style,
-disjunctions included, which never reach the cut: code layout of this
-build, to be judged again in an integration's PGO A/B.
+disjunctions included, which never reach the cut. Bisected on M4 (where
+the same build had +0.8-1.0%): iterating a group frontier in the cut
+compiled the walks' hot frontier folds differently; the cut now decodes
+its buckets with its own function, and every untargeted style is within
++0.04% of the base's instructions (the targets keep -16% / -12%). Not
+re-gated on x86 yet.
 
 ## Open
 
