@@ -3761,10 +3761,21 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             match self.groups.admit(g) {
                 Admit::Yes => {}
-                // Terms are read in order: the groups before the next
-                // range are passed one at a time.
-                Admit::From(_) => {
-                    from = g + 1;
+                // The groups before the next range are passed unread: each
+                // term behind it sought there (a grouped term's walk in
+                // order moved to its first group from there).
+                Admit::From(start) => {
+                    from = start;
+                    for i in 0..n {
+                        if next[i] < start {
+                            fresh[i] = false;
+                            if grouped[i] {
+                                let t = self.sc[i].term;
+                                let set = self.terms[t].as_ref().expect("scoring");
+                                set.step_from(&mut order[i], start, self.mems[t].hint);
+                            }
+                        }
+                    }
                     continue;
                 }
                 Admit::Done => break,

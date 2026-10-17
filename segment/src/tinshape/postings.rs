@@ -2171,6 +2171,37 @@ impl Directory {
         Ok(Some((b, entry)))
     }
 
+    /// Where a walk in order stands to read next the first entry from
+    /// `from` on whose group index is `group` or more ([`Self::seek`]), as
+    /// if it had read every entry before it ([`Self::step`]).
+    pub fn in_order_from(&self, group: u32, from: usize) -> InOrder {
+        let (b, index) = self.seek(group, from);
+        if b == 0 || b >= self.len {
+            // The first entry's walk starts itself; past the last, none.
+            return InOrder {
+                next: b,
+                ..InOrder::default()
+            };
+        }
+        let (head, totals) = self.row(b);
+        let (w, word) = match self.presence {
+            // The bits of the entries before `b` cleared.
+            Presence::Bitmap { words, .. } => {
+                let w = index as usize / 64;
+                (w, self.word(words, w) & (u64::MAX << (index % 64)))
+            }
+            Presence::Indexes { .. } => (0, 0),
+        };
+        InOrder {
+            next: b,
+            head,
+            totals,
+            base: self.base(b / DIRECTORY_BLOCK),
+            w,
+            word,
+        }
+    }
+
     /// Entry `b`, its group index found first: the entry read last as it
     /// was, the one after it by the next group its presence holds (a walk
     /// in order selects nothing).
@@ -5231,6 +5262,22 @@ mod directory_tests {
             assert_eq!(dir.get(b, groups).unwrap(), *e, "get after step {b}");
         }
         assert_eq!(dir.step(&mut order, groups).unwrap(), None, "past the last");
+        // Read in order from a group on: the entries from the first at or
+        // after it, as if every one before had been read.
+        for g in 0..=groups.len() as u32 + 1 {
+            let b = want.partition_point(|w| w.0 < g);
+            for from in [0, b / 2, b] {
+                let mut order = dir.in_order_from(g, from);
+                for (at, e) in entries.iter().enumerate().skip(b) {
+                    assert_eq!(
+                        dir.step(&mut order, groups).unwrap(),
+                        Some((at, *e)),
+                        "step {at} from group {g}"
+                    );
+                }
+                assert_eq!(dir.step(&mut order, groups).unwrap(), None, "past the last from {g}");
+            }
+        }
     }
 
     proptest! {

@@ -441,6 +441,16 @@ impl<'a> TermSet<'a> {
         }
     }
 
+    /// Moves a grouped term's walk in order ([`Self::step_index`]) to its
+    /// first group whose index is `group` or more, sought from `hint`: the
+    /// groups before it are passed unread.
+    #[inline]
+    fn step_from(&self, order: &mut InOrder, group: u32, hint: usize) {
+        if let Some(dir) = &self.dir {
+            *order = dir.in_order_from(group, hint);
+        }
+    }
+
     /// The term's group `group`, if it holds it, looked for from `hint`
     /// forward (the hint is left at the first group at or after it).
     /// Inlined: returned through memory, its group was stored a field at a
