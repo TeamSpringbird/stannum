@@ -2567,25 +2567,23 @@ conjunctions' cycles and 11% of phrases', the slowest 25 48% and 24%;
 1,024-slot sub-ranges took none (R10's gain was its finer per-candidate
 length floors).
 
-| 150M rows, x86 paired gate (3 rounds) | full conj | full phrase | conj | phrase | disj | full disj |
+| 150M rows, x86 paired gate (3 rounds, f3dcd3f vs 990e51c) | full conj | full phrase | conj | phrase | disj | full disj |
 |---|---:|---:|---:|---:|---:|---:|
-| q/Gcyc, paired core | **+10.4%** | **+8.9%** | -0.9% | -0.5% | -0.3% | -0.2% |
-| instructions/q | -12.6% | -12.4% | +0.7% | +0.7% | +0.4% | +0.4% |
-| tail-25 (i16's slowest), paired cycles | **-24.0%** | **-18.1%** | | | | +1.2% |
+| q/Gcyc, paired core | **+12.6%** | **+10.7%** | +0.5% | +2.8% | +1.0% | +0.0% |
+| instructions/q | -13.6% | -13.4% | +0.1% | -0.1% | -0.0% | -0.0% |
+| tail-25 (i16's slowest), paired cycles | **-25.8%** | **-19.4%** | | | | +0.1% |
 
 Index +1.66% (36.23 -> 36.83 GB). Answers identical (`--expect` 0
 different, `--full` byte-identical). On M4 (32.6M rows) `full_score`
 conjunctions' cycles fell 23% and phrases' 9% (the slowest 25: 49% and
 19%); `SUB_MIN` 256 / 96 / 32 / 16 / 8 cut conjunctions' cycles 4 / 15 /
-23 / 24 / 23%. Not kept by the paired gate: the targets pass, but score
-conjunctions and phrases fall 0.9% and 0.5% (rounds -1.4..+2.2 and
--1.8..+0.4) with 0.4-0.7% more instructions in every untargeted style,
-disjunctions included, which never reach the cut. Bisected on M4 (where
-the same build had +0.8-1.0%): iterating a group frontier in the cut
-compiled the walks' hot frontier folds differently; the cut now decodes
-its buckets with its own function, and every untargeted style is within
-+0.04% of the base's instructions (the targets keep -16% / -12%). Not
-re-gated on x86 yet.
+23 / 24 / 23%. Kept by the paired gate (geomean +4.48%, rounds +3.6 / +4.5 / +5.5,
+worst style +0.04%). A first gate of an earlier build had dropped it: score
+conjunctions and phrases fell 0.9% and 0.5% with 0.4-0.7% more
+instructions in every untargeted style, disjunctions included, which never
+reach the cut. Bisected on M4: iterating a group frontier in the cut
+compiled the walks' hot frontier folds differently; the cut now decodes its
+buckets with its own function (`frontier_buckets`).
 
 ## Open
 
