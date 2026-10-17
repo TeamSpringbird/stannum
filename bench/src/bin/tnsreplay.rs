@@ -119,9 +119,9 @@ struct Args {
     /// `--prepass SPEC`: some groups of one segment walked before the
     /// others (see [`Prepass`]).
     prepass: Option<Prepass>,
-    /// `--tail-first P[:MIN]`: the extension path's tail-first walk
-    /// (`WalkConfig::tail_first_*`); the engine's defaults when unset.
-    tail_first: (u32, f64),
+    /// `--tail-first P`: the extension path's tail-first walk
+    /// (`WalkConfig::tail_first_permille`); the engine's default when unset.
+    tail_first: u32,
     pin_ns: u64,
     /// Pages a walk keeps pinned between groups (`LazyBlob::set_keep`);
     /// the blob's default when unset.
@@ -268,7 +268,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
-         [--order engine|gen|gen-desc|docs-asc|small-first|bound|matches|density|final] [--seed | --seed-rank R] [--prepass big|small:stride|head|tail:N] [--tail-first P[:MIN]] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|matches|density|final] [--seed | --seed-rank R] [--prepass big|small:stride|head|tail:N] [--tail-first P] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
          [--plan STYLE:score|full:N|full:@FILE,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,...] [--mmap]"
     );
     std::process::exit(2)
@@ -291,7 +291,7 @@ fn args() -> Args {
         seed: false,
         seed_rank: None,
         prepass: None,
-        tail_first: (engine::walk::TAIL_FIRST_PERMILLE, engine::walk::TAIL_FIRST_MIN),
+        tail_first: engine::walk::TAIL_FIRST_PERMILLE,
         pin_ns: 0,
         keep_pins: None,
         threads: 0,
@@ -326,14 +326,7 @@ fn args() -> Args {
             "--memory" => a.memory = true,
             "--mmap" => a.mmap = true,
             "--seed" => a.seed = true,
-            "--tail-first" => {
-                let v = value(&mut it);
-                let (p, m) = v.split_once(':').unwrap_or((v.as_str(), "0"));
-                a.tail_first = (
-                    p.parse().unwrap_or_else(|_| usage()),
-                    m.parse().unwrap_or_else(|_| usage()),
-                );
-            }
+            "--tail-first" => a.tail_first = value(&mut it).parse().unwrap_or_else(|_| usage()),
             "--prepass" => {
                 a.prepass = Some(Prepass::parse(&value(&mut it)).unwrap_or_else(|| usage()))
             }
@@ -863,8 +856,8 @@ struct Reader {
     /// Rank as `full_score` (set per query with `--plan`).
     full: std::cell::Cell<bool>,
     prepass: Option<Prepass>,
-    /// `--tail-first P[:MIN]` ([`WalkConfig::tail_first_permille`]).
-    tail_first: (u32, f64),
+    /// `--tail-first P` ([`WalkConfig::tail_first_permille`]).
+    tail_first: u32,
     segs: Vec<Seg>,
 }
 
@@ -990,8 +983,7 @@ impl Reader {
             warmup_chunks: 256,
             warmup_min_matches: 4.0,
             seed: None,
-            tail_first_permille: self.tail_first.0,
-            tail_first_min: self.tail_first.1,
+            tail_first_permille: self.tail_first,
         };
         let top = scorer.top_k(&sources, k, false, &config, |_| AllVisible, |_| true)?;
         if top.zero_fill || !top.native || top.ordinal {
@@ -1399,9 +1391,6 @@ fn answer_line(ids: &FxHashMap<Tid, String>, rows: &[(f32, Tid)]) -> String {
 }
 
 struct Row {
-    /// The candidates the largest segment's walk expects
-    /// ([`Scorer::expected_candidates`]).
-    est: f64,
     name: String,
     style: String,
     ns: u64,
@@ -1833,13 +1822,16 @@ fn run() -> Result<bool, String> {
     let start = Instant::now();
     let reader = Reader::open(&loaded, &args)?;
     if let Some(path) = &args.group_stats {
-        let mut text = String::from("generation\tgroup\tid\tdocuments\tmean_length\tc0\tc1\tc2\tc3\n");
+        let mut text =
+            String::from("generation\tgroup\tid\tdocuments\tmean_length\tc0\tc1\tc2\tc3\n");
         for seg in &reader.segs {
             let docs = &seg.segment.docs;
             let groups = &docs.geometry.groups;
             for (g, group) in groups.iter().enumerate() {
                 let from = group.rank_base;
-                let to = groups.get(g + 1).map_or(seg.segment.documents, |next| next.rank_base);
+                let to = groups
+                    .get(g + 1)
+                    .map_or(seg.segment.documents, |next| next.rank_base);
                 let (mut sum, mut classes) = (0u64, [0u32; 4]);
                 for rank in from..to {
                     sum += u64::from(seg.segment.lengths.get(rank).unwrap_or(0));
@@ -2002,13 +1994,7 @@ fn run() -> Result<bool, String> {
             mismatched += 1;
             eprintln!("instrumented walk differs: {}", q.name);
         }
-        let est = reader
-            .segs
-            .iter()
-            .max_by_key(|seg| seg.segment.documents)
-            .map_or(0.0, |seg| scorer.expected_candidates(&seg.reader));
         rows.push(Row {
-            est,
             name: q.name.clone(),
             style: q.style.clone(),
             ns: percentile(&mut times, 0.5),
@@ -2307,12 +2293,12 @@ fn run() -> Result<bool, String> {
     }
     if let Some(path) = &args.per_query {
         let mut text = String::from(
-            "name\tstyle\tus\texamined\tscored\tchecks\tpages\tdl\tpayload\tfooter\ttf\tpositions\tpins\tallocs\treallocs\tdlclass\tclasscuts\tins\tcyc\test\n",
+            "name\tstyle\tus\texamined\tscored\tchecks\tpages\tdl\tpayload\tfooter\ttf\tpositions\tpins\tallocs\treallocs\tdlclass\tclasscuts\tins\tcyc\n",
         );
         for r in &rows {
             let _ = writeln!(
                 text,
-                "{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}\t{:.0}",
+                "{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}",
                 r.name,
                 r.style,
                 r.ns as f64 / 1e3,
@@ -2332,27 +2318,35 @@ fn run() -> Result<bool, String> {
                 r.answer.class_cuts,
                 r.timed[0] as f64 / args.repeat.max(1) as f64,
                 r.timed[1] as f64 / args.repeat.max(1) as f64,
-                r.est,
             );
         }
         std::fs::write(path, text).map_err(|e| e.to_string())?;
     }
     if let Some(path) = &args.rows_at {
         // Where each answer row lies: its segment and group there.
-        let mut text = String::from("name\tstyle\trank\tscore\tblock\toffset\tgeneration\tgroup\tgroups\n");
+        let mut text =
+            String::from("name\tstyle\trank\tscore\tblock\toffset\tgeneration\tgroup\tgroups\n");
         for r in &rows {
             for (rank, (score, tid)) in r.rows.iter().enumerate() {
                 let at = reader.segs.iter().find_map(|seg| {
                     let geometry = &seg.segment.docs.geometry;
                     let slot = geometry.slot_of(*tid)?;
                     seg.segment.docs.rank(slot)?;
-                    Some((seg.generation, geometry.group_of_slot(slot), geometry.groups.len()))
+                    Some((
+                        seg.generation,
+                        geometry.group_of_slot(slot),
+                        geometry.groups.len(),
+                    ))
                 });
                 let (generation, group, groups) = at.unwrap_or((0, 0, 0));
                 let _ = writeln!(
                     text,
                     "{}\t{}\t{}\t{score}\t{}\t{}\t{generation}\t{group}\t{groups}",
-                    r.name, r.style, rank + 1, tid.block, tid.offset
+                    r.name,
+                    r.style,
+                    rank + 1,
+                    tid.block,
+                    tid.offset
                 );
             }
         }

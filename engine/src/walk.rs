@@ -43,11 +43,7 @@ pub const PRUNE_MAX_K: usize = 4096;
 
 /// Per mille of the first native segment's groups, its last, that its walk
 /// takes first (zero: none; see [`WalkConfig::tail_first_permille`]).
-pub const TAIL_FIRST_PERMILLE: u32 = 200;
-
-/// The candidates a walk must expect in the first native segment for its
-/// tail to be taken first (see [`WalkConfig::tail_first_min`]).
-pub const TAIL_FIRST_MIN: f64 = 0.0;
+pub const TAIL_FIRST_PERMILLE: u32 = 400;
 
 /// A first segment of fewer groups is walked in order.
 const TAIL_FIRST_MIN_GROUPS: usize = 1024;
@@ -322,13 +318,10 @@ pub struct WalkConfig {
     /// a query returns.
     pub seed: Option<(f32, Tid)>,
     /// Per mille of the first native segment's groups, its last, that its
-    /// walk takes first, when the query expects at least `tail_first_min`
-    /// candidates there ([`Scorer::expected_candidates`]); zero: none. The
-    /// threshold forms there before the walk turns to the segment's other
-    /// groups and the other segments; the rows kept are the same in any
-    /// order (see [`TopRows`]).
+    /// walk takes first; zero: none. The threshold forms there before the
+    /// walk turns to the segment's other groups and the other segments; the
+    /// rows kept are the same in any order (see [`TopRows`]).
     pub tail_first_permille: u32,
-    pub tail_first_min: f64,
 }
 
 /// Whether a candidate's tuple is visible: asked of each candidate as it
@@ -797,22 +790,6 @@ impl TopRows {
 }
 
 impl Scorer {
-    /// The candidates a walk over `index` is expected to meet, its terms
-    /// taken as independent: a conjunction's (a phrase's) documents holding
-    /// every scoring term, a disjunction's postings of them all.
-    pub fn expected_candidates(&self, index: &dyn Index) -> f64 {
-        let docs = f64::from(index.document_count().max(1));
-        let all = prunable_shape(&self.query).is_some_and(|(combine, _, _)| combine == Combine::All);
-        let mut share = 1.0_f64;
-        let mut sum = 0.0_f64;
-        for (term, _) in &self.terms {
-            let df = segment_error(index.term(term)).map_or(0, |t| t.df());
-            share *= f64::from(df) / docs;
-            sum += f64::from(df);
-        }
-        if all { share * docs } else { sum }
-    }
-
     /// True when no term scores: every leaf is absent or an elided dense
     /// term, so every match scores zero and ranks in heap order.
     pub fn scores_nothing(&self) -> bool {
@@ -934,7 +911,11 @@ impl Scorer {
             let mut shortcut = true;
             // Largest source first: the threshold prunes only once the heap
             // holds k rows, and the biggest segment is the likeliest to hold
-            // the best of them, so the smaller ones are walked pruned.
+            // the best of them, so the smaller ones are walked pruned. Its
+            // last groups go first ([`TAIL_FIRST_PERMILLE`]): on the 150M
+            // benchmark's layout they hold its shortest documents, whose
+            // rows the threshold forms from; the slowest queries ran 5-9%
+            // fewer instructions so.
             let mut order: Vec<usize> = (0..sources.len()).collect();
             order.sort_by_key(|&i| std::cmp::Reverse(sources[i].index.document_count()));
             // Only a conjunction of scoring terms, elided filters beside them
@@ -970,9 +951,7 @@ impl Scorer {
                     let source = &sources[i];
                     let walked = match (&node, source.native) {
                         (Some(node), Some(native)) => {
-                            let lead = std::mem::take(&mut first)
-                                && config.tail_first_permille > 0
-                                && self.expected_candidates(source.index) >= config.tail_first_min;
+                            let lead = std::mem::take(&mut first);
                             native.walk(&names, positions, &mut |segment| {
                                 let groups = segment.docs.geometry.groups.len();
                                 let split = lead
@@ -1001,9 +980,8 @@ impl Scorer {
                                         &mut crate::tinshape::NoTouch,
                                     )?;
                                     scored += answer.scored as usize;
-                                    POSITION_CHECKS.set(
-                                        POSITION_CHECKS.get() + answer.position_checks as i64,
-                                    );
+                                    POSITION_CHECKS
+                                        .set(POSITION_CHECKS.get() + answer.position_checks as i64);
                                 }
                                 Ok(())
                             })
