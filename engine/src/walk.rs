@@ -49,57 +49,8 @@ pub const TAIL_FIRST_PERMILLE: u32 = 200;
 /// tail to be taken first (see [`WalkConfig::tail_first_min`]).
 pub const TAIL_FIRST_MIN: f64 = 0.0;
 
-/// Whether the lead groups are the densest rather than the last
-/// (see [`WalkConfig::dense_first`]).
-pub const DENSE_FIRST: bool = true;
-
 /// A first segment of fewer groups is walked in order.
 const TAIL_FIRST_MIN_GROUPS: usize = 1024;
-
-/// The first native segment's groups its walk takes first, the `permille`
-/// per mille holding the most documents (a group spans a fixed run of heap
-/// pages, so those of the shortest rows, whose documents BM25 favours), and
-/// the others; both as ascending ranges. `None` for every group in order.
-pub fn dense_first(
-    geometry: &segment::tinshape::docs::Geometry,
-    permille: u32,
-) -> Option<(Vec<(u32, u32)>, Vec<(u32, u32)>)> {
-    let groups = &geometry.groups;
-    let n = groups.len();
-    if permille == 0 || n < TAIL_FIRST_MIN_GROUPS {
-        return None;
-    }
-    let docs: Vec<u32> = (0..n)
-        .map(|g| {
-            let next = groups
-                .get(g + 1)
-                .map_or(geometry.documents, |next| next.rank_base);
-            next - groups[g].rank_base
-        })
-        .collect();
-    let take = ((n as u64 * u64::from(permille.min(1000))).div_ceil(1000) as usize).clamp(1, n - 1);
-    let mut sorted = docs.clone();
-    let (_, cut, _) = sorted.select_nth_unstable_by(take - 1, |a, b| b.cmp(a));
-    let cut = *cut;
-    // Groups above the cut lead, then those at it in order up to `take`.
-    let mut room = take - docs.iter().filter(|d| **d > cut).count();
-    let mut lead: Vec<(u32, u32)> = Vec::new();
-    let mut rest: Vec<(u32, u32)> = Vec::new();
-    for (g, d) in docs.iter().enumerate() {
-        let first = *d > cut
-            || (*d == cut && room > 0 && {
-                room -= 1;
-                true
-            });
-        let out = if first { &mut lead } else { &mut rest };
-        let g = g as u32;
-        match out.last_mut() {
-            Some(last) if last.1 == g => last.1 = g + 1,
-            _ => out.push((g, g + 1)),
-        }
-    }
-    Some((lead, rest))
-}
 
 /// The first native segment's group ranges in the order its walk takes
 /// them (see [`TAIL_FIRST_PERMILLE`]); `None` for every group in order.
@@ -378,9 +329,6 @@ pub struct WalkConfig {
     /// order (see [`TopRows`]).
     pub tail_first_permille: u32,
     pub tail_first_min: f64,
-    /// Lead with the segment's densest groups (most documents, so the
-    /// shortest rows; see [`dense_first`]) rather than its last.
-    pub dense_first: bool,
 }
 
 /// Whether a candidate's tuple is visible: asked of each candidate as it
@@ -854,8 +802,7 @@ impl Scorer {
     /// every scoring term, a disjunction's postings of them all.
     pub fn expected_candidates(&self, index: &dyn Index) -> f64 {
         let docs = f64::from(index.document_count().max(1));
-        let all =
-            prunable_shape(&self.query).is_some_and(|(combine, _, _)| combine == Combine::All);
+        let all = prunable_shape(&self.query).is_some_and(|(combine, _, _)| combine == Combine::All);
         let mut share = 1.0_f64;
         let mut sum = 0.0_f64;
         for (term, _) in &self.terms {
@@ -1027,22 +974,17 @@ impl Scorer {
                                 && config.tail_first_permille > 0
                                 && self.expected_candidates(source.index) >= config.tail_first_min;
                             native.walk(&names, positions, &mut |segment| {
-                                let geometry = &segment.docs.geometry;
-                                let split = if !lead {
-                                    None
-                                } else if config.dense_first {
-                                    dense_first(geometry, config.tail_first_permille)
-                                } else {
-                                    tail_first(geometry.groups.len(), config.tail_first_permille)
-                                        .map(|[a, b]| (vec![a], vec![b]))
-                                };
-                                // Every group in one walk, or the lead
-                                // groups' walk then the rest's.
+                                let groups = segment.docs.geometry.groups.len();
+                                let split = lead
+                                    .then(|| tail_first(groups, config.tail_first_permille))
+                                    .flatten();
+                                // Every group in one walk, or the tail's
+                                // walk then the rest's.
                                 let whole: [&[(u32, u32)]; 1] = [&[]];
                                 let parts: [&[(u32, u32)]; 2];
                                 let walks: &[&[(u32, u32)]] = match &split {
-                                    Some((first, then)) => {
-                                        parts = [first, then];
+                                    Some(split) => {
+                                        parts = [&split[..1], &split[1..]];
                                         &parts
                                     }
                                     None => &whole,
@@ -1059,8 +1001,9 @@ impl Scorer {
                                         &mut crate::tinshape::NoTouch,
                                     )?;
                                     scored += answer.scored as usize;
-                                    POSITION_CHECKS
-                                        .set(POSITION_CHECKS.get() + answer.position_checks as i64);
+                                    POSITION_CHECKS.set(
+                                        POSITION_CHECKS.get() + answer.position_checks as i64,
+                                    );
                                 }
                                 Ok(())
                             })
@@ -4127,46 +4070,6 @@ mod tests {
         assert_eq!(tail_first(14445, 100), Some([(13000, 14445), (0, 13000)]));
         assert_eq!(tail_first(2000, 1), Some([(1998, 2000), (0, 1998)]));
         assert_eq!(tail_first(2000, 1000), Some([(1, 2000), (0, 1)]));
-    }
-
-    /// The densest groups lead, as many as asked (ties in group order), and
-    /// the rest follow: together every group once, both in ranges.
-    #[test]
-    fn dense_first_leads_with_the_densest_groups() {
-        use segment::tinshape::docs::Geometry;
-        // Group g holds 1 document, but every 7th holds 3 and group 5 holds 2.
-        let mut tids = Vec::new();
-        for g in 0..1100u32 {
-            let docs = if g % 7 == 0 {
-                3
-            } else if g == 5 {
-                2
-            } else {
-                1
-            };
-            for o in 0..docs {
-                tids.push(Tid {
-                    block: g * 256,
-                    offset: o as u16 + 1,
-                });
-            }
-        }
-        let geometry = Geometry::of(&tids).unwrap();
-        assert_eq!(geometry.groups.len(), 1100);
-        assert_eq!(dense_first(&geometry, 0), None);
-        // 158 groups hold 3; 160 asked: those, then group 5, then group 1.
-        let (lead, rest) = dense_first(&geometry, 145).unwrap();
-        let mut want: Vec<u32> = (0..1100).filter(|g| g % 7 == 0).collect();
-        want.extend([1, 5]);
-        want.sort_unstable();
-        let flat = |r: &[(u32, u32)]| r.iter().flat_map(|&(a, b)| a..b).collect::<Vec<u32>>();
-        assert_eq!(flat(&lead), want);
-        let mut all = flat(&lead);
-        all.extend(flat(&rest));
-        all.sort_unstable();
-        assert_eq!(all, (0..1100).collect::<Vec<u32>>());
-        assert!(lead.windows(2).all(|w| w[0].1 < w[1].0));
-        assert!(rest.windows(2).all(|w| w[0].1 < w[1].0));
     }
 
     /// A small linear congruential generator: deterministic, no dependency.
