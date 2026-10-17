@@ -57,16 +57,48 @@ pub const DENSE_FIRST: bool = true;
 const TAIL_FIRST_MIN_GROUPS: usize = 1024;
 
 /// The first native segment's groups its walk takes first, the `permille`
-/// per mille holding the most documents (see [`DocSet::densest_first`]),
-/// and the others. `None` for every group in order.
+/// per mille holding the most documents (a group spans a fixed run of heap
+/// pages, so those of the shortest rows, whose documents BM25 favours), and
+/// the others; both as ascending ranges. `None` for every group in order.
 pub fn dense_first(
-    docs: &segment::tinshape::docs::DocSet,
+    geometry: &segment::tinshape::docs::Geometry,
     permille: u32,
-) -> Option<std::rc::Rc<segment::tinshape::docs::Lead>> {
-    if permille == 0 || docs.geometry.groups.len() < TAIL_FIRST_MIN_GROUPS {
+) -> Option<(Vec<(u32, u32)>, Vec<(u32, u32)>)> {
+    let groups = &geometry.groups;
+    let n = groups.len();
+    if permille == 0 || n < TAIL_FIRST_MIN_GROUPS {
         return None;
     }
-    Some(docs.densest_first(permille))
+    let docs: Vec<u32> = (0..n)
+        .map(|g| {
+            let next = groups
+                .get(g + 1)
+                .map_or(geometry.documents, |next| next.rank_base);
+            next - groups[g].rank_base
+        })
+        .collect();
+    let take = ((n as u64 * u64::from(permille.min(1000))).div_ceil(1000) as usize).clamp(1, n - 1);
+    let mut sorted = docs.clone();
+    let (_, cut, _) = sorted.select_nth_unstable_by(take - 1, |a, b| b.cmp(a));
+    let cut = *cut;
+    // Groups above the cut lead, then those at it in order up to `take`.
+    let mut room = take - docs.iter().filter(|d| **d > cut).count();
+    let mut lead: Vec<(u32, u32)> = Vec::new();
+    let mut rest: Vec<(u32, u32)> = Vec::new();
+    for (g, d) in docs.iter().enumerate() {
+        let first = *d > cut
+            || (*d == cut && room > 0 && {
+                room -= 1;
+                true
+            });
+        let out = if first { &mut lead } else { &mut rest };
+        let g = g as u32;
+        match out.last_mut() {
+            Some(last) if last.1 == g => last.1 = g + 1,
+            _ => out.push((g, g + 1)),
+        }
+    }
+    Some((lead, rest))
 }
 
 /// The first native segment's group ranges in the order its walk takes
@@ -999,18 +1031,18 @@ impl Scorer {
                                 let split = if !lead {
                                     None
                                 } else if config.dense_first {
-                                    dense_first(&segment.docs, config.tail_first_permille)
+                                    dense_first(geometry, config.tail_first_permille)
                                 } else {
                                     tail_first(geometry.groups.len(), config.tail_first_permille)
-                                        .map(|[a, b]| std::rc::Rc::new((vec![a], vec![b])))
+                                        .map(|[a, b]| (vec![a], vec![b]))
                                 };
                                 // Every group in one walk, or the lead
                                 // groups' walk then the rest's.
                                 let whole: [&[(u32, u32)]; 1] = [&[]];
                                 let parts: [&[(u32, u32)]; 2];
                                 let walks: &[&[(u32, u32)]] = match &split {
-                                    Some(lead) => {
-                                        parts = [&lead.0, &lead.1];
+                                    Some((first, then)) => {
+                                        parts = [first, then];
                                         &parts
                                     }
                                     None => &whole,
@@ -4101,7 +4133,7 @@ mod tests {
     /// the rest follow: together every group once, both in ranges.
     #[test]
     fn dense_first_leads_with_the_densest_groups() {
-        use segment::tinshape::docs::{DocSet, Geometry, encode_docset};
+        use segment::tinshape::docs::Geometry;
         // Group g holds 1 document, but every 7th holds 3 and group 5 holds 2.
         let mut tids = Vec::new();
         for g in 0..1100u32 {
@@ -4121,23 +4153,16 @@ mod tests {
         }
         let geometry = Geometry::of(&tids).unwrap();
         assert_eq!(geometry.groups.len(), 1100);
-        let docs = DocSet::decode(&encode_docset(&geometry, &tids)).unwrap();
-        assert!(dense_first(&docs, 0).is_none());
+        assert_eq!(dense_first(&geometry, 0), None);
         // 158 groups hold 3; 160 asked: those, then group 5, then group 1.
-        let split = dense_first(&docs, 145).unwrap();
-        // Asked again, the same split, not computed again.
-        assert!(std::rc::Rc::ptr_eq(
-            &split,
-            &dense_first(&docs, 145).unwrap()
-        ));
-        let (lead, rest) = (&split.0, &split.1);
+        let (lead, rest) = dense_first(&geometry, 145).unwrap();
         let mut want: Vec<u32> = (0..1100).filter(|g| g % 7 == 0).collect();
         want.extend([1, 5]);
         want.sort_unstable();
         let flat = |r: &[(u32, u32)]| r.iter().flat_map(|&(a, b)| a..b).collect::<Vec<u32>>();
-        assert_eq!(flat(lead), want);
-        let mut all = flat(lead);
-        all.extend(flat(rest));
+        assert_eq!(flat(&lead), want);
+        let mut all = flat(&lead);
+        all.extend(flat(&rest));
         all.sort_unstable();
         assert_eq!(all, (0..1100).collect::<Vec<u32>>());
         assert!(lead.windows(2).all(|w| w[0].1 < w[1].0));
