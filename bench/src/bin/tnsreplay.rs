@@ -119,9 +119,16 @@ struct Args {
     /// `--prepass SPEC`: some groups of one segment walked before the
     /// others (see [`Prepass`]).
     prepass: Option<Prepass>,
-    /// `--tail-first P`: the extension path's tail-first walk
-    /// (`WalkConfig::tail_first_permille`); the engine's default when unset.
-    tail_first: u32,
+    /// `--lead RULE:P[:R]`: the largest segment's lead groups, walked first
+    /// by the timed walk (see [`Lead`]).
+    lead: Option<Lead>,
+    /// `--heap-perm K:rev|K:SEED`: the timed walk takes the largest
+    /// segment's groups as if its heap held them in K chunks permuted (see
+    /// [`heap_perm`]).
+    heap_perm: Option<Vec<u32>>,
+    /// `--short-first P`: the extension path's short-first walk
+    /// (`WalkConfig::short_first_permille`); the engine's default when unset.
+    short_first: u32,
     pin_ns: u64,
     /// Pages a walk keeps pinned between groups (`LazyBlob::set_keep`);
     /// the blob's default when unset.
@@ -236,6 +243,255 @@ impl Prepass {
     }
 }
 
+/// `--lead RULE:P[:R][:gA]`: which of the largest segment's groups the
+/// timed walk takes first, `P` per mille of them, on its (virtual) heap
+/// order: `tail` its last; `dwin` / `lwin` the run of them holding the most
+/// documents / of the least mean document length; `druns` / `lruns` runs of
+/// `R` groups by the same measures, best first. `gA`: only when the lead
+/// groups' mean length is at most `A` per mille of the segment's.
+#[derive(Clone, Copy)]
+struct Lead {
+    rule: LeadRule,
+    permille: u32,
+    run: usize,
+    gate: u64,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum LeadRule {
+    Tail,
+    DenseWindow,
+    ShortWindow,
+    DenseRuns,
+    ShortRuns,
+    /// Runs of `R` groups holding at least `P` per mille of the segment's
+    /// documents per group (`dthr`), or of a mean length at most `P` per
+    /// mille of its (`lthr`), however many (half the groups at most).
+    DenseOver,
+    ShortUnder,
+    /// The engine's rule ([`engine::walk::short_first`]) on the virtual
+    /// heap: the densest run of whole `R`-group runs, `P` per mille of the
+    /// groups, when it holds at least `gA` per mille (default 1200) of the
+    /// segment's documents per group.
+    Short,
+}
+
+impl Lead {
+    fn parse(spec: &str) -> Option<Self> {
+        let mut f = spec.split(':');
+        let rule = match f.next()? {
+            "tail" => LeadRule::Tail,
+            "dwin" => LeadRule::DenseWindow,
+            "lwin" => LeadRule::ShortWindow,
+            "druns" => LeadRule::DenseRuns,
+            "lruns" => LeadRule::ShortRuns,
+            "dthr" => LeadRule::DenseOver,
+            "lthr" => LeadRule::ShortUnder,
+            "short" => LeadRule::Short,
+            _ => return None,
+        };
+        let permille: u32 = f.next()?.parse().ok()?;
+        let mut lead = Self {
+            rule,
+            permille,
+            run: 64,
+            gate: if rule == LeadRule::Short {
+                u64::from(engine::walk::SHORT_FIRST_DENSITY_PERMILLE)
+            } else {
+                0
+            },
+        };
+        for x in f {
+            match x.strip_prefix('g') {
+                Some(a) => lead.gate = a.parse().ok()?,
+                None => lead.run = x.parse().ok().filter(|r| *r > 0)?,
+            }
+        }
+        let thr = matches!(rule, LeadRule::DenseOver | LeadRule::ShortUnder);
+        (permille > 0 && (thr || permille < 1000)).then_some(lead)
+    }
+
+    /// Per virtual position (`order[v]` its group), whether it leads.
+    fn pick(&self, order: &[u32], docs: &[u32], lengths: &[u64]) -> Vec<bool> {
+        let n = order.len();
+        let m = ((n as u64 * u64::from(self.permille.min(999))).div_ceil(1000) as usize)
+            .clamp(1, n - 1);
+        let d = |v: usize| u64::from(docs[order[v] as usize]);
+        let l = |v: usize| lengths[order[v] as usize];
+        let mut lead = vec![false; n];
+        // Whether a (lengths, documents) run is shorter than another.
+        let shorter = |a: (u64, u64), b: (u64, u64)| {
+            u128::from(a.0) * u128::from(b.1.max(1)) < u128::from(b.0) * u128::from(a.1.max(1))
+        };
+        match self.rule {
+            LeadRule::Short => {
+                let (ad, runs) = ((0..n).map(d).sum::<u64>(), n.div_ceil(self.run));
+                let width = ((runs as u64 * u64::from(self.permille)).div_ceil(1000) as usize)
+                    .clamp(1, runs - 1);
+                let mut best = (0u64, 1u64, 0usize);
+                for start in 0..=runs - width {
+                    let (a, b) = (start * self.run, ((start + width) * self.run).min(n));
+                    let docs: u64 = (a..b).map(d).sum();
+                    if u128::from(docs) * u128::from(best.1) > u128::from(best.0) * (b - a) as u128
+                    {
+                        best = (docs, (b - a) as u64, a);
+                    }
+                }
+                let (docs, span, a) = best;
+                if u128::from(docs) * n as u128 * 1000
+                    >= u128::from(self.gate) * u128::from(ad) * u128::from(span)
+                {
+                    lead[a..a + span as usize].fill(true);
+                }
+                return lead;
+            }
+            LeadRule::Tail => lead[n - m..].fill(true),
+            LeadRule::DenseWindow | LeadRule::ShortWindow => {
+                let (mut sl, mut sd) = (0u64, 0u64);
+                for v in 0..m {
+                    sl += l(v);
+                    sd += d(v);
+                }
+                let (mut best, mut at) = ((sl, sd), 0);
+                for start in 1..=n - m {
+                    sl = sl + l(start + m - 1) - l(start - 1);
+                    sd = sd + d(start + m - 1) - d(start - 1);
+                    let better = match self.rule {
+                        LeadRule::DenseWindow => sd > best.1,
+                        _ => shorter((sl, sd), best),
+                    };
+                    if better {
+                        best = (sl, sd);
+                        at = start;
+                    }
+                }
+                lead[at..at + m].fill(true);
+            }
+            LeadRule::DenseRuns | LeadRule::ShortRuns => {
+                let runs: Vec<(usize, u64, u64)> = (0..n)
+                    .step_by(self.run)
+                    .map(|s| {
+                        let e = (s + self.run).min(n);
+                        (s, (s..e).map(l).sum(), (s..e).map(d).sum())
+                    })
+                    .collect();
+                let mut ranked: Vec<usize> = (0..runs.len()).collect();
+                let len = |r: (usize, u64, u64)| ((r.0 + self.run).min(n) - r.0) as u128;
+                ranked.sort_by(|&a, &b| {
+                    let (ra, rb) = (runs[a], runs[b]);
+                    let ord = if self.rule == LeadRule::DenseRuns {
+                        // Documents per group, most first.
+                        (u128::from(rb.2) * len(ra)).cmp(&(u128::from(ra.2) * len(rb)))
+                    } else if shorter((ra.1, ra.2), (rb.1, rb.2)) {
+                        std::cmp::Ordering::Less
+                    } else if shorter((rb.1, rb.2), (ra.1, ra.2)) {
+                        std::cmp::Ordering::Greater
+                    } else {
+                        std::cmp::Ordering::Equal
+                    };
+                    ord.then(a.cmp(&b))
+                });
+                let mut taken = 0;
+                for r in ranked {
+                    if taken >= m {
+                        break;
+                    }
+                    let s = runs[r].0;
+                    let e = (s + self.run).min(n);
+                    lead[s..e].fill(true);
+                    taken += e - s;
+                }
+                if taken >= n {
+                    return vec![false; n];
+                }
+            }
+            LeadRule::DenseOver | LeadRule::ShortUnder => {
+                let (al, ad) = (0..n).fold((0u64, 0u64), |(a, b), v| (a + l(v), b + d(v)));
+                let p = u128::from(self.permille);
+                // Selected runs, best first, up to half the groups.
+                let mut runs: Vec<(usize, usize, u64, u64)> = (0..n)
+                    .step_by(self.run)
+                    .map(|s| {
+                        let e = (s + self.run).min(n);
+                        (s, e, (s..e).map(l).sum::<u64>(), (s..e).map(d).sum::<u64>())
+                    })
+                    .filter(|&(s, e, rl, rd)| match self.rule {
+                        // rd / (e - s) >= p/1000 * ad / n
+                        LeadRule::DenseOver => {
+                            u128::from(rd) * n as u128 * 1000
+                                >= p * u128::from(ad) * (e - s) as u128
+                        }
+                        // rl / rd <= p/1000 * al / ad
+                        _ => {
+                            u128::from(rl) * u128::from(ad) * 1000
+                                <= p * u128::from(al) * u128::from(rd.max(1))
+                        }
+                    })
+                    .collect();
+                runs.sort_by(|a, b| {
+                    let (ka, kb) = match self.rule {
+                        LeadRule::DenseOver => (
+                            u128::from(b.3) * (a.1 - a.0) as u128,
+                            u128::from(a.3) * (b.1 - b.0) as u128,
+                        ),
+                        _ => (
+                            u128::from(a.2) * u128::from(b.3.max(1)),
+                            u128::from(b.2) * u128::from(a.3.max(1)),
+                        ),
+                    };
+                    ka.cmp(&kb).then(a.0.cmp(&b.0))
+                });
+                let mut taken = 0;
+                for (s, e, _, _) in runs {
+                    if taken + (e - s) > n / 2 {
+                        break;
+                    }
+                    lead[s..e].fill(true);
+                    taken += e - s;
+                }
+            }
+        }
+        if self.gate > 0 {
+            let (mut ll, mut ld, mut al, mut ad) = (0u64, 0u64, 0u64, 0u64);
+            for v in 0..n {
+                al += l(v);
+                ad += d(v);
+                if lead[v] {
+                    ll += l(v);
+                    ld += d(v);
+                }
+            }
+            // Lead mean > gate/1000 x segment mean: no lead.
+            if u128::from(ll) * u128::from(ad) * 1000
+                > u128::from(self.gate) * u128::from(al) * u128::from(ld.max(1))
+            {
+                return vec![false; n];
+            }
+        }
+        lead
+    }
+}
+
+/// `--heap-perm K:rev|K:SEED`: the order of K equal chunks of a segment's
+/// groups as a permuted heap would hold them, reversed or shuffled.
+fn heap_perm(spec: &str) -> Option<Vec<u32>> {
+    let (k, how) = spec.split_once(':')?;
+    let k: u32 = k.parse().ok().filter(|k| *k >= 2)?;
+    let mut perm: Vec<u32> = (0..k).collect();
+    if how == "rev" {
+        perm.reverse();
+    } else {
+        let mut x: u64 = how.parse().ok()?;
+        for i in (1..perm.len()).rev() {
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            perm.swap(i, ((x >> 33) % (i as u64 + 1)) as usize);
+        }
+    }
+    Some(perm)
+}
+
 /// Which of a style's queries a `--plan` slice replays.
 enum PlanSlice {
     /// The first N.
@@ -271,7 +527,7 @@ fn usage() -> ! {
     eprintln!(
         "usage: tnsreplay --dump DIR --trace FILE [--expect FILE] [--style S] [--k N] \
          [--repeat N] [--limit N] [--memory [--keep]] [--forget] [--full] [--pin-ns N] [--keep-pins N] [--threads N --seconds S] [--per-query FILE] [--per-segment FILE] \
-         [--order engine|gen|gen-desc|docs-asc|small-first|bound|matches|density|final] [--seed | --seed-rank R] [--prepass big|small:stride|head|tail:N] [--tail-first P] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
+         [--order engine|gen|gen-desc|docs-asc|small-first|bound|matches|density|final] [--seed | --seed-rank R] [--prepass big|small:stride|head|tail:N] [--lead tail|dwin|lwin|lruns|druns|dthr|lthr:P[:R][:gA]] [--heap-perm K:rev|K:SEED] [--short-first P] [--warm FILE [--warm-untimed]] [--timed-walk] [--out FILE] \
          [--plan STYLE:score|full:N|full:@FILE,...] [--perf-ctl CTL,ACK] [--cpus CPU,CPU/CPU,...] [--mmap]"
     );
     std::process::exit(2)
@@ -294,7 +550,9 @@ fn args() -> Args {
         seed: false,
         seed_rank: None,
         prepass: None,
-        tail_first: engine::walk::TAIL_FIRST_PERMILLE,
+        lead: None,
+        heap_perm: None,
+        short_first: engine::walk::SHORT_FIRST_PERMILLE,
         pin_ns: 0,
         keep_pins: None,
         threads: 0,
@@ -329,7 +587,11 @@ fn args() -> Args {
             "--memory" => a.memory = true,
             "--mmap" => a.mmap = true,
             "--seed" => a.seed = true,
-            "--tail-first" => a.tail_first = value(&mut it).parse().unwrap_or_else(|_| usage()),
+            "--short-first" => a.short_first = value(&mut it).parse().unwrap_or_else(|_| usage()),
+            "--lead" => a.lead = Some(Lead::parse(&value(&mut it)).unwrap_or_else(|| usage())),
+            "--heap-perm" => {
+                a.heap_perm = Some(heap_perm(&value(&mut it)).unwrap_or_else(|| usage()))
+            }
             "--prepass" => {
                 a.prepass = Some(Prepass::parse(&value(&mut it)).unwrap_or_else(|| usage()))
             }
@@ -859,8 +1121,14 @@ struct Reader {
     /// Rank as `full_score` (set per query with `--plan`).
     full: std::cell::Cell<bool>,
     prepass: Option<Prepass>,
-    /// `--tail-first P` ([`WalkConfig::tail_first_permille`]).
-    tail_first: u32,
+    lead: Option<Lead>,
+    heap_perm: Option<Vec<u32>>,
+    /// Per segment, its groups' documents and summed lengths (for `--lead`).
+    group_lengths: std::cell::RefCell<FxHashMap<usize, std::rc::Rc<(Vec<u32>, Vec<u64>)>>>,
+    /// Per segment, its walks under `--lead` / `--heap-perm` (lead first).
+    lead_walks: std::cell::RefCell<FxHashMap<usize, std::rc::Rc<(Vec<Ranges>, Vec<Ranges>)>>>,
+    /// `--short-first P` ([`WalkConfig::short_first_permille`]).
+    short_first: u32,
     segs: Vec<Seg>,
 }
 
@@ -937,7 +1205,11 @@ impl Reader {
             stop: loaded.stop_words.clone(),
             full: std::cell::Cell::new(args.full),
             prepass: args.prepass,
-            tail_first: args.tail_first,
+            lead: args.lead,
+            heap_perm: args.heap_perm.clone(),
+            group_lengths: Default::default(),
+            lead_walks: Default::default(),
+            short_first: args.short_first,
             segs,
         })
     }
@@ -986,7 +1258,7 @@ impl Reader {
             warmup_chunks: 256,
             warmup_min_matches: 4.0,
             seed: None,
-            tail_first_permille: self.tail_first,
+            short_first_permille: self.short_first,
         };
         let top = scorer.top_k(&sources, k, false, &config, |_| AllVisible, |_| true)?;
         if top.zero_fill || !top.native || top.ordinal {
@@ -1170,7 +1442,7 @@ impl Reader {
         let mut walks: Vec<(usize, Vec<(u32, u32)>)> =
             visit.iter().map(|&i| (i, Vec::new())).collect();
         let Some(p) = self.prepass else {
-            return walks;
+            return self.lead_schedule(&visit, walks);
         };
         let pick = if p.big {
             visit
@@ -1196,6 +1468,117 @@ impl Reader {
         }
         walks.insert(0, (pick, sample));
         walks
+    }
+
+    /// Segment `i`'s groups' documents and summed lengths.
+    fn group_lengths(&self, i: usize) -> std::rc::Rc<(Vec<u32>, Vec<u64>)> {
+        if let Some(found) = self.group_lengths.borrow().get(&i) {
+            return found.clone();
+        }
+        let seg = &self.segs[i].segment;
+        let groups = &seg.docs.geometry.groups;
+        let (mut docs, mut lengths) = (Vec::new(), Vec::new());
+        for (g, group) in groups.iter().enumerate() {
+            let to = groups
+                .get(g + 1)
+                .map_or(seg.documents, |next| next.rank_base);
+            docs.push(to - group.rank_base);
+            lengths.push(
+                (group.rank_base..to)
+                    .map(|r| u64::from(seg.lengths.get(r).unwrap_or(0)))
+                    .sum(),
+            );
+        }
+        let found = std::rc::Rc::new((docs, lengths));
+        self.group_lengths.borrow_mut().insert(i, found.clone());
+        found
+    }
+
+    /// `--lead` / `--heap-perm`: the largest segment's walks, its lead
+    /// groups' first (before every other walk), then its others'.
+    fn lead_schedule(
+        &self,
+        visit: &[usize],
+        mut walks: Vec<(usize, Vec<(u32, u32)>)>,
+    ) -> Vec<(usize, Vec<(u32, u32)>)> {
+        if self.lead.is_none() && self.heap_perm.is_none() {
+            return walks;
+        }
+        let Some(pick) = visit
+            .iter()
+            .copied()
+            .max_by_key(|&i| (self.segs[i].segment.documents, std::cmp::Reverse(i)))
+        else {
+            return walks;
+        };
+        let (first, then) = &*self.lead_walks(pick);
+        if then.is_empty() {
+            return walks;
+        }
+        let at = walks.iter().position(|w| w.0 == pick).expect("picked");
+        walks.remove(at);
+        for (j, groups) in then.iter().enumerate() {
+            walks.insert(at + j, (pick, groups.clone()));
+        }
+        for (j, groups) in first.iter().enumerate() {
+            walks.insert(j, (pick, groups.clone()));
+        }
+        walks
+    }
+
+    /// Segment `pick`'s lead walks and its other walks (none of either
+    /// when it is walked whole), computed once.
+    fn lead_walks(&self, pick: usize) -> std::rc::Rc<(Vec<Ranges>, Vec<Ranges>)> {
+        if let Some(found) = self.lead_walks.borrow().get(&pick) {
+            return found.clone();
+        }
+        let n = self.segs[pick].segment.docs.geometry.groups.len();
+        let found = std::rc::Rc::new(if n < 1024 {
+            Default::default()
+        } else {
+            self.compute_lead_walks(pick, n)
+        });
+        self.lead_walks.borrow_mut().insert(pick, found.clone());
+        found
+    }
+
+    fn compute_lead_walks(&self, pick: usize, n: usize) -> (Vec<Ranges>, Vec<Ranges>) {
+        // Virtual heap position -> group.
+        let order: Vec<u32> = match &self.heap_perm {
+            None => (0..n as u32).collect(),
+            Some(perm) => {
+                let k = perm.len();
+                perm.iter()
+                    .flat_map(|&c| (c as usize * n / k) as u32..((c as usize + 1) * n / k) as u32)
+                    .collect()
+            }
+        };
+        let lead = match self.lead {
+            Some(lead) => {
+                let stats = self.group_lengths(pick);
+                lead.pick(&order, &stats.0, &stats.1)
+            }
+            None => vec![false; n],
+        };
+        // Walks over the positions of one kind in order: a walk's ranges
+        // ascend, so a group before the walk's last starts another.
+        let walks_of = |want: bool| {
+            let mut out: Vec<Vec<(u32, u32)>> = Vec::new();
+            let mut last_end = u32::MAX;
+            for (v, &g) in order.iter().enumerate() {
+                if lead[v] != want {
+                    continue;
+                }
+                match out.last_mut() {
+                    Some(walk) if g == last_end => walk.last_mut().expect("a range").1 = g + 1,
+                    Some(walk) if g > last_end => walk.push((g, g + 1)),
+                    _ => out.push(vec![(g, g + 1)]),
+                }
+                last_end = g + 1;
+            }
+            out
+        };
+        (walks_of(true), walks_of(false))
     }
 
     /// The segments in `order`.
@@ -1855,6 +2238,23 @@ fn run() -> Result<bool, String> {
             }
         }
         std::fs::write(path, text).map_err(|e| e.to_string())?;
+    }
+    if args.lead.is_some() || args.heap_perm.is_some() {
+        // The lead rules' group lengths and walks, untimed.
+        for i in 0..reader.segs.len() {
+            reader.group_lengths(i);
+            let w = reader.lead_walks(i);
+            eprintln!(
+                "segment {i}: lead walks {:?} then {} walks; engine short_first {:?}",
+                w.0,
+                w.1.len(),
+                engine::walk::short_first(
+                    &reader.segs[i].segment.docs.geometry,
+                    engine::walk::SHORT_FIRST_PERMILLE,
+                    engine::walk::SHORT_FIRST_DENSITY_PERMILLE
+                )
+            );
+        }
     }
     eprintln!(
         "{} segments opened in {:.1} s",
