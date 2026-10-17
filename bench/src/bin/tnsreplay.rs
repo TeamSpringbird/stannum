@@ -41,7 +41,10 @@
 //! `--plan conjunction:score:300,disjunction:full:200,...` replays several
 //! slices of the trace after one load (the first N queries of a style,
 //! ranked as `score` or as `full`), each reported as its own style (a full
-//! one as `STYLE+full`). The timed passes' instructions, cycles and branch
+//! one as `STYLE+full`). A slice `STYLE:MODE:@FILE` takes instead the
+//! queries of that style named in FILE's first column (a trace's lines, in
+//! FILE's order), reported as `STYLE[+full]@STEM` (FILE's stem): a fixed
+//! set of forms, such as the benchmark's slowest (`benchmarks/tail/`). The timed passes' instructions, cycles and branch
 //! misses are counted in the process (Linux: `perf_event_open`, user space
 //! only; macOS: `proc_pid_rusage`, no branch misses); `--perf-ctl CTL,ACK`
 //! turns an outside `perf stat` or `perf record` (`-D -1 --control
@@ -61,7 +64,11 @@
 //! IPC (the threads' instructions over a thread's cycles), the set's
 //! queries per gigacycle (each thread's queries over its own cycles,
 //! summed: a core's throughput at a fixed clock) and the answers' digest
-//! (the same for every set and build of a correct walk). Sibling CPUs
+//! (the same for every set and build of a correct walk); then, per query, a
+//! `pinq` line with its instructions and cycles per timed pass (the mean
+//! over the set's threads), from which a tail of the slowest forms is
+//! compared (`benchmarks/aws/htpair_summary.py`). `--per-query` gives the
+//! same counts per query, per timed pass, in its `ins` and `cyc` columns. Sibling CPUs
 //! are in `/sys/devices/system/cpu/cpuN/topology/thread_siblings_list`;
 //! pinning and per-thread counts are Linux only (macOS counts the process).
 //!
@@ -129,13 +136,22 @@ struct Args {
     warm_untimed: bool,
     out: Option<PathBuf>,
     /// `--plan`: (style, full, queries) slices replayed after one load.
-    plan: Vec<(String, bool, usize)>,
+    plan: Vec<(String, bool, PlanSlice)>,
     /// `--perf-ctl CTL,ACK`: perf's control and ack FIFOs; counting is
     /// enabled around each timed pass only (not the load, the answer's
     /// pass or the instrumented one).
     perf_ctl: Option<(PathBuf, PathBuf)>,
     /// `--cpus`: sets of CPUs, each measured with one pinned thread per CPU.
     cpus: Vec<Vec<usize>>,
+}
+
+/// Which of a style's queries a `--plan` slice replays.
+enum PlanSlice {
+    /// The first N.
+    First(usize),
+    /// Those named (a trace file's first column), in this order, reported
+    /// with the label's suffix.
+    Named(String, Vec<String>),
 }
 
 /// Orders of the instrumented pass's segments, to measure what an order
@@ -243,8 +259,28 @@ fn args() -> Args {
                         "full" => true,
                         _ => usage(),
                     };
-                    let n = n.parse().unwrap_or_else(|_| usage());
-                    a.plan.push((style.to_owned(), full, n));
+                    let pick = match n.strip_prefix('@') {
+                        Some(path) => {
+                            let path = std::path::Path::new(path);
+                            let names = std::fs::read_to_string(path)
+                                .unwrap_or_else(|e| {
+                                    eprintln!("--plan {}: {e}", path.display());
+                                    std::process::exit(2)
+                                })
+                                .lines()
+                                .filter_map(|l| l.split('\t').next())
+                                .filter(|n| !n.is_empty())
+                                .map(str::to_owned)
+                                .collect();
+                            let stem = path.file_stem().map_or_else(
+                                || "named".to_owned(),
+                                |s| s.to_string_lossy().into_owned(),
+                            );
+                            PlanSlice::Named(stem, names)
+                        }
+                        None => PlanSlice::First(n.parse().unwrap_or_else(|_| usage())),
+                    };
+                    a.plan.push((style.to_owned(), full, pick));
                 }
             }
             "--cpus" => {
@@ -1295,6 +1331,10 @@ struct PinnedSlice {
     digest: u64,
 }
 
+/// A thread's slice: its totals and, per query of the slice (by its place
+/// in it), the timed passes' instructions, cycles and branch misses.
+type PinnedRun = (PinnedSlice, Vec<[u64; 3]>);
+
 /// Pins this thread to `cpu` (Linux: `sched_setaffinity`); false where it
 /// cannot.
 fn pin_to(cpu: usize) -> bool {
@@ -1328,13 +1368,15 @@ fn pinned_thread(
     slices: &[(String, std::ops::Range<usize>)],
     (t, threads): (usize, usize),
     (start, done): (&std::sync::Barrier, &[std::sync::atomic::AtomicUsize]),
-) -> Result<Vec<PinnedSlice>, String> {
+) -> Result<Vec<PinnedRun>, String> {
     use std::sync::atomic::Ordering;
     let mut out = Vec::with_capacity(slices.len());
     for (n, (_, range)) in slices.iter().enumerate() {
         let len = range.len();
         let offset = t * len / threads;
         let mut slice = PinnedSlice::default();
+        // Per query of the slice (by its place in it): the timed passes' counts.
+        let mut per_query = vec![[0u64; 3]; len];
         start.wait();
         let began = Instant::now();
         let mut i = 0usize;
@@ -1375,6 +1417,7 @@ fn pinned_thread(
                 slice.queries += 1;
                 for (k, count) in slice.counts.iter_mut().enumerate() {
                     *count += c1[k] - c0[k];
+                    per_query[at - range.start][k] = c1[k] - c0[k];
                 }
                 let mut h = rustc_hash::FxHasher::default();
                 for (score, tid) in &answer {
@@ -1383,7 +1426,7 @@ fn pinned_thread(
                 slice.digest = slice.digest.wrapping_add(std::hash::Hasher::finish(&h));
             }
         }
-        out.push(slice);
+        out.push((slice, per_query));
     }
     Ok(out)
 }
@@ -1443,7 +1486,7 @@ fn pinned(
             .collect::<Vec<_>>()
             .join(",");
         for (n, (style, _)) in slices.iter().enumerate() {
-            let all: Vec<PinnedSlice> = per_thread.iter().map(|t| t[n]).collect();
+            let all: Vec<PinnedSlice> = per_thread.iter().map(|t| t[n].0).collect();
             let queries = all.iter().map(|s| s.queries).sum::<u64>().max(1) as f64;
             let sum = |k: usize| all.iter().map(|s| s.counts[k]).sum::<u64>() as f64;
             let (ins, cyc, miss) = (sum(0), sum(1).max(1.0), sum(2));
@@ -1478,6 +1521,28 @@ fn pinned(
                 per.join(","),
             );
         }
+        // Per query: its timed passes' instructions and cycles, per pass,
+        // the mean over the threads that answered it.
+        for (n, (style, range)) in slices.iter().enumerate() {
+            for (j, q) in trace[range.clone()].iter().enumerate() {
+                let counted: Vec<[u64; 3]> = per_thread
+                    .iter()
+                    .map(|t| t[n].1[j])
+                    .filter(|c| c[1] > 0)
+                    .collect();
+                if counted.is_empty() {
+                    continue;
+                }
+                let per = (counted.len() * args.repeat.max(1)) as f64;
+                let sum = |k: usize| counted.iter().map(|c| c[k]).sum::<u64>() as f64 / per;
+                println!(
+                    "pinq {label:<8} {style:<18} {} ins {:.0} cyc {:.0}",
+                    q.name,
+                    sum(0),
+                    sum(1),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1495,11 +1560,32 @@ fn run() -> Result<bool, String> {
     if !args.plan.is_empty() {
         let mut sliced = Vec::new();
         fulls.clear();
-        for (style, full, n) in &args.plan {
-            for q in trace.iter().filter(|q| &q.style == style).take(*n) {
+        for (style, full, pick) in &args.plan {
+            let of_style = || trace.iter().filter(|q| &q.style == style);
+            let (picked, suffix): (Vec<&bench::TraceQuery>, &str) = match pick {
+                PlanSlice::First(n) => (of_style().take(*n).collect(), ""),
+                PlanSlice::Named(stem, names) => {
+                    let by_name: FxHashMap<&str, &bench::TraceQuery> =
+                        of_style().map(|q| (q.name.as_str(), q)).collect();
+                    let picked = names
+                        .iter()
+                        .map(|n| {
+                            by_name.get(n.as_str()).copied().ok_or_else(|| {
+                                format!("--plan {style}:@{stem}: no {style} query {n}")
+                            })
+                        })
+                        .collect::<Result<_, _>>()?;
+                    (picked, stem.as_str())
+                }
+            };
+            for q in picked {
                 let mut q = q.clone();
                 if *full {
                     q.style.push_str("+full");
+                }
+                if !suffix.is_empty() {
+                    q.style.push('@');
+                    q.style.push_str(suffix);
                 }
                 sliced.push(q);
                 fulls.push(*full);
@@ -1952,12 +2038,12 @@ fn run() -> Result<bool, String> {
     }
     if let Some(path) = &args.per_query {
         let mut text = String::from(
-            "name\tstyle\tus\texamined\tscored\tchecks\tpages\tdl\tpayload\tfooter\ttf\tpositions\tpins\tallocs\treallocs\tdlclass\tclasscuts\n",
+            "name\tstyle\tus\texamined\tscored\tchecks\tpages\tdl\tpayload\tfooter\ttf\tpositions\tpins\tallocs\treallocs\tdlclass\tclasscuts\tins\tcyc\n",
         );
         for r in &rows {
             let _ = writeln!(
                 text,
-                "{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                "{}\t{}\t{:.1}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{:.0}\t{:.0}",
                 r.name,
                 r.style,
                 r.ns as f64 / 1e3,
@@ -1975,6 +2061,8 @@ fn run() -> Result<bool, String> {
                 r.walk_allocs.reallocs,
                 r.pages.distinct(Part::DlClasses),
                 r.answer.class_cuts,
+                r.timed[0] as f64 / args.repeat.max(1) as f64,
+                r.timed[1] as f64 / args.repeat.max(1) as f64,
             );
         }
         std::fs::write(path, text).map_err(|e| e.to_string())?;

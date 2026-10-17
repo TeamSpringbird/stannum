@@ -23,13 +23,23 @@ change (least-squares slope and correlation), and each pair's verdict:
            >= +0.5%;
     NOISE  otherwise if |geomean| < --keep %;
     DROP   otherwise.
+
+With tnsreplay's per-query lines (`pinq`), each style also shows its tail:
+the change in mean paired cycles per query of the 25 forms slowest in BASE
+(`tail25`, median of the per-round changes; - is better), or, if the
+plan ran a fixed set of a style's slowest forms (a slice STYLE@SET, such as
+benchmarks/aws/tail/'s), that set's change in paired cycles. A STYLE@SET
+slice's own row is shown but left out of the verdicts. `--tail-gate PCT` adds a tail verdict per pair, TAIL-KEEP if the
+answers are equal, no style's paired change is below --style-floor %, and
+some style (a --target style, if given) has its tail25 cycles at or below
+-PCT % with its own mean paired change >= 0; else TAIL-NO.
 """
 
 import argparse
 import math
 import statistics as st
 
-from htpair_summary import get, parse, styles_of
+from htpair_summary import TAIL, get, parse, styles_of, tail_rounds
 
 
 def ratio_rounds(runs, name, base, threads, style, key):
@@ -61,6 +71,7 @@ def main():
     ap.add_argument('--keep', type=float, default=1.5, help='geomean paired gain to keep, %% (default 1.5)')
     ap.add_argument('--style-floor', type=float, default=-0.5, help='worst style allowed, %% (default -0.5)')
     ap.add_argument('--target', default='', help='NAME=STYLE/STYLE,...: the styles a change aims at')
+    ap.add_argument('--tail-gate', type=float, help='tail verdict: tail25 cycles at or below -PCT %%')
     args = ap.parse_args()
     targets = {k: v.split('/') for k, v in (t.split('=') for t in filter(None, args.target.split(',')))}
     runs = parse(args.out)
@@ -69,8 +80,9 @@ def main():
     for pair in filter(None, args.compare.split(',')):
         name, base = pair.split(':')
         print(f'== {name} vs {base}: change per style, median of per-round ratios [round range]; + is better')
-        print(f'  {"style":<18} {"pair q/Gcyc":>22} {"single q/Gcyc":>22} {"ins/q":>7} {"pair-single":>11}')
-        pair_by_round, pair_med, same, aimed = [], [], True, False
+        print(f'  {"style":<18} {"pair q/Gcyc":>22} {"single q/Gcyc":>22} {"ins/q":>7} {"pair-single":>11} '
+              f'{"tail" + str(TAIL) + " cyc/q":>22}')
+        pair_by_round, pair_med, same, aimed, tail_ok = [], [], True, False, False
         for style in styles:
             p = ratio_rounds(runs, name, base, 2, style, 'rate')
             s = ratio_rounds(runs, name, base, 1, style, 'rate')
@@ -80,13 +92,30 @@ def main():
             same &= all(get(runs, name, r, t, style, 'digest') == get(runs, base, r, t, style, 'digest')
                         for r in set(runs[name]) & set(runs[base]) for t in (1, 2))
             pm, sm, im = st.median(p), st.median(s), st.median(i)
-            pair_med.append(pm)
-            pair_by_round.append(p)
-            aimed |= style in targets.get(name, []) and pm >= 0.020 and min(p) >= 0.010
-            points.append((pm, sm, im))
+            fixed = '@' in style
+            if not fixed:
+                # A fixed set of forms (STYLE@SET) is shown, not judged: the
+                # verdict's geomean and floor are over the plain styles.
+                pair_med.append(pm)
+                pair_by_round.append(p)
+                aimed |= style in targets.get(name, []) and pm >= 0.020 and min(p) >= 0.010
+                points.append((pm, sm, im))
+            # The style's tail: its fixed slowest set's cycles if the plan ran
+            # one (STYLE@SET), else the 25 forms of the slice slowest in BASE.
+            sets = [x for x in styles if x.startswith(style + '@')]
+            if fixed:
+                tail = ratio_rounds(runs, name, base, 2, style, 'cyc')
+            elif sets:
+                tail = ratio_rounds(runs, name, base, 2, sets[0], 'cyc')
+            else:
+                tail, _ = tail_rounds(runs, name, base, 2, style)
+            shown = (f'{100 * st.median(tail):+6.2f}% [{100 * min(tail):+5.1f},{100 * max(tail):+5.1f}]'
+                     if tail else '-')
+            if tail and not fixed and args.tail_gate is not None and style in targets.get(name, [style]):
+                tail_ok |= st.median(tail) * 100 <= -args.tail_gate and pm >= 0
             print(f'  {style:<18} {100 * pm:+6.2f}% [{100 * min(p):+5.1f},{100 * max(p):+5.1f}] '
                   f'{100 * sm:+6.2f}% [{100 * min(s):+5.1f},{100 * max(s):+5.1f}] {100 * im:+6.2f}% '
-                  f'{100 * (pm - sm):+10.2f}')
+                  f'{100 * (pm - sm):+10.2f} {shown:>22}{"  (shown, not judged)" if fixed else ""}')
         g = geomean(pair_med)
         round_g = [geomean(list(col)) for col in zip(*pair_by_round)]
         sg = geomean([pt[1] for pt in points[-len(pair_med):]])
@@ -98,6 +127,8 @@ def main():
             verdict = 'NOISE'
         else:
             verdict = 'DROP'
+        if args.tail_gate is not None:
+            verdict += ', ' + ('TAIL-KEEP' if same and worst * 100 >= args.style_floor and tail_ok else 'TAIL-NO')
         verdicts.append((name, base, g, sg, worst, round_g, verdict))
         print(f'  {"geomean":<18} {100 * g:+6.2f}%  rounds {" ".join(f"{100 * x:+.1f}" for x in round_g)}  '
               f'single {100 * sg:+.2f}%  answers {"same" if same else "DIFFERENT"}\n')
