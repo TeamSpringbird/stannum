@@ -410,7 +410,12 @@ that fixed set as the style's tail and leaves its row out of the verdict.
 tail cycles fall at least 5% with its mean not worse, the answers agree and
 no style falls below the floor. On this Mac, `tnsreplay --cpus 0` (one
 thread; the counts are the process's) gives the same files, which the two
-scripts read as single-thread runs.
+scripts read as single-thread runs, and `--mmap` maps the segments from
+their files instead of reading them: the 100 tail forms over the whole 150M
+dump (36 GB) then hold 2–7 GB, and their instructions per form match the
+x86 box's. `--order density` (and `matches`, `docs-asc`, ...) with
+`--timed-walk` times the walk with the segments in another order than
+largest first.
 
 ## Matching TIN v1.0.6's published setup
 
