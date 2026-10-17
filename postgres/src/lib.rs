@@ -8731,27 +8731,28 @@ mod tests {
              SET LOCAL enable_seqscan = off;",
         )
         .unwrap();
-        || {
-            ["alpha AND v5", "alpha OR v5", "\"alpha beta\" v7"]
-                .iter()
-                .map(|q| {
-                    Spi::connect(|client| {
-                        client
-                            .select(
-                                &format!(
-                                    "SELECT id FROM hints WHERE body ==> '{q}'
-                                     ORDER BY stannum.score(ctid) DESC LIMIT 10"
-                                ),
-                                None,
-                                &[],
-                            )
-                            .unwrap()
-                            .map(|row| row.get::<i32>(1).unwrap().unwrap())
-                            .collect::<Vec<i32>>()
-                    })
-                })
-                .collect()
-        }
+        || HINT_QUERIES.iter().map(|q| hint_query(q)).collect()
+    }
+
+    /// [`buffer_hint_fixture`]'s queries.
+    const HINT_QUERIES: [&str; 3] = ["alpha AND v5", "alpha OR v5", "\"alpha beta\" v7"];
+
+    /// One of [`HINT_QUERIES`] over `hints`, ranked, as ids.
+    fn hint_query(q: &str) -> Vec<i32> {
+        Spi::connect(|client| {
+            client
+                .select(
+                    &format!(
+                        "SELECT id FROM hints WHERE body ==> '{q}'
+                         ORDER BY stannum.score(ctid) DESC LIMIT 10"
+                    ),
+                    None,
+                    &[],
+                )
+                .unwrap()
+                .map(|row| row.get::<i32>(1).unwrap().unwrap())
+                .collect::<Vec<i32>>()
+        })
     }
 
     #[pg_test]
@@ -8772,6 +8773,14 @@ mod tests {
         clear_reader_caches();
         Spi::run("SET LOCAL stannum.share_buffer_hints = off").unwrap();
         assert_eq!(ranked(), first);
+        // The phrase alone, right after forgetting: the queries before it
+        // in `ranked` would leave hints of their own to the pages they
+        // share with it (the term map's, the shorter records', the DL
+        // sidecar's), which it rightly pins through, and how many such
+        // pages there are is a matter of where the records fall on pages.
+        forget_recent_buffers();
+        clear_reader_caches();
+        assert_eq!(hint_query(HINT_QUERIES[2]), first[2]);
         let (pins, recent) = crate::storage::scan_pins();
         assert!(pins > 0, "the last query pinned no page");
         // (A page the query pins again, in another span, it pins through
@@ -8802,7 +8811,10 @@ mod tests {
         Spi::run("REINDEX INDEX hints_idx").unwrap();
         crate::storage::testing::forget_recent_buffers();
         crate::storage::testing::clear_reader_caches();
-        assert_eq!(ranked(), first);
+        // The phrase first, alone: every hint it could take is the old
+        // file's (the queries before it in `ranked` would leave hints to
+        // the rebuilt pages they share with it).
+        assert_eq!(hint_query(HINT_QUERIES[2]), first[2]);
         let (pins, recent) = crate::storage::scan_pins();
         assert!(pins > 0, "the last query pinned no page");
         // Only the pages it pins a second time, in another span.
