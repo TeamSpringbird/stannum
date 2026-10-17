@@ -1345,8 +1345,9 @@ impl<'a> Postings<'a> {
                 subs: None,
             });
         }
-        // The form and up to four varints.
-        let record = bytes.window(0, 1 + 4 * 10)?;
+        // The form and three varints (four with sub-range codes: a u32's
+        // varint is at most five bytes, so they fit as well).
+        let record = bytes.window(0, 1 + 3 * 10)?;
         let mut directory_len = 0;
         let form = *record.first().ok_or(Error::Truncated)?;
         let mut at = 1;

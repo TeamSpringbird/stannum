@@ -2393,6 +2393,9 @@ mod tests {
             block_size: 4,
             grid_min_postings: 0,
             inline_lengths_min_documents: 0,
+            // No sub-range codes: a rare lead's walk reads none, and at
+            // 97-byte pages they move the dense term's TF tail a page.
+            sub_codes_share: 0,
             ..Options::default()
         };
         let blob = build(&docs, &members, options);
@@ -2585,10 +2588,20 @@ mod tests {
         let read = lazy.loaded() - before;
         let positions = parsed.bounds[4] - parsed.bounds[3];
         let sidecar = parsed.bounds[6] - parsed.bounds[5];
+        // The words' sub-range codes, read by each dense group's cut, and
+        // the two chunks they start and end in.
+        let codes: usize = 2 * segment::tinshape::blob::CHUNK
+            + names
+                .iter()
+                .map(|n| {
+                    let term = parsed.term(n).unwrap().unwrap();
+                    term.postings.subs.as_ref().map_or(0, |s| s.len())
+                })
+                .sum::<usize>();
         assert!(positions > 200_000, "{positions}");
         assert!(
-            read < (positions + sidecar) / 4,
-            "read {read} bytes of {positions} of positions and {sidecar} of lengths"
+            read < (positions + sidecar) / 4 + codes,
+            "read {read} bytes of {positions} of positions, {sidecar} of lengths and {codes} of codes"
         );
     }
 
@@ -3292,10 +3305,13 @@ mod tests {
         for node in &nodes {
             let mut answers = Vec::new();
             for length_classes in [false, true] {
+                // No sub-range codes: they cut the long documents' words
+                // before either reads a length.
                 let options = Options {
                     grid_min_postings: 0,
                     inline_lengths_min_documents: u32::MAX,
                     length_classes,
+                    sub_codes_share: 0,
                     ..Options::default()
                 };
                 let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
