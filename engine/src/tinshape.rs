@@ -2347,6 +2347,37 @@ mod tests {
         assert!(released_walks_match(&docs, &members, &blob, 80, &nodes) > 0);
     }
 
+    /// A led walk reads a candidate's buckets from where its terms' TF
+    /// tails hold the group at hand, never from such a place kept past the
+    /// group: wide buckets, groups' buckets on one small page or across
+    /// two, common words read last, a phrase, each page released once the
+    /// walk is past it.
+    #[test]
+    fn led_walks_read_buckets_of_the_group_at_hand() {
+        let (docs, members) = drawn(9_000, &[60, 35, 4], 40);
+        let options = Options {
+            block_size: 32,
+            grid_density: 24,
+            grid_min_postings: 0,
+            inline_lengths_min_documents: u32::MAX,
+            ..Options::default()
+        };
+        let blob = build(&docs, &members, options);
+        use Node::*;
+        let nodes = [
+            And(vec![Term(0), Term(1)]),
+            And(vec![Term(2), Term(0), Term(1)]),
+            And(vec![Term(2), Term(1)]),
+            Span {
+                slots: vec![0, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+        ];
+        for page_len in [64, 173] {
+            assert!(released_walks_match(&docs, &members, &blob, page_len, &nodes) > 0);
+        }
+    }
+
     /// Phrase checks read positions through cursors that keep offsets, not
     /// slices, across groups: a phrase, and one repeating a word, over
     /// positions spanning many released pages.
