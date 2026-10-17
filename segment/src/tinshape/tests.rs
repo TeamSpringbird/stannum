@@ -491,7 +491,7 @@ fn a_corrupted_length_is_found() {
     assert!(!verify_segment(&broken).is_clean());
 }
 
-/// A dense term's grids carry sub-range codes (page layout 17), a rarer
+/// A dense term's grids carry sub-range codes (page layout 18), a rarer
 /// term's do not: each grid posting is bounded by its sub-range's code at
 /// its frontier pair, which the verifier checks, so a code past a
 /// posting's length is found.
