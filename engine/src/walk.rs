@@ -4097,18 +4097,19 @@ mod tests {
         assert_eq!(tail_first(2000, 1000), Some([(1, 2000), (0, 1)]));
     }
 
-    /// The densest groups lead, as many as asked (ties in group order), and
-    /// the rest follow: together every group once, both in ranges.
+    /// The run of groups holding the most documents leads (the first of
+    /// equal runs), as many groups as asked, and the rest follow.
     #[test]
-    fn dense_first_leads_with_the_densest_groups() {
+    fn dense_first_leads_with_the_densest_run() {
         use segment::tinshape::docs::{DocSet, Geometry, encode_docset};
-        // Group g holds 1 document, but every 7th holds 3 and group 5 holds 2.
+        // Every group holds one document; groups 600..700 hold three, and
+        // group 50 alone holds nine.
         let mut tids = Vec::new();
         for g in 0..1100u32 {
-            let docs = if g % 7 == 0 {
+            let docs = if (600..700).contains(&g) {
                 3
-            } else if g == 5 {
-                2
+            } else if g == 50 {
+                9
             } else {
                 1
             };
@@ -4123,25 +4124,18 @@ mod tests {
         assert_eq!(geometry.groups.len(), 1100);
         let docs = DocSet::decode(&encode_docset(&geometry, &tids)).unwrap();
         assert!(dense_first(&docs, 0).is_none());
-        // 158 groups hold 3; 160 asked: those, then group 5, then group 1.
-        let split = dense_first(&docs, 145).unwrap();
+        // 110 groups: every window holding 600..700 holds 310 documents,
+        // the most; the first starts at 590.
+        let split = dense_first(&docs, 100).unwrap();
+        assert_eq!(*split, (vec![(590, 700)], vec![(0, 590), (700, 1100)]));
         // Asked again, the same split, not computed again.
         assert!(std::rc::Rc::ptr_eq(
             &split,
-            &dense_first(&docs, 145).unwrap()
+            &dense_first(&docs, 100).unwrap()
         ));
-        let (lead, rest) = (&split.0, &split.1);
-        let mut want: Vec<u32> = (0..1100).filter(|g| g % 7 == 0).collect();
-        want.extend([1, 5]);
-        want.sort_unstable();
-        let flat = |r: &[(u32, u32)]| r.iter().flat_map(|&(a, b)| a..b).collect::<Vec<u32>>();
-        assert_eq!(flat(lead), want);
-        let mut all = flat(lead);
-        all.extend(flat(rest));
-        all.sort_unstable();
-        assert_eq!(all, (0..1100).collect::<Vec<u32>>());
-        assert!(lead.windows(2).all(|w| w[0].1 < w[1].0));
-        assert!(rest.windows(2).all(|w| w[0].1 < w[1].0));
+        // Two groups: group 50 and a neighbour, the first of equals.
+        let split = dense_first(&docs, 1).unwrap();
+        assert_eq!(*split, (vec![(49, 51)], vec![(0, 49), (51, 1100)]));
     }
 
     /// A small linear congruential generator: deterministic, no dependency.
