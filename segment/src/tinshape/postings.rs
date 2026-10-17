@@ -5275,7 +5275,11 @@ mod directory_tests {
                         "step {at} from group {g}"
                     );
                 }
-                assert_eq!(dir.step(&mut order, groups).unwrap(), None, "past the last from {g}");
+                assert_eq!(
+                    dir.step(&mut order, groups).unwrap(),
+                    None,
+                    "past the last from {g}"
+                );
             }
         }
     }
