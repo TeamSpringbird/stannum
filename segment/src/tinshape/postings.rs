@@ -417,8 +417,9 @@ pub fn put_sub_codes(
 /// (`u32::MAX` for an entry without: any but a grid), then each grid
 /// entry's codes ([`put_sub_codes`]), a byte per sub-range and frontier
 /// pair, the pairs of a sub-range together. Read only by the walks that
-/// bound a group's candidates per sub-range: no other reads it, so it lies
-/// apart from the containers, before the TF tail.
+/// bound a group's candidates per sub-range: no other reads it, so it ends
+/// the record, after the TF tail (every other area where it would be
+/// without codes).
 ///
 /// ```text
 /// subs := (offset u32le){entries} codes*
@@ -859,11 +860,12 @@ pub fn encode_reusing<'r>(
     out.extend_from_slice(&footer);
     out.extend_from_slice(payload);
     out.extend_from_slice(&inline_bytes);
-    out.extend_from_slice(&subs);
-    stats.subs = subs.len();
     stats.lengths = inline_bytes.len();
     let tf_bytes = if use_sparse { &tf_bytes } else { &grouped_tf };
     out.extend_from_slice(tf_bytes);
+    // Last: every other area lies where it would without codes.
+    out.extend_from_slice(&subs);
+    stats.subs = subs.len();
     stats.footer = footer.len();
     stats.payload = payload.len();
     stats.tf = tf_bytes.len();
@@ -1384,16 +1386,18 @@ impl<'a> Postings<'a> {
         let footer_at = at;
         let payload_at = footer_at + footer_len;
         let lengths_at = payload_at + payload_len;
-        let subs_at = lengths_at + lengths_len;
-        let tf_at = subs_at + subs_len;
-        if tf_at > bytes.len() {
+        let tf_at = lengths_at + lengths_len;
+        if tf_at + subs_len > bytes.len() {
             return Err(Error::Truncated);
         }
+        // The codes end the record, after the TF tail.
+        let subs_at = bytes.len() - subs_len;
+        let tf_end = subs_at;
         let footer = bytes.sub(footer_at, payload_at)?.tag(Kind::Footer);
         let payload = bytes.sub(payload_at, lengths_at)?;
         let lengths = if lengths_len > 0 {
             Some(InlineLengths::parse(
-                bytes.tag(Kind::InlineLengths).get(lengths_at, subs_at)?,
+                bytes.tag(Kind::InlineLengths).get(lengths_at, tf_at)?,
                 lengths_at,
                 df,
             )?)
@@ -1401,7 +1405,7 @@ impl<'a> Postings<'a> {
             None
         };
         let mut containers_at = 0;
-        let tf_len = bytes.len() - tf_at;
+        let tf_len = tf_end - tf_at;
         let form = match form {
             FORM_SPARSE => {
                 if payload.len() != ef::encoded_len(df as usize, geometry.slots) {
@@ -1446,7 +1450,7 @@ impl<'a> Postings<'a> {
                     return Err(Error::Corrupt("sub-range codes length"));
                 }
                 Some(Box::new(SubCodes {
-                    area: bytes.sub(subs_at, tf_at)?.tag(Kind::Footer),
+                    area: bytes.sub(subs_at, bytes.len())?.tag(Kind::Footer),
                     entries: dir.len(),
                     at: subs_at,
                 }))
@@ -1461,7 +1465,7 @@ impl<'a> Postings<'a> {
             payload,
             payload_at,
             containers_at,
-            tf: bytes.sub(tf_at, bytes.len())?.tag(Kind::Tf),
+            tf: bytes.sub(tf_at, tf_end)?.tag(Kind::Tf),
             tf_at,
             lengths,
             compact,

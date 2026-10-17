@@ -119,7 +119,7 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
          | sparse:  form u8, [footer_len], payload_len, [lengths_len],
                     [footer], list, [lengths], tf
          | grouped: form u8, directory_len, payload_len, [lengths_len],
-                    [subs_len], directory, container*, [lengths], [subs], tf
+                    [subs_len], directory, container*, [lengths], tf, [subs]
                     (directory_len: the bytes of the payload before its
                     containers, layout 10)
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
@@ -2544,8 +2544,9 @@ A grouped record of a term in at least one in 10 of its segment's documents
 (`Options::sub_codes_share`) holds sub-range codes for its grids ([grammar](#postings-record)):
 per 64-slot sub-range (one word of the group's candidate bitmap) and
 frontier pair, the least rounded length of the sub-range's postings at
-that pair's buckets. They lie apart from the containers, before the TF
-tail, so nothing but the walk that uses them reads them. A led walk's group
+that pair's buckets. They end the record, after the TF tail, so nothing
+but the walk that uses them reads them and every other area lies where it
+would without them. A led walk's group
 of all grids with at least 32 candidates (`SUB_MIN`) bounds each candidate
 word by its scoring terms' codes, the best pair bucket at its code's length
 per term (at most its group bound; a term without codes at its group
