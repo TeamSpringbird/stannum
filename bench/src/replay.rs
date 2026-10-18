@@ -40,6 +40,7 @@ pub const DEFAULT_CONFIG: WalkConfig = WalkConfig {
     warmup_chunks: 256,
     warmup_min_matches: 4.0,
     seed: None,
+    short_first_permille: engine::walk::SHORT_FIRST_PERMILLE,
 };
 
 /// Dictionary lookups a memo holds before it is emptied, as the

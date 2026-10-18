@@ -201,6 +201,38 @@ pub fn verify_segment(bytes: &[u8]) -> SegmentReport {
                             entry.index
                         ));
                     }
+                    // Sub-range codes: a grid's posting must be bounded by
+                    // its sub-range's code at its frontier pair.
+                    if let Some(subs) = &found.postings.subs {
+                        use super::postings::{
+                            KIND_GRID, SUB_NONE, SUB_SHIFT, rounded_length, sub_ranges,
+                        };
+                        let pairs: Vec<u8> =
+                            found.postings.group_frontier(entry).map(|p| p.0).collect();
+                        let n = pairs.len();
+                        match subs.of(at_entry, sub_ranges(group.slots()) * n)? {
+                            None if entry.kind == KIND_GRID => problems.push(format!(
+                                "group {}'s grid has no sub-range codes",
+                                entry.index
+                            )),
+                            Some(_) if entry.kind != KIND_GRID => problems.push(format!(
+                                "group {}'s container has sub-range codes but is no grid",
+                                entry.index
+                            )),
+                            Some((codes, _)) => {
+                                let local = *slot - group.slot_base;
+                                let k = pairs.partition_point(|b| *b < bucket).min(n - 1);
+                                let code = codes[(local >> SUB_SHIFT) as usize * n + k];
+                                if code == SUB_NONE || rounded_length(u32::from(code)) > length {
+                                    problems.push(format!(
+                                        "posting {i} (bucket {bucket}, length {length}) is not covered by its sub-range code {code} in group {}",
+                                        entry.index
+                                    ));
+                                }
+                            }
+                            None => {}
+                        }
+                    }
                 }
             }
             if largest != entry.max_tf_bucket {

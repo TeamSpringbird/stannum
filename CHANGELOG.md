@@ -172,6 +172,35 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- A dense term's grouped record (a term in at least a tenth of its
+  segment's documents) holds a sub-range code for each 64-slot word of each
+  grid, per pair of its group frontier: the least rounded length of the
+  word's postings at that pair's buckets (page layout 18; an index of an
+  earlier layout must be rebuilt). A `full_score` conjunction's group with
+  at least 32 candidates bounds each candidate word by its scoring terms'
+  codes, summed in the scorer's order, and drops the words the bar cuts
+  before it reads their buckets; other walks read no code. At 150 million
+  rows the index is 1.6% larger; on Sapphire Rapids (one core's two
+  hyperthreads) `full_score` conjunctions answer 12.6% more queries per
+  cycle and phrases 10.7%, their 25 slowest forms in 26% and 19% fewer
+  cycles, the other styles unchanged; the same answers.
+- A ranked walk over a segment of at least 1,024 groups first walks the run
+  of 40% of its groups (whole 64-group runs) holding the most documents per
+  group, when that run holds at least 1.2 times the segment's documents per
+  group, then the rest: short documents score highest, so the bar forms
+  where the winners are and the longer documents are walked under a
+  near-final bar. A disjunction walking groups in ranges seeks each term to
+  the next range rather than stepping through the groups between them. The
+  answers are the same in any order. At 150 million rows on Sapphire
+  Rapids, 5.6% more queries per cycle over the six styles (every style 3.6%
+  or more; each style's 25 slowest forms 5-8% fewer cycles); on aarch64 3.1%
+  fewer instructions.
+- Together, with PostgreSQL on one Sapphire Rapids core's two hyperthreads
+  (the loader's x86-64-v4 build, no PGO on either side), this release
+  answers 6.5% more queries per cycle than the last over the six styles
+  (`full_score` phrases 9.4%, conjunctions 8.7%, disjunctions 6.4%; score
+  disjunctions 6.5%, phrases 5.4%, conjunctions 2.8%), and reads 1-6% fewer
+  shared buffers a query (`full_score` disjunctions 6%).
 - A run page's data is found by arithmetic (its header and link, a chain's
   capacity a page, the run's length on its last), and its header and
   special area are checked once per backend, on its first pin; each run

@@ -973,6 +973,7 @@ impl IndexScorer {
             warmup_chunks: usize::try_from(WARMUP_CHUNKS.get()).unwrap_or(0),
             warmup_min_matches: WARMUP_MIN_MATCHES.get(),
             seed: seeded_threshold(),
+            short_first_permille: engine::walk::SHORT_FIRST_PERMILLE,
         };
         let heap_oid = pg_sys::Oid::from(self.key.heap_oid);
         let index_oid = pg_sys::Oid::from(self.key.index_oid);
