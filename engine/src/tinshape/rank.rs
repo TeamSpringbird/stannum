@@ -4089,14 +4089,6 @@ pub(super) fn walk_into<'s, 'a>(
         }
         // The pages those ranges lie on, read to open the terms, are held
         // to the walk's end before the mark the groups release to.
-        // A disjunction reads two streams a scoring term (its containers
-        // and TF tail) and the lengths' two: past 24 kept pages, they
-        // would release pages the next group reads on from.
-        blob.keep_streams(if required.is_empty() {
-            2 * walk.sc.len() + 6
-        } else {
-            0
-        });
         walk.frame = Some((blob, blob.hold_since(opened, &walk.held)));
         // A footer's pages hold only its bytes: each is released once the
         // footer has read past it, not left pinned to the group's end.

@@ -491,18 +491,6 @@ impl LazyBlob {
         self.keep.set(keep);
     }
 
-    /// Sizes the pages kept for a walk reading `streams` page streams a
-    /// group (a disjunction's: a container and a TF tail per scoring term,
-    /// the DL sidecar and the class plane, and some slack): [`KEEP_PINS`]
-    /// or `streams`, the more, so that a walk over many terms keeps the
-    /// page each stream reads on from. A blob set to keep none (tests
-    /// releasing every page) keeps none.
-    pub fn keep_streams(&self, streams: usize) {
-        if self.keep.get() != 0 {
-            self.keep.set(KEEP_PINS.max(streams));
-        }
-    }
-
     /// Notes a read of page `page`, which the page memo holds.
     #[inline(always)]
     fn touch(&self, page: usize) {
@@ -1475,15 +1463,7 @@ mod tests {
         blob.set_keep(100);
         unsafe { blob.release_since(mark, &[]) };
         assert_eq!(state.pinned.borrow().len(), 9);
-        // A walk over many streams keeps one page for each; one over few,
-        // the default; a blob set to keep none still keeps none.
-        blob.keep_streams(KEEP_PINS + 12);
-        assert_eq!(blob.keep(), KEEP_PINS + 12);
-        blob.keep_streams(0);
-        assert_eq!(blob.keep(), KEEP_PINS);
         blob.set_keep(0);
-        blob.keep_streams(KEEP_PINS + 12);
-        assert_eq!(blob.keep(), 0);
         unsafe { blob.release_since(mark, &[]) };
         assert_eq!(
             state.pinned.borrow().keys().copied().collect::<Vec<_>>(),
