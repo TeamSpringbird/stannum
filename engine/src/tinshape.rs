@@ -441,6 +441,16 @@ impl<'a> TermSet<'a> {
         }
     }
 
+    /// Moves a grouped term's walk in order ([`Self::step_index`]) to its
+    /// first group whose index is `group` or more, sought from `hint`: the
+    /// groups before it are passed unread.
+    #[inline]
+    fn step_from(&self, order: &mut InOrder, group: u32, hint: usize) {
+        if let Some(dir) = &self.dir {
+            *order = dir.in_order_from(group, hint);
+        }
+    }
+
     /// The term's group `group`, if it holds it, looked for from `hint`
     /// forward (the hint is left at the first group at or after it).
     /// Inlined: returned through memory, its group was stored a field at a
@@ -1581,6 +1591,37 @@ pub fn top_k_into(
         scorers,
         top,
         visibility,
+        &[],
+        touch,
+        &mut answer,
+    )?;
+    Ok(answer)
+}
+
+/// [`top_k_into`] over only the groups in `groups` (ascending, disjoint
+/// ranges `[start, end)` of the segment's group indexes): walks over
+/// complementary ranges keep the rows one walk over every group keeps, in
+/// any order, as walks over segments do.
+#[expect(clippy::too_many_arguments, reason = "top_k_into's and the ranges")]
+pub fn top_k_into_groups(
+    segment: &Segment<'_>,
+    node: &Node,
+    names: &[String],
+    scorers: &[(String, TermScorer)],
+    top: &mut crate::walk::TopRows,
+    visibility: &mut dyn crate::walk::Visibility,
+    groups: &[(u32, u32)],
+    touch: &mut impl Touch,
+) -> Result<RankedAnswer> {
+    let mut answer = RankedAnswer::default();
+    rank::walk_into(
+        segment,
+        node,
+        names,
+        scorers,
+        top,
+        visibility,
+        groups,
         touch,
         &mut answer,
     )?;
@@ -2424,6 +2465,9 @@ mod tests {
             block_size: 4,
             grid_min_postings: 0,
             inline_lengths_min_documents: 0,
+            // No sub-range codes: a rare lead's walk reads none, and at
+            // 97-byte pages they move the dense term's TF tail a page.
+            sub_codes_share: 0,
             ..Options::default()
         };
         let blob = build(&docs, &members, options);
@@ -2616,10 +2660,20 @@ mod tests {
         let read = lazy.loaded() - before;
         let positions = parsed.bounds[4] - parsed.bounds[3];
         let sidecar = parsed.bounds[6] - parsed.bounds[5];
+        // The words' sub-range codes, read by each dense group's cut, and
+        // the two chunks they start and end in.
+        let codes: usize = 2 * segment::tinshape::blob::CHUNK
+            + names
+                .iter()
+                .map(|n| {
+                    let term = parsed.term(n).unwrap().unwrap();
+                    term.postings.subs.as_ref().map_or(0, |s| s.len())
+                })
+                .sum::<usize>();
         assert!(positions > 200_000, "{positions}");
         assert!(
-            read < (positions + sidecar) / 4,
-            "read {read} bytes of {positions} of positions and {sidecar} of lengths"
+            read < (positions + sidecar) / 4 + codes,
+            "read {read} bytes of {positions} of positions, {sidecar} of lengths and {codes} of codes"
         );
     }
 
@@ -3032,8 +3086,32 @@ mod tests {
                 for &part in &order {
                     top_k_into(&segments[part], &node, &names, &scorers, &mut top, &mut AllVisible, &mut NoTouch).unwrap();
                 }
+                // The same walks over each segment's groups in pieces
+                // (complementary ranges), the pieces of every segment in
+                // any order: a prepass over some groups, the rest after.
+                let mut pieces: Vec<(usize, Vec<(u32, u32)>)> = Vec::new();
+                for &part in &order {
+                    let groups = segments[part].docs.geometry.groups.len() as u32;
+                    let cuts = 1 + (next() % 3) as usize;
+                    let mut ranges: Vec<Vec<(u32, u32)>> = vec![Vec::new(); cuts];
+                    for g in 0..groups {
+                        ranges[(next() % cuts as u64) as usize].push((g, g + 1));
+                    }
+                    for r in ranges.into_iter().filter(|r| !r.is_empty()) {
+                        pieces.push((part, r));
+                    }
+                }
+                for i in (1..pieces.len()).rev() {
+                    pieces.swap(i, (next() % (i as u64 + 1)) as usize);
+                }
+                let mut pieced = crate::walk::TopRows::new(k, ties);
+                for (part, groups) in &pieces {
+                    top_k_into_groups(&segments[*part], &node, &names, &scorers, &mut pieced, &mut AllVisible, groups, &mut NoTouch).unwrap();
+                }
                 let bits = |rows: Vec<(f32, Tid)>| rows.into_iter().map(|(s, t)| (s.to_bits(), t)).collect::<Vec<_>>();
-                prop_assert_eq!(bits(top.into_rows()), bits(want.into_rows()), "top {} ties {} parts {:?} of {:?}", k, ties, order, node);
+                let want = bits(want.into_rows());
+                prop_assert_eq!(bits(pieced.into_rows()), want.clone(), "pieces {:?} top {} ties {} of {:?}", pieces, k, ties, node);
+                prop_assert_eq!(bits(top.into_rows()), want, "top {} ties {} parts {:?} of {:?}", k, ties, order, node);
             }
         }
     }
@@ -3323,10 +3401,13 @@ mod tests {
         for node in &nodes {
             let mut answers = Vec::new();
             for length_classes in [false, true] {
+                // No sub-range codes: they cut the long documents' words
+                // before either reads a length.
                 let options = Options {
                     grid_min_postings: 0,
                     inline_lengths_min_documents: u32::MAX,
                     length_classes,
+                    sub_codes_share: 0,
                     ..Options::default()
                 };
                 let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
@@ -4182,6 +4263,113 @@ mod tests {
                 walked.candidates
             );
         }
+    }
+
+    /// Dense words whose short documents sit in a few sub-ranges of each
+    /// group (64 slots: the first word of every eight), the rest long
+    /// documents counting one or five (a group's frontier at five is a
+    /// short document's, so a long one's bucket leaves it in reach): with sub-range codes ([`Options::sub_codes_share`])
+    /// a conjunction seeded with its final rows examines no candidate of a
+    /// sub-range the bar cuts (reads none of its buckets), so far fewer
+    /// than without codes, and keeps the same rows. Codes are read only by a led walk: a
+    /// disjunction reads as many buckets either way.
+    #[test]
+    fn dense_sub_ranges_a_bar_cuts_read_no_buckets() {
+        let n = 12_000;
+        let docs: Vec<Tid> = (0..n as u32)
+            .map(|i| Tid {
+                block: i / 7,
+                offset: (i % 7) as u16 + 1,
+            })
+            .collect();
+        let hot = |r: usize| (r / 64).is_multiple_of(8);
+        let lengths: Vec<u32> = (0..n)
+            .map(|r| if hot(r) { 12 } else { 300 + (r % 7) as u32 })
+            .collect();
+        let members: Vec<Vec<(usize, u32)>> = (0..2)
+            .map(|t| {
+                (0..n)
+                    .filter(|r| !(r + t).is_multiple_of(5))
+                    .map(|r| {
+                        let tf = if hot(r) {
+                            3 + ((r + t) % 4) as u32
+                        } else {
+                            1 + 4 * ((r + t) % 2) as u32
+                        };
+                        (r, tf)
+                    })
+                    .collect()
+            })
+            .collect();
+        let all: Vec<usize> = (0..n).collect();
+        let names: Vec<String> = (0..2).map(|t| format!("t{t}")).collect();
+        let scorers: Vec<(String, TermScorer)> = (0..2)
+            .map(|t| {
+                let df = members[t].len() as u64;
+                let scorer =
+                    TermScorer::from_statistics(n as u64, df, 1.0, Bm25Params::default(), 50.0)
+                        .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let k = 10;
+        let mut reads_by = Vec::new();
+        for share in [0, 10] {
+            let options = Options {
+                grid_min_postings: 0,
+                inline_lengths_min_documents: u32::MAX,
+                sub_codes_share: share,
+                ..Options::default()
+            };
+            let blob = build_part(&docs, &lengths, &members, &all, &vec![false; n], options);
+            let segment = Segment::parse(&blob).unwrap();
+            let mut reads = Vec::new();
+            for node in [
+                Node::And(vec![Node::Term(0), Node::Term(1)]),
+                Node::Or(vec![Node::Term(0), Node::Term(1)]),
+            ] {
+                let got = top_k(&segment, &node, &names, &scorers, k, &mut NoTouch).unwrap();
+                let mut seeded = crate::walk::TopRows::new(k, false);
+                for row in &got.rows {
+                    seeded.push(crate::walk::Ranked(row.0, row.1));
+                }
+                let mut tf = TfReads::default();
+                let walked = top_k_into(
+                    &segment,
+                    &node,
+                    &names,
+                    &scorers,
+                    &mut seeded,
+                    &mut AllVisible,
+                    &mut tf,
+                )
+                .unwrap();
+                let bits: Vec<(u32, Tid)> =
+                    got.rows.iter().map(|(s, t)| (s.to_bits(), *t)).collect();
+                reads.push((bits, walked.candidates, tf.0));
+            }
+            reads_by.push(reads);
+        }
+        let (without, with) = (&reads_by[0], &reads_by[1]);
+        // The same rows with codes and without.
+        assert_eq!(without[0].0, with[0].0);
+        assert_eq!(without[1].0, with[1].0);
+        // A conjunction examines (reads the buckets of) a fraction of the
+        // candidates.
+        assert!(
+            without[0].1 > 1_000,
+            "{} candidates without codes",
+            without[0].1
+        );
+        assert!(
+            with[0].1 * 3 < without[0].1,
+            "conjunction: {} candidates examined with codes, {} without",
+            with[0].1,
+            without[0].1
+        );
+        assert!(with[0].2 <= without[0].2, "{:?} {:?}", with[0], without[0]);
+        // A disjunction reads no codes.
+        assert_eq!((with[1].1, with[1].2), (without[1].1, without[1].2));
     }
 
     struct AllVisible;

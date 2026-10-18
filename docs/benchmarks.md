@@ -392,6 +392,31 @@ points). Cutting cheap, high-IPC work gained 1–2.5 points more in the pair
 than alone on conjunctions, but no candidate that the single-thread gate
 had rejected became a keep on the strength of that alone.
 
+The tail is reported beside the means. The benchmark runs every query form
+equally often, so a style's p99 is about its 13th-slowest form of 1,254,
+and a change can raise the mean throughput while it slows the slowest forms
+(i14 to i16: full conjunctions' cheap forms 9–20% faster, their 25 slowest
+4.6% slower, their p99 176 to 188 ms). `tnsreplay --cpus` prints each
+query's cycles and instructions per timed pass (`pinq` lines;
+`--per-query` has them as `ins` and `cyc`). Per style, the summary and the
+gate show the change in mean cycles of the 25 forms slowest in the base
+(`tail25`) beside every form's. A plan slice can also name its forms
+(`STYLE:MODE:@FILE`, reported as `STYLE[+full]@STEM`):
+`benchmarks/aws/tail/` holds the 25 slowest forms of score disjunction and
+of each full style in the i16 i7i campaign (by their median latency), and
+`devbox-htpair-ab.sh` runs them by default (`TAIL=1`). The gate then reports
+that fixed set as the style's tail and leaves its row out of the verdict.
+`htpair_gate.py --tail-gate 5` adds a tail verdict: TAIL-KEEP if a style's
+tail cycles fall at least 5% with its mean not worse, the answers agree and
+no style falls below the floor. On this Mac, `tnsreplay --cpus 0` (one
+thread; the counts are the process's) gives the same files, which the two
+scripts read as single-thread runs, and `--mmap` maps the segments from
+their files instead of reading them: the 100 tail forms over the whole 150M
+dump (36 GB) then hold 2–7 GB, and their instructions per form match the
+x86 box's. `--order density` (and `matches`, `docs-asc`, ...) with
+`--timed-walk` times the walk with the segments in another order than
+largest first.
+
 ## Matching TIN v1.0.6's published setup
 
 Benchmarks v2 reproduces the setup of PlanetScale's
