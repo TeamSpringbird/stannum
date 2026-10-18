@@ -347,3 +347,28 @@ pub fn replay() {
 pub(super) fn mode() -> u8 {
     MODE.with(Cell::get)
 }
+
+/// research6: a funnel of a disjunction's group and candidate work (offline only).
+pub mod orf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    pub const NAMES: [&str; 28] = [
+        "groups", "pruned_bound", "pruned_mask", "present", "present_loaded", "essential", "required",
+        "words", "live_words", "mask_members", "kept_words", "members_weighed", "members_kept", "sieving_groups",
+        "stage", "held", "cut_block", "class_first_reads", "class_first_cuts", "bucket_reads", "cut_buckets",
+        "survivors", "class_after_reads", "class_after_cuts", "load_sparse", "load_grid", "load_container",
+        "load_locals",
+    ];
+    pub static C: [AtomicU64; 28] = [const { AtomicU64::new(0) }; 28];
+    #[inline(always)]
+    pub fn add(i: usize, v: u64) {
+        C[i].fetch_add(v, Ordering::Relaxed);
+    }
+    pub fn report() {
+        let v: Vec<u64> = C.iter().map(|c| c.load(Ordering::Relaxed)).collect();
+        if v[0] == 0 {
+            return;
+        }
+        let line: Vec<String> = NAMES.iter().zip(&v).map(|(n, x)| format!("{n}={x}")).collect();
+        println!("orfunnel {}", line.join(" "));
+    }
+}

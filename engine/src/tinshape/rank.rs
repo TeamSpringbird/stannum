@@ -4421,6 +4421,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         r.at = RowAt::of(row);
         r.tf = TfRun::default();
         if let Form::Sparse(list) = &set.postings.form {
+            #[cfg(feature = "census")]
+            super::census::orf::add(24, 1);
             row.fill(0);
             let cursor = set.sparse.get_or_insert_with(|| {
                 self.touch.touch(
@@ -4453,6 +4455,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.touch.touch(Part::Payload, at, bytes.len());
                 self.mems[t].used += 1;
                 r.first = e.first;
+                #[cfg(feature = "census")]
+                super::census::orf::add(if e.kind == KIND_GRID { 25 } else { 26 }, 1);
                 if e.kind == KIND_GRID {
                     r.at = grid_row(bytes, row)?;
                 } else {
@@ -4461,6 +4465,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
             }
             Src::Locals { from, to } => {
+                #[cfg(feature = "census")]
+                super::census::orf::add(27, 1);
                 r.first = from;
                 row.fill(0);
                 kernels::set_ascending(&set.locals[from as usize..to as usize], row);
@@ -4524,6 +4530,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.answer.windows += 1;
         #[cfg(feature = "census")]
         self.census_group(g);
+        #[cfg(feature = "census")]
+        {
+            super::census::orf::add(0, 1);
+            super::census::orf::add(3, self.present_list.len() as u64);
+        }
         // The present terms' bounds over the group.
         self.cand_w = usize::MAX;
         let mut sb = std::mem::take(&mut self.sub_bounds);
@@ -4547,6 +4558,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let gi = g as usize;
         if self.cut(total, || geometry.tid_in(gi, 0)) {
             self.answer.windows_pruned += 1;
+            #[cfg(feature = "census")]
+            super::census::orf::add(1, 1);
             self.sub_bounds = sb;
             return Ok(());
         }
@@ -4566,6 +4579,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // before its bounds are taken.
         let real: f64 = sb.iter().map(|b| f64::from(*b)).sum();
         self.plan_group(&mut plan, self.threshold(), &sb, real);
+        #[cfg(feature = "census")]
+        {
+            super::census::orf::add(5, if plan.by_essential { plan.essential.len() } else { 0 } as u64);
+            super::census::orf::add(6, plan.required.len() as u64);
+        }
         let mut loaded = std::mem::take(&mut self.row_loaded);
         loaded.clear();
         loaded.resize(n, false);
@@ -4607,6 +4625,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         if !kernels::any_set(&mask) {
             self.answer.windows_pruned += 1;
+            #[cfg(feature = "census")]
+            super::census::orf::add(2, 1);
             self.words = mask;
             self.row_loaded = loaded;
             self.sub_bounds = sb;
@@ -4619,6 +4639,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
         }
         self.row_loaded = loaded;
+        #[cfg(feature = "census")]
+        {
+            super::census::orf::add(4, self.present_list.len() as u64);
+            super::census::orf::add(7, words as u64);
+            super::census::orf::add(8, mask.iter().filter(|w| **w != 0).count() as u64);
+            super::census::orf::add(9, mask.iter().map(|w| u64::from(w.count_ones())).sum::<u64>());
+        }
         // Each member of the mask weighed alone: the bounds of the terms it
         // holds, summed, must reach the threshold. A word's members are
         // weighed first all at once, by the group's bounds of the terms
@@ -4676,6 +4703,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             && kernels::popcount(&mask) >= OR_SIEVE_MIN
             && self.or_sieve(&terms, &sb);
         if sieving {
+            #[cfg(feature = "census")]
+            super::census::orf::add(13, 1);
             self.sieve_words(&mut mask)?;
         }
         // A word's members are bounded from its first slot's ctid (see
@@ -4749,6 +4778,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             break;
                         }
                     }
+                    #[cfg(feature = "census")]
+                    {
+                        super::census::orf::add(10, 1);
+                        super::census::orf::add(11, u64::from(word.count_ones()));
+                    }
                     // The word's members, each at the sub-range's bounds of
                     // the terms holding it: lanes at a time where the word
                     // holds enough of them to fill a vector, else one at a
@@ -4794,6 +4828,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     }
                     word = keep;
                 }
+                #[cfg(feature = "census")]
+                super::census::orf::add(12, u64::from(word.count_ones()));
                 if sieving {
                     self.or_keep(g, base, w, word)?;
                     continue;
@@ -5033,7 +5069,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 bound += v;
             }
         }
+        #[cfg(feature = "census")]
+        {
+            super::census::orf::add(14, 1);
+            super::census::orf::add(15, self.held_list.len() as u64);
+        }
         if self.cut(bound, tid) {
+            #[cfg(feature = "census")]
+            super::census::orf::add(16, 1);
             return Ok(None);
         }
         // The candidate's buckets, before its length is read (see
@@ -5060,11 +5103,15 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let class_first = self.held_list.len() >= CLASS_FIRST_TERMS;
         if class_first && self.threshold().is_some() {
             let class = self.class_floor(g, local)?;
+            #[cfg(feature = "census")]
+            super::census::orf::add(17, 1);
             if class > 0 {
                 floor = class;
                 reach = self.or_rebound(class);
                 if self.cut(reach, tid) {
                     self.answer.class_cuts += 1;
+                    #[cfg(feature = "census")]
+                    super::census::orf::add(18, 1);
                     return Ok(None);
                 }
             }
@@ -5081,6 +5128,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 break;
             }
             let f = self.or_bucket_of(top)?;
+            #[cfg(feature = "census")]
+            super::census::orf::add(19, 1);
             if f > floor {
                 floor = f;
                 reach = self.or_rebound(floor);
@@ -5094,9 +5143,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
             }
             if self.cut(reach, tid) {
+                #[cfg(feature = "census")]
+                super::census::orf::add(20, 1);
                 return Ok(None);
             }
         }
+        #[cfg(feature = "census")]
+        super::census::orf::add(21, 1);
         let carrier = self.held_list.iter().copied().find(|i| {
             self.terms[self.sc[*i].term]
                 .as_ref()
@@ -5120,10 +5173,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 if !class_first && self.threshold().is_some() && self.segment.lengths.has_classes()
                 {
                     let c = self.class_of(g, local)?;
+                    #[cfg(feature = "census")]
+                    super::census::orf::add(22, 1);
                     if self.segment.lengths.floors()[c] > floor {
                         reach = self.class_reach(self.held_list.iter().copied(), c);
                         if self.cut(reach, tid) {
                             self.answer.class_cuts += 1;
+                            #[cfg(feature = "census")]
+                            super::census::orf::add(23, 1);
                             return Ok(None);
                         }
                     }

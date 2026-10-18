@@ -2609,6 +2609,8 @@ fn run() -> Result<bool, String> {
     #[cfg(feature = "census")]
     print_census(&census);
     #[cfg(feature = "census")]
+    engine::tinshape::census::orf::report();
+    #[cfg(feature = "census")]
     for (style, t) in &sub_census {
         print_sub_query("ALL", style, t);
     }
