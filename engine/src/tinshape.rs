@@ -3549,7 +3549,7 @@ mod tests {
     }
 
     /// A candidate holding a scoring term whose record carries length codes
-    /// (page layout 18, at most a tenth of the documents) is bounded by its
+    /// (page layout 19, at most a twentieth of the documents) is bounded by its
     /// length class read beside its buckets in the TF tail, not from the DL
     /// sidecar's class plane; the answers are the same as without codes.
     #[test]
@@ -3566,15 +3566,19 @@ mod tests {
         // Term t holds positions 0..tf: "t0 t1" needs t1 at 1, so tf 2.
         let members = vec![
             (0..n as usize)
-                .filter(|r| r % 13 == 0 || r % 97 == 0)
+                .filter(|r| r % 29 == 0 || r % 97 == 0)
                 .map(|r| (r, 1 + (r % 3) as u32))
                 .collect::<Vec<_>>(),
             (0..n as usize)
-                .filter(|r| r % 17 == 0 || r % 97 == 0)
+                .filter(|r| r % 37 == 0 || r % 97 == 0)
                 .map(|r| (r, 2 + (r % 2) as u32))
                 .collect(),
         ];
-        assert!(members.iter().all(|m| m.len() * 10 <= n as usize));
+        assert!(
+            members
+                .iter()
+                .all(|m| m.len() as u64 * segment::tinshape::postings::CODE_SHARE <= u64::from(n))
+        );
         let all: Vec<usize> = (0..n as usize).collect();
         let names = vec!["t0".to_owned(), "t1".to_owned()];
         let scorers: Vec<(String, TermScorer)> = members

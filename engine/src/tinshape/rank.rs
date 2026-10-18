@@ -3779,7 +3779,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// The length code of the candidate at hand from the first scoring term
     /// it holds whose record carries codes (a disjunction's
     /// [`Walk::held_list`] with `or`, else the terms whose buckets were
-    /// read), beside its buckets in the TF tail (page layout 18: TIN's TF
+    /// read), beside its buckets in the TF tail (page layout 19: TIN's TF
     /// tail keeps a length code a posting); `None` when none carries codes.
     /// A code is its document's length class
     /// ([`segment::tinshape::docs::LENGTH_CLASSES`]).

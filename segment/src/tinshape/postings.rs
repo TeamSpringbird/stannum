@@ -132,13 +132,15 @@ pub const FORM_CODES: u8 = 0x20;
 pub const CODE_BITS: u32 = 2;
 
 /// A record of at most one posting in this many of its segment's documents
-/// carries length codes (page layout 18): a walk scoring it reads its
+/// carries length codes (page layout 19): a walk scoring it reads its
 /// candidates' length classes from the TF tail it reads their buckets from.
-/// A denser term is elided from `score` ranking (its documents' share is
-/// past `stannum.dense_ratio`'s default), and its codes would cost most of
-/// their bytes: at 150M rows records of at most a tenth of the documents
-/// hold 4.4 of the 6.8 billion postings, and their codes 1.1 GB (+3.1%).
-pub const CODE_SHARE: u64 = 10;
+/// At 150M rows records of at most a twentieth of the documents hold 3.7 of
+/// the 6.8 billion postings, and their codes 0.92 GB (+2.5%). Rarer records
+/// are where a ranked walk reads classes (a disjunction's candidates hold
+/// one term in most groups); the records of a twentieth to a tenth (0.75
+/// billion postings, layout 18's trial coded them too) lengthen the TF tails
+/// of `full_score` conjunctions' denser words more than they save there.
+pub const CODE_SHARE: u64 = 20;
 
 /// Whether a record of `df` postings in a segment of `documents` documents
 /// carries length codes (one carrying its documents' lengths inline, or of
@@ -4752,11 +4754,12 @@ mod tests {
         }
     }
 
-    /// A record of at most a tenth of the documents carries each posting's
-    /// length class after its block's (or group's) buckets, sparse or
-    /// grouped, at every width; a denser one carries none.
+    /// A record of at most a twentieth of the documents ([`CODE_SHARE`])
+    /// carries each posting's length class after its block's (or group's)
+    /// buckets, sparse or grouped, at every width; a denser one carries none.
     #[test]
     fn rare_records_carry_their_postings_length_codes() {
+        let coded_share = |df: usize, documents: usize| df as u64 * CODE_SHARE <= documents as u64;
         let tids: Vec<Tid> = (0..4_000u32)
             .map(|i| Tid {
                 block: i / 7 * 3,
@@ -4764,7 +4767,7 @@ mod tests {
             })
             .collect();
         let geometry = geometry(&tids);
-        for (step, max_tf) in [(13usize, 1u8), (11, 2), (17, 5), (9, 15), (3, 4)] {
+        for (step, max_tf) in [(23usize, 1u8), (21, 2), (29, 5), (19, 15), (11, 2), (3, 4)] {
             let members: Vec<Tid> = tids.iter().step_by(step).copied().collect();
             let slots: Vec<u32> = members
                 .iter()
@@ -4785,10 +4788,10 @@ mod tests {
                 let parsed = Postings::parse(&out, slots.len() as u32, &geometry).unwrap();
                 coded += usize::from(parsed.codes);
                 if options.length_codes && options.inline_lengths_max_df == 0 {
-                    assert_eq!(parsed.codes, slots.len() * 10 <= tids.len(), "{step}");
+                    assert_eq!(parsed.codes, coded_share(slots.len(), tids.len()), "{step}");
                 }
             }
-            assert_eq!(coded > 0, slots.len() * 10 <= tids.len(), "{step}");
+            assert_eq!(coded > 0, coded_share(slots.len(), tids.len()), "{step}");
         }
     }
 

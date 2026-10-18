@@ -3,10 +3,11 @@
 // See LICENSE in the repository root for license terms.
 
 //! Re-encodes dumped `TNS1` segments of page layout version 16 or 15 (one
-//! segment format) to version 18's length codes: records of at most a tenth of
-//! the documents hold their postings' length codes in their TF tails (step 5
-//! alone, from the file mapped; `--no-codes` writes none, a control; version
-//! 18's sub-range codes are written by a merge, `tnsmerge --stream`), and
+//! segment format) to the length codes (page layout 19): records of at most a
+//! twentieth of the documents hold their postings' length codes in their TF
+//! tails (step 5 alone, from the file mapped; `--no-codes` writes none, a
+//! control; version 18's sub-range codes are written by a merge, `tnsmerge
+//! --stream`), and
 //! of version 14, 13, 12, 11, 10, 9, 8 or 6 to version 15, whose positions are bit-packed per block of
 //! entries, whose grouped records' directories are rows of fixed width
 //! found by a group's rank and hold short lists as arrays, and whose DL
