@@ -4170,6 +4170,8 @@ const SUB_WORDS: usize = 16;
 /// Whether a disjunction's group counts its members' terms before weighing
 /// them (research6), and the most terms it counts to.
 const AT_LEAST: bool = true;
+/// The fewest members of a group's mask the count is taken for.
+const AT_LEAST_MIN: u64 = 128;
 
 /// Keeps the members of `mask` that at least `M` of `rows` hold.
 #[inline(never)]
@@ -4709,7 +4711,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // It keeps every member the weighing below would keep (a member's
         // bounds there are no higher than the group's), so it only spares
         // the weighing those it would cut (research6).
-        if AT_LEAST && terms.len() >= 2 && self.threshold().is_some() {
+        if AT_LEAST
+            && terms.len() >= 2
+            && self.threshold().is_some()
+            && kernels::popcount(&mask) >= AT_LEAST_MIN
+        {
             let mut sorted = std::mem::take(&mut self.or_sorted);
             sorted.clear();
             sorted.extend_from_slice(&bounds);
