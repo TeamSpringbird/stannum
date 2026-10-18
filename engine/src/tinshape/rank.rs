@@ -4541,6 +4541,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         sb.clear();
         sb.resize(n, 0.0);
         let mut total = 0.0_f32;
+        #[cfg(feature = "census")]
+        let (mut sparse_sum, mut sparse_n) = (0.0_f32, 0u64);
         for (i, bound) in sb.iter_mut().enumerate() {
             if self.present[i] {
                 // A grouped term's entry for the group is the one its seek
@@ -4551,9 +4553,16 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 } else {
                     s.range_bound(g, base, end)
                 };
+                #[cfg(feature = "census")]
+                if !s.grouped() {
+                    sparse_sum += *bound;
+                    sparse_n += 1;
+                }
                 total += *bound;
             }
         }
+        #[cfg(feature = "census")]
+        super::census::orf::add(28, sparse_n);
         let geometry = self.geometry;
         let gi = g as usize;
         if self.cut(total, || geometry.tid_in(gi, 0)) {
@@ -4562,6 +4571,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             super::census::orf::add(1, 1);
             self.sub_bounds = sb;
             return Ok(());
+        }
+        #[cfg(feature = "census")]
+        if sparse_n > 0 {
+            super::census::orf::add(29, sparse_n);
+            super::census::orf::add(30, 1);
+            if self.cut(total - sparse_sum, || geometry.tid_in(gi, 0)) {
+                super::census::orf::add(31, 1);
+            }
         }
         let words = group.words();
         // Rows are overwritten where read: only present terms' are.
@@ -4636,6 +4653,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         for (i, done) in loaded.iter().enumerate() {
             if self.present[i] && !done {
                 self.or_load(i, g, words)?;
+                #[cfg(feature = "census")]
+                {
+                    super::census::orf::add(33, 1);
+                    if self.row_state[i].entry == usize::MAX || !matches!(self.sc[i].grouped(), true) {
+                        super::census::orf::add(34, 1);
+                    }
+                    super::census::orf::add(36, u64::from(kernels::popcount_bytes(self.row_state[i].at.bytes())));
+                }
+            }
+        }
+        #[cfg(feature = "census")]
+        for (i, done) in loaded.iter().enumerate() {
+            if *done {
+                super::census::orf::add(35, u64::from(kernels::popcount_bytes(self.row_state[i].at.bytes())));
             }
         }
         self.row_loaded = loaded;
@@ -4699,6 +4730,44 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // conjunction there) and whose mask holds many (a `full_score`
         // disjunction of dense words; a `score` one's holds some 85, which
         // their own checks bound for less).
+        #[cfg(feature = "census")]
+        if self.threshold().is_some() {
+            let mut sorted: Vec<f32> = bounds.clone();
+            sorted.sort_by(|a, b| b.total_cmp(a));
+            let (mut acc, mut m) = (0.0_f32, 0usize);
+            while m < sorted.len() {
+                acc += sorted[m];
+                m += 1;
+                if !self.cut(acc, || geometry.tid_in(gi, 0)) {
+                    break;
+                }
+            }
+            let mut atleast = 0u64;
+            for (w, &mw) in mask.iter().enumerate() {
+                let mut left = mw;
+                while left != 0 {
+                    let bit = left.trailing_zeros();
+                    left &= left - 1;
+                    let cnt = rows.iter().filter(|r| r.word(w) >> bit & 1 == 1).count();
+                    if cnt >= m {
+                        atleast += 1;
+                    }
+                }
+            }
+            super::census::orf::add(37, 1);
+            super::census::orf::add(38, m as u64);
+            super::census::orf::add(39, atleast);
+            if m >= 2 {
+                super::census::orf::add(40, 1);
+            }
+            if m >= 3 {
+                super::census::orf::add(41, 1);
+            }
+            if m >= 4 {
+                super::census::orf::add(42, 1);
+            }
+            super::census::orf::add(43, terms.len() as u64);
+        }
         let sieving = plan.required.len() == terms.len()
             && kernels::popcount(&mask) >= OR_SIEVE_MIN
             && self.or_sieve(&terms, &sb);
