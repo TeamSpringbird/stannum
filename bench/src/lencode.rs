@@ -52,15 +52,7 @@ pub enum Code {
     Exact,
 }
 
-pub const CODES: [Code; 7] = [
-    Code::Class,
-    Code::Pow2,
-    Code::Escape(6),
-    Code::Escape(7),
-    Code::Escape(8),
-    Code::Float(8),
-    Code::Exact,
-];
+pub const CODES: [Code; 4] = [Code::Class, Code::Pow2, Code::Escape(8), Code::Float(8)];
 
 impl Code {
     pub fn bits(self) -> u64 {
@@ -124,16 +116,23 @@ impl Code {
 pub enum Policy {
     Tail,
     Capped(f64),
+    /// `Capped`'s records, only their blocks or groups with stored buckets.
+    TailCapped(f64),
 }
 
-pub const POLICIES: [Policy; 7] = [
+pub const POLICIES: [Policy; 12] = [
     Policy::Tail,
-    Policy::Capped(0.001),
     Policy::Capped(0.005),
     Policy::Capped(0.01),
+    Policy::Capped(0.02),
     Policy::Capped(0.03),
+    Policy::Capped(0.05),
     Policy::Capped(0.10),
     Policy::Capped(1.0),
+    Policy::TailCapped(0.01),
+    Policy::TailCapped(0.03),
+    Policy::TailCapped(0.05),
+    Policy::TailCapped(0.10),
 ];
 
 impl Policy {
@@ -142,6 +141,7 @@ impl Policy {
             Policy::Tail => "T".into(),
             Policy::Capped(x) if x >= 1.0 => "A".into(),
             Policy::Capped(x) => format!("<{}%", x * 100.0),
+            Policy::TailCapped(x) => format!("T<{}%", x * 100.0),
         }
     }
 
@@ -154,7 +154,7 @@ impl Policy {
     fn record(self, df: u32, documents: u64) -> bool {
         match self {
             Policy::Tail => true,
-            Policy::Capped(x) => f64::from(df) <= x * documents as f64,
+            Policy::Capped(x) | Policy::TailCapped(x) => f64::from(df) <= x * documents as f64,
         }
     }
 
@@ -164,7 +164,7 @@ impl Policy {
             && !h.carrier
             && self.record(h.df, documents)
             && match self {
-                Policy::Tail => h.width > 0,
+                Policy::Tail | Policy::TailCapped(_) => h.width > 0,
                 Policy::Capped(_) => true,
             }
     }
@@ -177,6 +177,7 @@ impl Policy {
         let coded = match self {
             Policy::Tail => tail,
             Policy::Capped(_) => self.record(df, documents),
+            Policy::TailCapped(_) => tail && self.record(df, documents),
         };
         if coded { u64::from(index) } else { 0 }
     }
@@ -246,15 +247,23 @@ pub fn sizes(segment: &Segment<'_>, blob: u64) -> SegmentSizes {
         }
         let tail = entry.max_tf_bucket > 0;
         for (i, p) in POLICIES.iter().enumerate().skip(1) {
-            if p.record(entry.df, s.documents) {
+            if matches!(p, Policy::Capped(_)) && p.record(entry.df, s.documents) {
                 s.covered[i] += df;
             }
         }
+        let tail_capped = |s: &mut SegmentSizes, n: u64| {
+            for (i, p) in POLICIES.iter().enumerate() {
+                if matches!(p, Policy::TailCapped(_)) && p.record(entry.df, s.documents) {
+                    s.covered[i] += n;
+                }
+            }
+        };
         match &p.form {
             Form::Grouped(dir) => {
                 for e in dir.entries(&geometry.groups).expect("a directory") {
                     if e.width > 0 {
                         s.covered[0] += u64::from(e.count);
+                        tail_capped(&mut s, u64::from(e.count));
                         s.tf_bits += u64::from(e.count) * u64::from(e.width);
                     }
                 }
@@ -281,6 +290,7 @@ pub fn sizes(segment: &Segment<'_>, blob: u64) -> SegmentSizes {
                     };
                     if *w > 0 {
                         s.covered[0] += n;
+                        tail_capped(&mut s, n);
                         s.tf_bits += n * u64::from(*w);
                     }
                 }
@@ -340,7 +350,7 @@ pub fn sizes_report(all: &[SegmentSizes]) -> String {
     let docs = sum(&|s| s.documents);
     let _ = writeln!(
         out,
-        "  (T: blocks or groups with stored buckets; <x%: records of at most x% of the segment's documents; A: all)"
+        "  (T: blocks or groups with stored buckets; <x%: records of at most x% of the segment's documents; T<x%: those records' blocks or groups with stored buckets; A: all)"
     );
     let mut acc = 0;
     let _ = write!(
