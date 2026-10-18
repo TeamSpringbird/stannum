@@ -4170,7 +4170,29 @@ const SUB_WORDS: usize = 16;
 /// Whether a disjunction's group counts its members' terms before weighing
 /// them (research6), and the most terms it counts to.
 const AT_LEAST: bool = true;
-const AT_LEAST_MAX: usize = 8;
+
+/// Keeps the members of `mask` that at least `M` of `rows` hold.
+#[inline(never)]
+fn at_least<const M: usize>(mask: &mut [u64], rows: &[RowAt]) {
+    for (w, word) in mask.iter_mut().enumerate() {
+        let live = *word;
+        if live == 0 {
+            continue;
+        }
+        // seen[k]: members held by more than k of the rows so far.
+        let mut seen = [0u64; M];
+        for row in rows {
+            let h = row.word(w) & live;
+            let mut k = M - 1;
+            while k > 0 {
+                seen[k] |= h & seen[k - 1];
+                k -= 1;
+            }
+            seen[0] |= h;
+        }
+        *word = seen[M - 1];
+    }
+}
 
 /// Whether a disjunction's words and members are weighed in lanes, by the
 /// weighing kernels (`kernels::word_sums`, `kernels::member_sums`), rather
@@ -4701,23 +4723,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
             }
             self.or_sorted = sorted;
-            let m = m.min(AT_LEAST_MAX);
-            if m >= 2 {
-                for (w, word) in mask.iter_mut().enumerate() {
-                    if *word == 0 {
-                        continue;
-                    }
-                    // seen[k]: members held by more than k of the rows so far.
-                    let mut seen = [0u64; AT_LEAST_MAX];
-                    for row in &rows {
-                        let h = row.word(w) & *word;
-                        for k in (1..m).rev() {
-                            seen[k] |= h & seen[k - 1];
-                        }
-                        seen[0] |= h;
-                    }
-                    *word = seen[m - 1];
-                }
+            match m {
+                0 | 1 => {}
+                2 => at_least::<2>(&mut mask, &rows),
+                3 => at_least::<3>(&mut mask, &rows),
+                _ => at_least::<4>(&mut mask, &rows),
             }
         }
         let sieving = plan.required.len() == terms.len()
