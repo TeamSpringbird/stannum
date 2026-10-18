@@ -47,11 +47,8 @@ pub const MAGIC: u32 = 0x4c44_5032;
 /// 15: positions bit-packed per block of entries at the block's widths.
 /// Version 16: a segment run's and a pending run's length in 64 bits on the
 /// meta page, a page table's length implied by its run. Version 17 (never
-/// shipped: two lanes' layouts, combined in 18). Version 18: a dense term's
-/// grouped record holds sub-range codes for its grids, and records of at most
-/// a tenth of a segment's documents hold each posting's length class after
-/// its block's (or group's) buckets in the TF tail. An index of
-/// an earlier version must be rebuilt.
+/// shipped). Version 18: a dense term's grouped record holds sub-range codes
+/// for its grids. An index of an earlier version must be rebuilt.
 pub const VERSION: u8 = 18;
 pub const SPECIAL_SIZE: usize = 8;
 pub const PAGE_SIZE: usize = pg_sys::BLCKSZ as usize;

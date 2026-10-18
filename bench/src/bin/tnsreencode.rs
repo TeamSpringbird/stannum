@@ -2,12 +2,8 @@
 //
 // See LICENSE in the repository root for license terms.
 
-//! Re-encodes dumped `TNS1` segments of page layout version 16 or 15 (one
-//! segment format) to version 18's length codes: records of at most a tenth of
-//! the documents hold their postings' length codes in their TF tails (step 5
-//! alone, from the file mapped; `--no-codes` writes none, a control; version
-//! 18's sub-range codes are written by a merge, `tnsmerge --stream`), and
-//! of version 14, 13, 12, 11, 10, 9, 8 or 6 to version 15, whose positions are bit-packed per block of
+//! Re-encodes dumped `TNS1` segments of page layout version 14, 13, 12, 11,
+//! 10, 9, 8 or 6 to version 15, whose positions are bit-packed per block of
 //! entries, whose grouped records' directories are rows of fixed width
 //! found by a group's rank and hold short lists as arrays, and whose DL
 //! sidecar holds length classes (or, with `--keep-records`, records as they
@@ -19,7 +15,7 @@
 //!
 //! ```text
 //! cargo run -p bench --release --bin tnsreencode -- --in DUMP_DIR --out OUT_DIR \
-//!     [--from 16|15|14|13|12|11|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--grid-share N] \
+//!     [--from 14|13|12|11|10|9|8|6] [--exact] [--segment FILE] [--grid-density N] [--grid-share N] \
 //!     [--arrays N] [--jobs N] [--check] [--check-merge] [--fresh] [--census] [--keep-records]
 //! ```
 //!
@@ -97,75 +93,13 @@ use segment::tinshape::docs::{GROUP_PAGES, Geometry, Lengths, encode_docset, enc
 use segment::tinshape::ef;
 use segment::tinshape::merge::{Input, merge, merge_afresh};
 use segment::tinshape::positions;
-use segment::tinshape::postings;
 use segment::tinshape::postings::{
     ARRAY_SLOTS_MAX, FORM_COMPACT, FORM_GROUPED, FORM_LENGTHS, FORM_ROUNDED, GroupEntry,
-    GroupFrontiers, KIND_EF, KIND_GRID, KIND_PAGED, Options, carries_codes, encode_directory,
-    for_each_local, group_frontier, put_group_frontier, tf_width,
+    GroupFrontiers, KIND_EF, KIND_GRID, KIND_PAGED, Options, encode_directory, for_each_local,
+    group_frontier, put_group_frontier, tf_width,
 };
 use segment::tinshape::segment::{Area, FLAG_LENGTH_CLASSES, Segment};
 use segment::tinshape::verify::verify_segment;
-
-/// Files mapped read-only for the process's life (a large segment re-encoded
-/// without its bytes copied into memory), and their resident pages dropped
-/// on demand by mapping each file again over itself.
-mod mapped {
-    use std::os::fd::AsRawFd;
-    use std::sync::Mutex;
-
-    const PROT_READ: i32 = 1;
-    const MAP_PRIVATE: i32 = 2;
-    const MAP_FIXED: i32 = 0x10;
-
-    unsafe extern "C" {
-        fn mmap(addr: *mut u8, len: usize, prot: i32, flags: i32, fd: i32, offset: i64) -> *mut u8;
-    }
-
-    static MAPS: Mutex<Vec<(usize, usize, std::fs::File)>> = Mutex::new(Vec::new());
-
-    pub fn map(path: &std::path::Path) -> std::io::Result<&'static [u8]> {
-        let file = std::fs::File::open(path)?;
-        let len = file.metadata()?.len() as usize;
-        // SAFETY: a fresh private read-only mapping of the whole file, never
-        // unmapped; the input is not written meanwhile.
-        let at = unsafe {
-            mmap(
-                std::ptr::null_mut(),
-                len,
-                PROT_READ,
-                MAP_PRIVATE,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if at as isize == -1 {
-            return Err(std::io::Error::last_os_error());
-        }
-        MAPS.lock().expect("maps").push((at as usize, len, file));
-        // SAFETY: the mapping lives as long as the process.
-        Ok(unsafe { std::slice::from_raw_parts(at, len) })
-    }
-
-    /// Maps every file again over itself: the same bytes at the same
-    /// addresses, none of them resident.
-    pub fn drop_resident() {
-        for (at, len, file) in MAPS.lock().expect("maps").iter() {
-            // SAFETY: the same file over its own read-only mapping: every
-            // slice into it reads the same bytes.
-            let got = unsafe {
-                mmap(
-                    *at as *mut u8,
-                    *len,
-                    PROT_READ,
-                    MAP_PRIVATE | MAP_FIXED,
-                    file.as_raw_fd(),
-                    0,
-                )
-            };
-            assert_eq!(got as usize, *at, "a remap moved");
-        }
-    }
-}
 
 /// The segment crate's unsigned LEB128 integers.
 mod varint {
@@ -212,18 +146,13 @@ struct Args {
     census: bool,
     keep_records: bool,
     fresh: bool,
-    /// `--no-codes`: records carry no length codes (layout 16's TF tails).
-    codes: bool,
-    /// `--merge`: from 16 or 15, merge each segment alone (step 5) rather
-    /// than re-encode only the records that gain codes.
-    merge: bool,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: tnsreencode --in DIR --out DIR [--from 16|15|14|13|12|11|10|9|8|6] [--exact] \
+        "usage: tnsreencode --in DIR --out DIR [--from 14|13|12|11|10|9|8|6] [--exact] \
          [--segment FILE] [--grid-density N] [--grid-share N] [--arrays N] [--jobs N] [--check] \
-         [--check-merge] [--fresh] [--census] [--keep-records] [--no-codes] [--merge]"
+         [--check-merge] [--fresh] [--census] [--keep-records]"
     );
     std::process::exit(2)
 }
@@ -245,8 +174,6 @@ fn args() -> Args {
         census: false,
         keep_records: false,
         fresh: false,
-        codes: true,
-        merge: false,
     };
     let value = |it: &mut std::iter::Skip<std::env::Args>| it.next().unwrap_or_else(|| usage());
     while let Some(arg) = it.next() {
@@ -265,15 +192,12 @@ fn args() -> Args {
             "--census" => a.census = true,
             "--keep-records" => a.keep_records = true,
             "--fresh" => a.fresh = true,
-            "--no-codes" => a.codes = false,
-            "--merge" => a.merge = true,
             _ => usage(),
         }
     }
     if a.input.as_os_str().is_empty()
         || a.output.as_os_str().is_empty()
-        || !matches!(a.from, 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14 | 15 | 16)
-        || (a.from >= 15 && a.keep_records)
+        || !matches!(a.from, 6 | 8 | 9 | 10 | 11 | 12 | 13 | 14)
         || (a.keep_records && a.from == 6)
         || a.jobs == 0
     {
@@ -443,7 +367,6 @@ fn parse_old<'r>(
             tf_bit: 0,
             width: 0,
             max_bucket: 0,
-            codes: 0,
         });
         body += len;
         first += count;
@@ -1037,7 +960,6 @@ fn legacy_entries(
             tf_bit: tf_bit as u32,
             width: width as u8,
             max_bucket,
-            codes: 0,
         });
         frontiers.extend_from_slice(&directory[from..at]);
         body += len;
@@ -1235,108 +1157,6 @@ fn positions_blocks(blob: &[u8], cost: &mut Cost) -> Result<Vec<u8>, String> {
     Ok(new)
 }
 
-/// Version 16 (or 15) to 17 without a merge, written to `path`: each record
-/// `postings::carries_codes` picks (none carrying its lengths inline) is
-/// encoded afresh from its slots, its buckets and its documents' lengths,
-/// as a merge encodes it (its containers what the options choose: a fresh
-/// encoding writes a copied container's bytes), now with its postings'
-/// length codes; every other record and area is copied, and the term map
-/// follows the records' new extents. Holds the new postings area and term
-/// map in memory, the input mapped (its resident pages dropped as it goes).
-/// Returns the bytes written. `--merge` checks it: the merge writes the
-/// same bytes.
-fn add_codes(blob: &[u8], args: &Args, path: &Path) -> Result<u64, String> {
-    use std::io::Write as _;
-    let segment = Segment::parse(blob).map_err(|e| e.to_string())?;
-    let (fields, _) = header_fields(blob)?;
-    let options = Options {
-        group_frontiers: args.mode,
-        grid_density: args.grid_density,
-        grid_min_share: args.grid_share,
-        array_max: args.array_max,
-        length_codes: args.codes,
-        ..Options::default()
-    };
-    let geometry = &segment.docs.geometry;
-    let postings_at = segment.area_at(Area::Postings);
-    let positions_at = segment.area_at(Area::Positions);
-    let mut out = Vec::with_capacity((positions_at - postings_at) * 21 / 20);
-    let mut dictionary = DictionaryBuilder::default();
-    let (mut coded, mut since) = (0u64, 0usize);
-    let err = |e: segment::Error| e.to_string();
-    for item in segment.dictionary().iter() {
-        let (term, entry) = item.map_err(err)?;
-        let from = postings_at + entry.ordinals.offset as usize;
-        let record = &blob[from..from + entry.ordinals.len as usize];
-        let at = out.len();
-        let df = entry.df as usize;
-        let found = segment.resolve(entry).map_err(err)?;
-        let p = &found.postings;
-        if args.codes && p.lengths.is_none() && !p.codes && carries_codes(df, segment.documents) {
-            let slots = p.slots(geometry).map_err(err)?;
-            let footer = p
-                .footer(
-                    geometry,
-                    segment.block_size,
-                    entry.max_tf_bucket,
-                    segment.adaptive_tf,
-                )
-                .map_err(err)?;
-            let mut buckets = Vec::with_capacity(df);
-            let mut lengths = Vec::with_capacity(df);
-            for (i, slot) in slots.iter().enumerate() {
-                buckets.push(footer.bucket(p.tf, i as u32).map_err(err)?);
-                let rank = segment
-                    .docs
-                    .rank(*slot)
-                    .ok_or("a posting without a document")?;
-                lengths.push(segment.lengths.get(rank).map_err(err)?);
-            }
-            postings::encode(geometry, &slots, &buckets, &lengths, &options, &mut out);
-            coded += 1;
-        } else {
-            out.extend_from_slice(record);
-        }
-        let moved = TermEntry {
-            ordinals: Extent {
-                offset: at as u64,
-                len: u32::try_from(out.len() - at).map_err(|e| e.to_string())?,
-            },
-            ..entry
-        };
-        dictionary.push(&term, moved).map_err(|e| e.to_string())?;
-        since += record.len();
-        if since > 1 << 28 {
-            since = 0;
-            segment.forget_borrowed();
-            mapped::drop_resident();
-        }
-    }
-    let dictionary = dictionary.finish();
-    let mut fields = fields.clone();
-    fields[4] = dictionary.len() as u64;
-    fields[5] = out.len() as u64;
-    let mut header = b"TNS1".to_vec();
-    for f in &fields {
-        varint::put(&mut header, *f);
-    }
-    let mut file = std::io::BufWriter::new(std::fs::File::create(path).map_err(|e| e.to_string())?);
-    let rest = &blob[positions_at..segment.bounds[7]];
-    for part in [&header[..], &dictionary[..], &out[..]] {
-        file.write_all(part).map_err(|e| e.to_string())?;
-    }
-    drop(out);
-    // The rest copied from the mapping a quarter GiB at a time, its pages
-    // dropped after each.
-    for chunk in rest.chunks(1 << 28) {
-        file.write_all(chunk).map_err(|e| e.to_string())?;
-        mapped::drop_resident();
-    }
-    file.flush().map_err(|e| e.to_string())?;
-    eprintln!("{coded} records given length codes");
-    Ok((header.len() + dictionary.len() + fields[5] as usize + rest.len()) as u64)
-}
-
 /// Step 5: `blob` merged alone, every record encoded over the grid of its
 /// documents: afresh (no container copied) when `fresh`.
 fn renumber(blob: &[u8], args: &Args, fresh: bool) -> Result<Vec<u8>, String> {
@@ -1352,7 +1172,6 @@ fn renumber(blob: &[u8], args: &Args, fresh: bool) -> Result<Vec<u8>, String> {
         grid_density: args.grid_density,
         grid_min_share: args.grid_share,
         array_max: args.array_max,
-        length_codes: args.codes,
         ..Options::default()
     };
     let merged = if fresh {
@@ -1370,61 +1189,23 @@ fn renumber(blob: &[u8], args: &Args, fresh: bool) -> Result<Vec<u8>, String> {
 /// and whether its checks passed.
 fn one(args: &Args, name: &str, cost: &mut Cost) -> Result<(String, bool), String> {
     let start = Instant::now();
-    // Versions 15 and 16 (one segment format) are only merged alone, from
-    // the file mapped: a large segment is not read into memory beside its
-    // merge's copies.
-    let mapped = if args.from >= 15 {
-        Some(mapped::map(&args.input.join(name)).map_err(|e| format!("{name}: {e}"))?)
-    } else {
-        None
-    };
-    let blob = match mapped {
-        Some(_) => Vec::new(),
-        None => std::fs::read(args.input.join(name)).map_err(|e| e.to_string())?,
-    };
-    let input: &[u8] = mapped.unwrap_or(&blob);
-    let before = area_sizes(input)?;
-    let source = input.len();
-    if args.from >= 15 && !args.merge {
-        let len = add_codes(input, args, &args.output.join(name))?;
-        mapped::drop_resident();
-        let written = mapped::map(&args.output.join(name)).map_err(|e| e.to_string())?;
-        let after = area_sizes(written)?;
-        let mut line = format!(
-            "{name}: {source} -> {len} bytes ({:+.3}%)",
-            100.0 * (len as f64 / source as f64 - 1.0)
-        );
-        for (i, area) in AREAS.iter().enumerate() {
-            line += &format!("; {area} {} -> {}", before[i], after[i]);
-        }
-        let mut ok = true;
-        if args.check {
-            let clean = verify_segment(written).is_clean();
-            line += &format!("; verifies {clean}");
-            ok &= clean;
-        }
-        mapped::drop_resident();
-        line += &format!("; {:.1} s", start.elapsed().as_secs_f64());
-        return Ok((line, ok));
+    let blob = std::fs::read(args.input.join(name)).map_err(|e| e.to_string())?;
+    let before = area_sizes(&blob)?;
+    let source = blob.len();
+    let mut new = if args.from >= 9 { blob } else { regrid(&blob)? };
+    new = positions_blocks(&new, cost)?;
+    if args.from == 6 {
+        new = reencode_v6(&new, args.mode, cost)?;
+    } else if args.from < 10 {
+        new = add_directory_lengths(&new, cost)?;
     }
-    let new = if args.from >= 15 {
-        renumber(input, args, args.fresh)?
+    if args.from < 14 {
+        new = directory_rows(&new, cost)?;
+    }
+    let new = if args.keep_records || args.from == 14 {
+        new
     } else {
-        let mut new = if args.from >= 9 { blob } else { regrid(&blob)? };
-        new = positions_blocks(&new, cost)?;
-        if args.from == 6 {
-            new = reencode_v6(&new, args.mode, cost)?;
-        } else if args.from < 10 {
-            new = add_directory_lengths(&new, cost)?;
-        }
-        if args.from < 14 {
-            new = directory_rows(&new, cost)?;
-        }
-        if args.keep_records || args.from == 14 {
-            new
-        } else {
-            renumber(&new, args, args.fresh)?
-        }
+        renumber(&new, args, args.fresh)?
     };
     let new = if header_fields(&new)?.0[3] & FLAG_LENGTH_CLASSES == 0 {
         add_length_classes(&new)?
