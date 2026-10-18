@@ -351,16 +351,16 @@ pub(super) fn mode() -> u8 {
 /// research6: a funnel of a disjunction's group and candidate work (offline only).
 pub mod orf {
     use std::sync::atomic::{AtomicU64, Ordering};
-    pub const NAMES: [&str; 44] = [
+    pub const NAMES: [&str; 46] = [
         "groups", "pruned_bound", "pruned_mask", "present", "present_loaded", "essential", "required",
         "words", "live_words", "mask_members", "kept_words", "members_weighed", "members_kept", "sieving_groups",
         "stage", "held", "cut_block", "class_first_reads", "class_first_cuts", "bucket_reads", "cut_buckets",
         "survivors", "class_after_reads", "class_after_cuts", "load_sparse", "load_grid", "load_container",
         "load_locals", "present_sparse", "sparse_nonpruned", "groups_with_sparse", "ceilA_sparse0_prunes",
         "x32", "nonessential_loads", "nonessential_sparse_loads", "essential_postings", "nonessential_postings",
-        "weighed_groups", "m_min_sum", "atleast_m_members", "m_ge2", "m_ge3", "m_ge4", "weighed_terms",
+        "weighed_groups", "m_min_sum", "atleast_m_members", "m_ge2", "m_ge3", "m_ge4", "weighed_terms", "best_L_members", "all_L_members",
     ];
-    pub static C: [AtomicU64; 44] = [const { AtomicU64::new(0) }; 44];
+    pub static C: [AtomicU64; 46] = [const { AtomicU64::new(0) }; 46];
     #[inline(always)]
     pub fn add(i: usize, v: u64) {
         C[i].fetch_add(v, Ordering::Relaxed);

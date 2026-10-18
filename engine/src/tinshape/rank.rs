@@ -4767,6 +4767,52 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 super::census::orf::add(42, 1);
             }
             super::census::orf::add(43, terms.len() as u64);
+            // Weighted: the L lightest terms left out of the count (their
+            // bounds summed into the bar's slack), the heavier ones counted
+            // to m_L; the best L per group, and all L together (ANDed).
+            let mut order: Vec<usize> = (0..bounds.len()).collect();
+            order.sort_by(|&a, &b| bounds[b].total_cmp(&bounds[a]));
+            let n = order.len();
+            let mut best = u64::MAX;
+            let mut all_mask: Vec<u64> = mask.clone();
+            for l in 0..n {
+                let heavy = &order[..n - l];
+                let light: f32 = order[n - l..].iter().map(|&i| bounds[i]).sum();
+                let (mut acc, mut ml) = (light, 0usize);
+                let mut reached = false;
+                while ml < heavy.len() {
+                    acc += bounds[heavy[ml]];
+                    ml += 1;
+                    if !self.cut(acc, || geometry.tid_in(gi, 0)) {
+                        reached = true;
+                        break;
+                    }
+                }
+                if !reached {
+                    // Even every heavy term with every light one is cut.
+                    best = 0;
+                    all_mask.iter_mut().for_each(|w| *w = 0);
+                    break;
+                }
+                let mut pass = 0u64;
+                for (w, &mw) in mask.iter().enumerate() {
+                    let mut keep = 0u64;
+                    let mut left = mw;
+                    while left != 0 {
+                        let bit = left.trailing_zeros();
+                        left &= left - 1;
+                        let cnt = heavy.iter().filter(|&&i| rows[i].word(w) >> bit & 1 == 1).count();
+                        if cnt >= ml {
+                            keep |= 1 << bit;
+                        }
+                    }
+                    pass += u64::from(keep.count_ones());
+                    all_mask[w] &= keep;
+                }
+                best = best.min(pass);
+            }
+            super::census::orf::add(44, best);
+            super::census::orf::add(45, all_mask.iter().map(|w| u64::from(w.count_ones())).sum::<u64>());
         }
         let sieving = plan.required.len() == terms.len()
             && kernels::popcount(&mask) >= OR_SIEVE_MIN
