@@ -846,6 +846,15 @@ impl LazyBlob {
             // drops this slice first.
             return Ok(unsafe { std::slice::from_raw_parts(data.add(within), to - from) });
         }
+        // CEILING HACK (replay only): a container across two pages adjacent
+        // in memory is read in place.
+        if kind == Kind::Container && (to - 1) / n == first + 1 {
+            if let (Some((a, alen)), Some((b, _))) = (self.page(first, kind)?, self.page(first + 1, kind)?) {
+                if alen == n && unsafe { a.add(n) } == b {
+                    return Ok(unsafe { std::slice::from_raw_parts(a.add(from - first * n), to - from) });
+                }
+            }
+        }
         // Across pages, or past the pages the source pins: stitched.
         let out = if kind == Kind::Container {
             self.containers.borrow_mut().alloc(to - from)
