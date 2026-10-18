@@ -1526,6 +1526,8 @@ struct Walk<'s, 'a, T: Touch> {
     or_bounds: Vec<f32>,
     or_sub: Vec<f32>,
     or_held: Vec<u64>,
+    /// The weighed terms' group bounds, largest first (research6).
+    or_sorted: Vec<f32>,
     /// A disjunction's candidate at hand: per scoring term it holds, the
     /// bound of the block or, once its bucket is read, of the bucket (see
     /// [`Walk::or_stage`]).
@@ -3947,6 +3949,7 @@ pub(super) fn walk_into<'s, 'a>(
         or_bounds: Vec::new(),
         or_sub: Vec::new(),
         or_held: Vec::new(),
+        or_sorted: Vec::new(),
         held_bound: vec![0.0; n],
         buckets: vec![NO_BUCKET; n],
         held_index: vec![0; n],
@@ -4163,6 +4166,11 @@ fn span_check<'a>(
 /// Words of a disjunction's sub-range: a group's members are bounded by
 /// their terms' blocks over this many words (1,024 slots) at a time.
 const SUB_WORDS: usize = 16;
+
+/// Whether a disjunction's group counts its members' terms before weighing
+/// them (research6), and the most terms it counts to.
+const AT_LEAST: bool = true;
+const AT_LEAST_MAX: usize = 8;
 
 /// Whether a disjunction's words and members are weighed in lanes, by the
 /// weighing kernels (`kernels::word_sums`, `kernels::member_sums`), rather
@@ -4672,6 +4680,46 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // conjunction there) and whose mask holds many (a `full_score`
         // disjunction of dense words; a `score` one's holds some 85, which
         // their own checks bound for less).
+        // A member must hold at least `m` of the weighed terms, `m` the
+        // fewest whose largest group bounds reach the bar (the sum of any
+        // fewer is cut): counted for every member of the mask at once, a
+        // word at a time, bit-sliced, before any member is weighed alone.
+        // It keeps every member the weighing below would keep (a member's
+        // bounds there are no higher than the group's), so it only spares
+        // the weighing those it would cut (research6).
+        if AT_LEAST && terms.len() >= 2 && self.threshold().is_some() {
+            let mut sorted = std::mem::take(&mut self.or_sorted);
+            sorted.clear();
+            sorted.extend_from_slice(&bounds);
+            sorted.sort_unstable_by(|a, b| b.total_cmp(a));
+            let (mut acc, mut m) = (0.0_f32, 0usize);
+            while m < sorted.len() {
+                acc += sorted[m];
+                m += 1;
+                if !self.cut(acc, || geometry.tid_in(gi, 0)) {
+                    break;
+                }
+            }
+            self.or_sorted = sorted;
+            let m = m.min(AT_LEAST_MAX);
+            if m >= 2 {
+                for (w, word) in mask.iter_mut().enumerate() {
+                    if *word == 0 {
+                        continue;
+                    }
+                    // seen[k]: members held by more than k of the rows so far.
+                    let mut seen = [0u64; AT_LEAST_MAX];
+                    for row in &rows {
+                        let h = row.word(w) & *word;
+                        for k in (1..m).rev() {
+                            seen[k] |= h & seen[k - 1];
+                        }
+                        seen[0] |= h;
+                    }
+                    *word = seen[m - 1];
+                }
+            }
+        }
         let sieving = plan.required.len() == terms.len()
             && kernels::popcount(&mask) >= OR_SIEVE_MIN
             && self.or_sieve(&terms, &sb);
