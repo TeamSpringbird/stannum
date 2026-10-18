@@ -2139,8 +2139,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             .extend(self.sc.iter().filter_map(|s| s.footer.borrowed()));
         // SAFETY: nothing read in place since the mark is used after but
         // what lies in `held` (see above): the members' slices were
-        // dropped just now, and the footers' windows are held.
-        unsafe { blob.release_since(mark, &self.held) };
+        // dropped just now, and the footers' windows are held. No
+        // container read since the last rewind is used after either: a
+        // walk reads containers only into its members, dropped above.
+        unsafe {
+            blob.release_since(mark, &self.held);
+            blob.rewind_containers();
+        }
         self.held.truncate(held);
     }
 

@@ -276,6 +276,34 @@ impl Stitches {
         at
     }
 
+    /// Frees what was handed out since the last rewind, keeping the span
+    /// open: the next stitch writes over the first block's start again,
+    /// lines still in cache. Unlike [`Self::clear`], nothing is dropped.
+    #[inline]
+    fn rewind(&mut self) {
+        // Debug builds poison what is freed, so a slice used past its
+        // rewind reads garbage rather than the right bytes by luck.
+        #[cfg(debug_assertions)]
+        {
+            let used = self.used;
+            let n = self.blocks.len();
+            for (i, block) in self.blocks.iter_mut().enumerate() {
+                let end = if i + 1 == n { used } else { block.len() };
+                block[..end].fill(MaybeUninit::new(0xA5));
+            }
+            for block in &mut self.large {
+                block.fill(MaybeUninit::new(0xA5));
+            }
+        }
+        self.used = 0;
+        if self.blocks.len() > 1 {
+            self.free_blocks.extend(self.blocks.drain(1..));
+        }
+        if !self.large.is_empty() {
+            self.free_large.append(&mut self.large);
+        }
+    }
+
     /// Ends the span: its buffers become free, the largest dropped past
     /// [`STITCH_KEEP`] bytes.
     fn clear(&mut self) {
@@ -339,6 +367,13 @@ pub struct LazyBlob {
     clock: Cell<u64>,
     used: Box<[Cell<u64>; PAGE_MEMO]>,
     stitches: RefCell<Stitches>,
+    /// Containers stitched across pages, freed by
+    /// [`Self::rewind_containers`] once a walk's group is done with them
+    /// rather than at the span's close: the stitches of a group or a few
+    /// reuse the same lines, where the span's buffers wrote some hundreds
+    /// of kilobytes of lines a query no longer in cache (straddling
+    /// containers were 17-21% of an x86 conjunction's L2 misses).
+    containers: RefCell<Stitches>,
 }
 
 impl Drop for LazyBlob {
@@ -386,6 +421,7 @@ impl LazyBlob {
             clock: Cell::new(0),
             used: Box::new([const { Cell::new(0) }; PAGE_MEMO]),
             stitches: RefCell::default(),
+            containers: RefCell::default(),
         }
     }
 
@@ -409,11 +445,25 @@ impl LazyBlob {
             + self.pages.len() * (std::mem::size_of::<PageRef>() + 8)
             + self.pinned.borrow().capacity() * std::mem::size_of::<usize>()
             + self.stitches.borrow().capacity()
+            + self.containers.borrow().capacity()
     }
 
     /// Bytes the open span stitched so far, freed when it closes.
     pub fn stitched(&self) -> usize {
-        self.stitches.borrow().bytes
+        self.stitches.borrow().bytes + self.containers.borrow().bytes
+    }
+
+    /// Frees the containers stitched across pages since the last call (or
+    /// the span's opening): the next is stitched over the same buffer.
+    ///
+    /// # Safety
+    ///
+    /// No slice of a container ([`Kind::Container`]) read within the open
+    /// span since the last call is used after: those stitched point into
+    /// a buffer written again.
+    #[inline]
+    pub unsafe fn rewind_containers(&self) {
+        self.containers.borrow_mut().rewind();
     }
 
     /// The whole blob as [`Bytes`].
@@ -451,6 +501,7 @@ impl LazyBlob {
         if depth == 0 {
             // The page memo's entries name the span: none is served after.
             self.stitches.borrow_mut().clear();
+            self.containers.borrow_mut().clear();
             self.pinned.borrow_mut().clear();
         }
         self.source.hold(false);
@@ -796,7 +847,11 @@ impl LazyBlob {
             return Ok(unsafe { std::slice::from_raw_parts(data.add(within), to - from) });
         }
         // Across pages, or past the pages the source pins: stitched.
-        let out = self.stitches.borrow_mut().alloc(to - from);
+        let out = if kind == Kind::Container {
+            self.containers.borrow_mut().alloc(to - from)
+        } else {
+            self.stitches.borrow_mut().alloc(to - from)
+        };
         let mut at = from;
         while at < to {
             let page = at / n;
