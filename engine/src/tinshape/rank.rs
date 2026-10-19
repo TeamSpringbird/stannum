@@ -4480,8 +4480,9 @@ fn grid_row(grid: Bytes<'_>, row: &mut [u64]) -> Result<RowAt> {
 /// What a scoring term's part of [`Walk::rows`] holds after its last
 /// load, so the next one clears no more than it must: the words a short
 /// list set there (noted as they were set), or any. Clearing a row whole is
-/// a 576-byte `memset` a load at 4,608 slots, most of them for a sparse
-/// term's or a small array's few members.
+/// a `memset` of 400 to 1,200 bytes a load; a disjunction's arrays (1.6
+/// loads a group at 150M rows) set 16 of 89 words, its sparse terms' lists
+/// (0.6 a group) 5.5 of 49.
 #[derive(Clone, Copy)]
 struct Dirt {
     /// How many of `at` hold the words set, or more than [`Dirt::NOTED`]:
@@ -4491,8 +4492,9 @@ struct Dirt {
 }
 
 impl Dirt {
-    /// Words noted at most: a list of up to this many members is noted.
-    const NOTED: usize = 16;
+    /// Words noted at most: past these, clearing them one at a time costs
+    /// about what clearing the row does.
+    const NOTED: usize = 32;
     const ANY: usize = usize::MAX;
 
     /// Any word may be set (as after a part is moved or made).
@@ -4662,7 +4664,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     if r.at.bytes().as_ptr() == row.as_ptr().cast() {
                         dirt.n = Dirt::ANY;
                     }
-                } else if e.kind == KIND_ARRAY && e.count as usize <= Dirt::NOTED {
+                } else if e.kind == KIND_ARRAY {
                     let starts = geometry.starts(g as usize);
                     let values = array_bytes(bytes.all()?, e.count, group_slots(starts))?;
                     dirt.clear(row);
