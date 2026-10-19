@@ -124,7 +124,8 @@ record  := slot varint [length varint]           when df = 1 (the bucket is the
                     containers, layout 10)
 form    := 1 sparse | 2 grouped, | 0x80 when lengths, | 0x40 when no footer
            (sparse), | 0x10 when the frontiers' lengths are rounded (grouped),
-           | 0x08 when sub-range codes (grouped, layout 18)
+           | 0x08 when sub-range codes (grouped, layout 18), | 0x20 when
+           length codes in the TF tail (layout 19; never with 0x80)
 subs    := (offset u32 LE) per directory entry (u32::MAX: none; else where
            its codes start after the offsets), then per grid entry, per
            64-slot sub-range in order, per pair k of its group frontier one
@@ -252,6 +253,32 @@ is 0 (every posting has tf 1), 1, 2, else 4. 2.3 bits per posting here
 against 4 at a fixed width (13.1 MB against 22.8 MB at 1M rows; packing
 per group rather than per byte-aligned block saved 46 MB of 1.7 GB at
 150M).
+
+Since page layout 19 a record of at most a twentieth of its segment's documents
+(`postings::carries_codes`; the form's bit `0x20`) also holds each
+posting's **length code**, its document's length class (the DL sidecar's,
+below), two bits after its group's buckets (a sparse record: after its
+block's, from a byte):
+
+```text
+tf := grouped: per group, buckets at its width, [codes at 2 bits];
+      sparse: per block, buckets at its width, [codes at 2 bits from a byte]
+```
+
+A ranked walk takes a candidate's class from the first scoring term it
+holds whose record carries codes, read beside the bucket it reads anyway
+(`Walk::length_floor`), and reads the class plane only for one holding none
+(a `full_score` walk's dense words). TIN keeps a per-posting length code in
+its TF tail (probe round 12 P5: about 1.2 bytes a posting wherever tf
+varies, and no DL page read for short documents). An 8-bit code exact
+below 255 would serve 94-98% of `score` DL reads too, but costs +10% of
+the index on these records (+18% on all); two bits cost +2.5% (0.92 GB at
+150M rows, 3.7 of the 6.8 billion postings) and serve 74% of the class
+pages a `score` disjunction read. Layout 18's trial coded the records of up
+to a tenth (+3.0%): the census (`tnsreplay --lencode`, `bench::lencode`)
+found those of a twentieth to a tenth save few class reads and lengthen the
+TF tails of `full_score` conjunctions' denser words (their length and TF
+lines +2.1% against +0.5%), so they carry none.
 
 ### Positions
 
