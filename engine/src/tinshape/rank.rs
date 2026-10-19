@@ -1531,6 +1531,11 @@ struct Walk<'s, 'a, T: Touch> {
     or_order: Vec<usize>,
     or_heavy: Vec<usize>,
     or_counted: Vec<RowAt>,
+    /// A disjunction group's terms whose rows are read only once a member
+    /// is left in reach (see `Walk::or_group`), and a row holding every
+    /// member, which stands in for theirs until then.
+    or_lazy: Vec<usize>,
+    or_ones: Vec<u64>,
     /// A disjunction's candidate at hand: per scoring term it holds, the
     /// bound of the block or, once its bucket is read, of the bucket (see
     /// [`Walk::or_stage`]).
@@ -3955,6 +3960,8 @@ pub(super) fn walk_into<'s, 'a>(
         or_order: Vec::new(),
         or_heavy: Vec::new(),
         or_counted: Vec::new(),
+        or_lazy: Vec::new(),
+        or_ones: Vec::new(),
         held_bound: vec![0.0; n],
         buckets: vec![NO_BUCKET; n],
         held_index: vec![0; n],
@@ -4618,6 +4625,43 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         Ok(())
     }
 
+    /// Whether scoring term `i`'s row in the group at hand may be read only
+    /// once a member is left in reach: any but a grid, which is read in
+    /// place.
+    #[inline]
+    fn or_lazy_row(&self, i: usize) -> bool {
+        let t = self.sc[i].term;
+        let set = self.terms[t].as_ref().expect("scoring");
+        if matches!(set.postings.form, Form::Sparse(_)) {
+            return true;
+        }
+        !matches!(set.group_at(self.mems[t].hint).src,
+            Src::Container { entry, .. } if entry.kind == KIND_GRID)
+    }
+
+    /// Reads the rows of group `g` (of `words` words) left unread, `lazy`,
+    /// in place of the full row each weighed one among `terms` stood in
+    /// with in `rows`.
+    #[inline(never)]
+    fn or_load_lazy(
+        &mut self,
+        lazy: &mut Vec<usize>,
+        terms: &[usize],
+        rows: &mut [RowAt],
+        g: u32,
+        words: usize,
+    ) -> Result<()> {
+        for &i in lazy.iter() {
+            self.or_load(i, g, words)?;
+            self.row_loaded[i] = true;
+            if let Some(t) = terms.iter().position(|&x| x == i) {
+                rows[t] = self.row_state[i].at;
+            }
+        }
+        lazy.clear();
+        Ok(())
+    }
+
     /// [`Walk::or_group_in`] for group `g`: on x86-64 built with POPCNT
     /// and BMI where the CPU has them ([`kernels::bit_ops`]), its
     /// candidates too.
@@ -4762,12 +4806,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             self.plan = plan;
             return Ok(());
         }
-        for (i, done) in loaded.iter().enumerate() {
-            if self.present[i] && !done {
-                self.or_load(i, g, words)?;
-            }
-        }
-        self.row_loaded = loaded;
         // Each member of the mask weighed alone: the bounds of the terms it
         // holds, summed, must reach the threshold. A word's members are
         // weighed first all at once, by the group's bounds of the terms
@@ -4790,14 +4828,82 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         terms.clear();
         rows.clear();
         bounds.clear();
+        if self.or_ones.len() < words {
+            self.or_ones.resize(words, !0);
+        }
+        let ones = RowAt::of(&self.or_ones[..words]);
         for p in 0..self.present_list.len() {
             let i = self.present_list[p];
             if sb[i] > 0.0 {
                 terms.push(i);
-                rows.push(self.row_state[i].at);
+                rows.push(ones);
                 bounds.push(sb[i]);
             }
         }
+        // A member must hold at least `m` of the heavier weighed terms (see
+        // `count_plan`): counted for every member of the mask at once, four
+        // words at a time, bit-sliced, before any member is weighed alone.
+        // It keeps every member the weighing below would keep, so it only
+        // spares the weighing those it would cut (research6).
+        let mut order = std::mem::take(&mut self.or_order);
+        let mut heavy = std::mem::take(&mut self.or_heavy);
+        let count = match self.threshold() {
+            Some(theta) if terms.len() >= 2 && kernels::popcount(&mask) >= COUNT_MIN => {
+                count_plan(&bounds, theta, &mut order, &mut heavy)
+            }
+            _ => None,
+        };
+        let mut counted_terms = 0u64;
+        if count.is_some() {
+            for &t in &heavy {
+                counted_terms |= 1 << t;
+            }
+        }
+        // The other terms' rows: read now if counted (or if every weighed
+        // term is required, where the sieve may read them), else, if not a
+        // grid read in place, only once a member is left in reach by the
+        // weighing below, which bounds every member by their bounds until
+        // then, as if it held them all. At 150 million rows those terms
+        // carry 3 (`score`) to 12 (`full_score`) times the postings of the
+        // terms that make the mask, and most groups' masks leave no member
+        // in reach.
+        let lazy_ok = self.threshold().is_some() && plan.required.len() != terms.len();
+        let mut lazy = std::mem::take(&mut self.or_lazy);
+        lazy.clear();
+        let mut t = 0;
+        for p in 0..self.present_list.len() {
+            let i = self.present_list[p];
+            let weighed = sb[i] > 0.0;
+            if !loaded[i] {
+                let counted = weighed && t < 64 && counted_terms >> t & 1 == 1;
+                if lazy_ok && !counted && self.or_lazy_row(i) {
+                    lazy.push(i);
+                } else {
+                    self.or_load(i, g, words)?;
+                    loaded[i] = true;
+                }
+            }
+            if weighed {
+                if loaded[i] {
+                    rows[t] = self.row_state[i].at;
+                }
+                t += 1;
+            }
+        }
+        self.row_loaded = loaded;
+        if let Some(m) = count {
+            let mut counted = std::mem::take(&mut self.or_counted);
+            counted.clear();
+            counted.extend(heavy.iter().map(|&t| rows[t]));
+            match m {
+                2 => at_least::<2>(&mut mask, &counted),
+                3 => at_least::<3>(&mut mask, &counted),
+                _ => at_least::<COUNT_MAX>(&mut mask, &counted),
+            }
+            self.or_counted = counted;
+        }
+        self.or_order = order;
+        self.or_heavy = heavy;
         // A grouped term's sub-range bounds are its group bound, set once; a
         // sparse term's are taken per sub-range below. Without a sparse
         // term, every sub-range's sum is the group's.
@@ -4815,31 +4921,6 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut sums = [0.0_f32; SUB_WORDS];
         let mut member_sums = [0.0_f32; 64];
         let mut bits = [0u8; 64];
-        // A member must hold at least `m` of the heavier weighed terms (see
-        // `count_plan`): counted for every member of the mask at once, four
-        // words at a time, bit-sliced, before any member is weighed alone.
-        // It keeps every member the weighing below would keep, so it only
-        // spares the weighing those it would cut (research6).
-        if let Some(theta) = self.threshold()
-            && terms.len() >= 2
-            && kernels::popcount(&mask) >= COUNT_MIN
-        {
-            let mut order = std::mem::take(&mut self.or_order);
-            let mut heavy = std::mem::take(&mut self.or_heavy);
-            if let Some(m) = count_plan(&bounds, theta, &mut order, &mut heavy) {
-                let mut counted = std::mem::take(&mut self.or_counted);
-                counted.clear();
-                counted.extend(heavy.iter().map(|&t| rows[t]));
-                match m {
-                    2 => at_least::<2>(&mut mask, &counted),
-                    3 => at_least::<3>(&mut mask, &counted),
-                    _ => at_least::<COUNT_MAX>(&mut mask, &counted),
-                }
-                self.or_counted = counted;
-            }
-            self.or_order = order;
-            self.or_heavy = heavy;
-        }
         // The members left after the weighing below are sieved by their
         // buckets a chunk at a time before each is bounded alone, in a
         // group whose every weighed term is required (the disjunction is a
@@ -4933,45 +5014,57 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             *h = row.word(w);
                         }
                     }
-                    // Each member's verdict without a branch on it (see
-                    // `BarKey::keeps`), at the bar as it stands now.
-                    let bar = BarKey::of(self.bar).expect("weighed under a bar");
-                    let mut keep = 0u64;
-                    if WEIGH_IN_LANES && word.count_ones() as usize >= MEMBER_LANES {
-                        let mut n = 0;
-                        let mut left = word;
-                        while left != 0 {
-                            bits[n] = left.trailing_zeros() as u8;
-                            n += 1;
-                            left &= left - 1;
-                        }
-                        let member_sums = &mut member_sums[..n];
-                        member_sums.fill(0.0);
-                        kernels::member_sums(&held, &bits[..n], &sub, member_sums);
-                        for (&bit, &sum) in bits[..n].iter().zip(member_sums.iter()) {
-                            let bit = u32::from(bit);
-                            let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
-                            keep |= u64::from(bar.keeps(sum, tid)) << bit;
-                        }
-                    } else {
-                        let mut left = word;
-                        while left != 0 {
-                            let bit = left.trailing_zeros();
-                            left &= left - 1;
-                            let mut sum = 0.0_f32;
-                            for (h, &bound) in held.iter().zip(&sub) {
-                                sum += or_zero(bound, *h >> bit & 1 == 1);
+                    // Weighed again, by every term's own row, once the rows
+                    // left unread are read (see the plan above).
+                    let keep = loop {
+                        // Each member's verdict without a branch on it (see
+                        // `BarKey::keeps`), at the bar as it stands now.
+                        let bar = BarKey::of(self.bar).expect("weighed under a bar");
+                        let mut keep = 0u64;
+                        if WEIGH_IN_LANES && word.count_ones() as usize >= MEMBER_LANES {
+                            let mut n = 0;
+                            let mut left = word;
+                            while left != 0 {
+                                bits[n] = left.trailing_zeros() as u8;
+                                n += 1;
+                                left &= left - 1;
                             }
-                            let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
-                            keep |= u64::from(bar.keeps(sum, tid)) << bit;
+                            let member_sums = &mut member_sums[..n];
+                            member_sums.fill(0.0);
+                            kernels::member_sums(&held, &bits[..n], &sub, member_sums);
+                            for (&bit, &sum) in bits[..n].iter().zip(member_sums.iter()) {
+                                let bit = u32::from(bit);
+                                let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
+                                keep |= u64::from(bar.keeps(sum, tid)) << bit;
+                            }
+                        } else {
+                            let mut left = word;
+                            while left != 0 {
+                                let bit = left.trailing_zeros();
+                                left &= left - 1;
+                                let mut sum = 0.0_f32;
+                                for (h, &bound) in held.iter().zip(&sub) {
+                                    sum += or_zero(bound, *h >> bit & 1 == 1);
+                                }
+                                let tid = || geometry.tid_in(gi, (w * 64) as u32 + bit);
+                                keep |= u64::from(bar.keeps(sum, tid)) << bit;
+                            }
                         }
-                    }
+                        if keep == 0 || lazy.is_empty() {
+                            break keep;
+                        }
+                        self.or_load_lazy(&mut lazy, &terms, &mut rows, g, words)?;
+                        for (h, row) in held.iter_mut().zip(&rows) {
+                            *h = row.word(w);
+                        }
+                    };
                     word = keep;
                 }
                 if sieving {
                     self.or_keep(g, base, w, word)?;
                     continue;
                 }
+                debug_assert!(word == 0 || lazy.is_empty());
                 while word != 0 {
                     let bit = word.trailing_zeros();
                     word &= word - 1;
@@ -4988,6 +5081,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if !self.staged.is_empty() {
             self.finish_staged(g)?;
         }
+        self.or_lazy = lazy;
         self.or_terms = terms;
         self.or_rows = rows;
         self.or_bounds = bounds;
