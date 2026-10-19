@@ -4584,6 +4584,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let end = group.slot_base + group.slots();
             let mut out = kernels::RowPut::new();
             cursor.drain_below(end, |slot| out.put(row, slot - group.slot_base));
+            #[cfg(feature = "census")]
+            super::census::ml_load(5, row);
             return Ok(());
         }
         // The entry `run_or`'s seek found for the group, in the hint.
@@ -4604,15 +4606,28 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 r.first = e.first;
                 if e.kind == KIND_GRID {
                     r.at = grid_row(bytes, row)?;
+                    #[cfg(feature = "census")]
+                    super::census::ml_load(
+                        if bytes.page_end(0) == bytes.len() {
+                            0
+                        } else {
+                            1
+                        },
+                        row,
+                    );
                 } else {
                     row.fill(0);
                     kernels::container_row(&e, bytes.all()?, geometry.starts(g as usize), row)?;
+                    #[cfg(feature = "census")]
+                    super::census::ml_load(if e.kind == KIND_EF { 3 } else { 2 }, row);
                 }
             }
             Src::Locals { from, to } => {
                 r.first = from;
                 row.fill(0);
                 kernels::set_ascending(&set.locals[from as usize..to as usize], row);
+                #[cfg(feature = "census")]
+                super::census::ml_load(4, row);
             }
         }
         Ok(())
@@ -4755,6 +4770,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             kernels::andnot_words(&mut mask, dead);
         }
         if !kernels::any_set(&mask) {
+            #[cfg(feature = "census")]
+            super::census::ml_group(true);
             self.answer.windows_pruned += 1;
             self.words = mask;
             self.row_loaded = loaded;
@@ -4768,6 +4785,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
         }
         self.row_loaded = loaded;
+        #[cfg(feature = "census")]
+        super::census::ml_group(false);
         // Each member of the mask weighed alone: the bounds of the terms it
         // holds, summed, must reach the threshold. A word's members are
         // weighed first all at once, by the group's bounds of the terms

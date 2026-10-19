@@ -347,3 +347,76 @@ pub fn replay() {
 pub(super) fn mode() -> u8 {
     MODE.with(Cell::get)
 }
+
+/// Lab counters for lane maskload: what a disjunction's `or_load` decodes,
+/// per kind (0 grid in place, 1 grid copied, 2 array, 3 EF, 4 locals,
+/// 5 sparse): loads, members, nonzero words, and loads by members
+/// (1, 2-4, 5-8, 9-16, 17-32, 33-64, 65-128, 129+). Offline only.
+pub static ML: [std::sync::atomic::AtomicU64; 96] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 96];
+
+pub fn ml_load(kind: usize, row: &[u64]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let members: u64 = row.iter().map(|w| u64::from(w.count_ones())).sum();
+    let words = row.iter().filter(|w| **w != 0).count() as u64;
+    let b = kind * 12;
+    ML[b].fetch_add(1, Relaxed);
+    ML[b + 1].fetch_add(members, Relaxed);
+    ML[b + 2].fetch_add(words, Relaxed);
+    ML[b + 3].fetch_add(row.len() as u64, Relaxed);
+    let h = match members {
+        0..=1 => 0,
+        2..=4 => 1,
+        5..=8 => 2,
+        9..=16 => 3,
+        17..=32 => 4,
+        33..=64 => 5,
+        65..=128 => 6,
+        _ => 7,
+    };
+    ML[b + 4 + h].fetch_add(1, Relaxed);
+}
+
+pub fn ml_group(pruned: bool) {
+    ML[90 + usize::from(pruned)].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn ml_dump() {
+    let g = |i: usize| ML[i].load(std::sync::atomic::Ordering::Relaxed);
+    let groups = (g(90) + g(91)).max(1) as f64;
+    println!(
+        "mlcensus groups {} (mask empty/pruned after loads {})",
+        g(90) + g(91),
+        g(91)
+    );
+    for (k, name) in [
+        "grid-inplace",
+        "grid-copied",
+        "array",
+        "ef",
+        "locals",
+        "sparse",
+    ]
+    .iter()
+    .enumerate()
+    {
+        let b = k * 12;
+        let n = g(b).max(1) as f64;
+        println!(
+            "mlcensus {name}: loads {} ({:.2}/group) members/load {:.1} words/load {:.1} of {:.1}; by members 1 {} 2-4 {} 5-8 {} 9-16 {} 17-32 {} 33-64 {} 65-128 {} 129+ {}",
+            g(b),
+            g(b) as f64 / groups,
+            g(b + 1) as f64 / n,
+            g(b + 2) as f64 / n,
+            g(b + 3) as f64 / n,
+            g(b + 4),
+            g(b + 5),
+            g(b + 6),
+            g(b + 7),
+            g(b + 8),
+            g(b + 9),
+            g(b + 10),
+            g(b + 11)
+        );
+    }
+}
