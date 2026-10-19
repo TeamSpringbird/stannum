@@ -32,15 +32,16 @@ use segment::tinshape::docs::{Geometry, Group};
 use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::{Block, Positions};
 use segment::tinshape::postings::{
-    Directory, Form, GroupEntry, GroupFrontier, InOrder, KIND_ARRAY, KIND_EF, KIND_GRID,
-    LazyFooter, SUB_NONE, SubCodes, array_bytes, fold_group_frontier, higher, lower,
+    CODE_BITS, Directory, Form, GroupEntry, GroupFrontier, InOrder, KIND_ARRAY, KIND_EF, KIND_GRID,
+    LazyFooter, SUB_NONE, SubCodes, array_bytes, code_floor, fold_group_frontier, higher, lower,
     rounded_length,
 };
 use segment::tinshape::segment::Segment;
 use segment::{Error, Result};
 
 use super::{
-    Node, Part, RankedAnswer, Src, TermSet, Touch, kernels, matches, open_terms, required_terms,
+    HeldTf, LengthKind, LengthRead, Node, Part, RankedAnswer, Src, TermSet, TfRead, Touch, kernels,
+    matches, open_terms, required_terms,
 };
 use crate::bm25::TermScorer;
 use crate::walk::{Ranked, TopRows, Visibility};
@@ -256,6 +257,33 @@ impl<'a> Bounds<'_, 'a> {
         }
     }
 
+    /// Where block `b`'s buckets start in the TF tail, in bits, their width,
+    /// the block's first posting index and its postings, of a record of
+    /// `df` (for the census of length codes; a width of 0 where no bucket is
+    /// stored).
+    #[cold]
+    fn census_layout(&self, b: usize, df: u32) -> (usize, u32, u32, u32) {
+        match self {
+            Self::Blocks(f) => {
+                if f.single().is_some() || b >= f.decoded() {
+                    (0, 0, 0, 1)
+                } else {
+                    let first = b as u32 * f.block_size();
+                    (
+                        f.tf_at(b) as usize * 8,
+                        f.width(b),
+                        first,
+                        f.block_size().min(df - first),
+                    )
+                }
+            }
+            Self::Groups(g) => {
+                let e = g.entry(b);
+                (e.tf_bit as usize, u32::from(e.width), e.first, e.count)
+            }
+        }
+    }
+
     /// Where block `b`'s buckets start in the TF tail, in bytes (for page
     /// accounting).
     #[inline]
@@ -263,6 +291,20 @@ impl<'a> Bounds<'_, 'a> {
         match self {
             Self::Blocks(f) => f.tf_at(b) as usize,
             Self::Groups(g) => g.entry(b).tf_bit as usize / 8,
+        }
+    }
+
+    /// Where posting `index`, which block `b` holds, keeps its length code
+    /// in the record's TF tail, in bits; `None` when the record carries
+    /// none.
+    #[inline]
+    fn code_bit(&mut self, b: usize, index: u32) -> Result<Option<usize>> {
+        match self {
+            Self::Blocks(f) => f.code_bit(index),
+            Self::Groups(g) => {
+                let e = g.entry(b);
+                Ok((e.codes > 0).then(|| e.code_bit(index)))
+            }
         }
     }
 
@@ -401,6 +443,8 @@ pub(super) struct Sc<'s, 'a> {
     /// at most at the class's shortest length: [`Walk::class_reach`] sums
     /// them where a candidate's class bounds it.
     class_scores: [[f32; BUCKET_COUNT]; 4],
+    /// Whether the term's record carries its postings' length codes.
+    pub(super) codes: bool,
 }
 
 /// A footer block past what a walk could reach was asked for, or a block
@@ -452,6 +496,7 @@ impl<'s, 'a> Sc<'s, 'a> {
             floors_block: u32::MAX,
             common: None,
             class_scores: [[0.0; BUCKET_COUNT]; 4],
+            codes: set.postings.codes,
         })
     }
 
@@ -1526,6 +1571,11 @@ struct Walk<'s, 'a, T: Touch> {
     or_bounds: Vec<f32>,
     or_sub: Vec<f32>,
     or_held: Vec<u64>,
+    /// A disjunction group's term count (see [`count_plan`]): its weighed
+    /// terms by bound, the counted ones, and their rows.
+    or_order: Vec<usize>,
+    or_heavy: Vec<usize>,
+    or_counted: Vec<RowAt>,
     /// A disjunction's candidate at hand: per scoring term it holds, the
     /// bound of the block or, once its bucket is read, of the bucket (see
     /// [`Walk::or_stage`]).
@@ -1577,6 +1627,11 @@ struct Walk<'s, 'a, T: Touch> {
     /// a span, its posting indexes; and the order they are finished in.
     staged: Vec<(f32, u32, u32)>,
     staged_buckets: Vec<u8>,
+    /// For the census of length codes only ([`Touch::census`]): per staged
+    /// candidate, what [`Walk::census_held`] knew of each scoring term as
+    /// it was staged, and the staged candidate being finished's.
+    census_staged: Vec<HeldTf>,
+    census_now: Vec<HeldTf>,
     staged_span: Vec<u32>,
     staged_order: Vec<u32>,
     cands: Vec<u32>,
@@ -2631,6 +2686,19 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 set.at + set.postings.tf_at + from + a / 8,
                 b.div_ceil(8) - a / 8,
             );
+            if self.touch.census() {
+                self.touch.census_tf(&TfRead {
+                    tf: set.at + set.postings.tf_at,
+                    record: set.at,
+                    start_bit: e.tf_bit as usize,
+                    width,
+                    first: e.first,
+                    from_bit: from * 8 + a,
+                    to_bit: from * 8 + b,
+                    tail: set.max_bucket > 0,
+                    df: set.df,
+                });
+            }
         }
         // Those dropped were examined (bounded) as those left will be.
         self.answer.candidates += dropped;
@@ -2738,6 +2806,19 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     set.at + set.postings.tf_at + read.start,
                     read.len(),
                 );
+                if self.touch.census() {
+                    self.touch.census_tf(&TfRead {
+                        tf: set.at + set.postings.tf_at,
+                        record: set.at,
+                        start_bit: st.group.tf_bit as usize,
+                        width: u32::from(st.group.width),
+                        first: st.group.first,
+                        from_bit: read.start * 8,
+                        to_bit: read.end * 8,
+                        tail: set.max_bucket > 0,
+                        df: set.df,
+                    });
+                }
             }
             // The buckets seen, bounded once per group.
             let (mut table, mut floors) = (st.table, st.floors);
@@ -3235,6 +3316,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         };
         self.staged.push((reach, local, length));
         self.staged_buckets.extend_from_slice(&self.buckets);
+        if self.touch.census() {
+            self.census_stage();
+        }
         if matches!(self.verify, Verify::Span(_)) {
             self.staged_span.extend_from_slice(&self.span_index);
         }
@@ -3288,6 +3372,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.staged_order = order;
         self.staged_buckets.clear();
         self.staged_span.clear();
+        self.census_staged.clear();
         result
     }
 
@@ -3302,6 +3387,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let width = self.span_index.len();
             self.span_index
                 .copy_from_slice(&self.staged_span[i * width..(i + 1) * width]);
+        }
+        if self.touch.census() && self.census_staged.len() >= (i + 1) * n {
+            self.census_now.clear();
+            self.census_now
+                .extend_from_slice(&self.census_staged[i * n..(i + 1) * n]);
+            let result = self.finish(g, local, length);
+            self.census_now.clear();
+            return result;
         }
         self.finish(g, local, length)
     }
@@ -3399,6 +3492,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // A walk with nothing to score (every term elided) scores nothing,
         // and needs no length.
         let length = if length == u32::MAX && n > 0 {
+            if self.touch.census() {
+                self.census_length(g, local, LengthKind::Dl, 0);
+            }
             self.dl_length(g, local)?
         } else {
             length
@@ -3605,6 +3701,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             bucket
         };
+        if self.touch.census() {
+            self.census_tf_one(i, block, index);
+        }
         self.buckets[i] = bucket;
         Ok(bucket)
     }
@@ -3662,7 +3761,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if !self.cut(at_top, tid) {
             return Ok(Some(reach));
         }
-        let c = self.class_of(g, local)?;
+        if self.touch.census() {
+            self.census_length(g, local, LengthKind::ClassLed, floor);
+        }
+        let c = self.length_class(g, local, false)?;
         let class = floors[c];
         if class <= floor {
             return Ok(Some(reach));
@@ -3677,6 +3779,70 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(None);
         }
         Ok(Some(bound))
+    }
+
+    /// The length code of the candidate at hand from the first scoring term
+    /// it holds whose record carries codes (a disjunction's
+    /// [`Walk::held_list`] with `or`, else the terms whose buckets were
+    /// read), beside its buckets in the TF tail (page layout 19: TIN's TF
+    /// tail keeps a length code a posting); `None` when none carries codes.
+    /// A code is its document's length class
+    /// ([`segment::tinshape::docs::LENGTH_CLASSES`]).
+    #[inline]
+    fn held_code(&mut self, or: bool) -> Result<Option<u8>> {
+        let n = if or {
+            self.held_list.len()
+        } else {
+            self.sc.len()
+        };
+        for k in 0..n {
+            let i = if or { self.held_list[k] } else { k };
+            if !self.sc[i].codes || (!or && usize::from(self.buckets[i]) >= BUCKET_COUNT) {
+                continue;
+            }
+            let index = self.held_index[i];
+            let s = &mut self.sc[i];
+            let block = if or {
+                self.blocks[i]
+            } else {
+                s.block_of(index, self.mems[s.term].entry)
+            };
+            let Some(bit) = s.footer.code_bit(block, index)? else {
+                continue;
+            };
+            let set = self.terms[s.term].as_ref().expect("scoring");
+            let bytes = set.postings.tf.window(bit / 8, 8)?;
+            let code = bits::get_at(bytes, bit % 8, CODE_BITS)? as u8;
+            self.touch
+                .touch(Part::TfTail, set.at + set.postings.tf_at + bit / 8, 1);
+            return Ok(Some(code));
+        }
+        Ok(None)
+    }
+
+    /// The shortest length of the length class of the candidate at slot
+    /// `local` of group `g`: from a held term's length code
+    /// ([`Walk::held_code`]), else from the DL sidecar's class plane
+    /// ([`Walk::class_floor`]).
+    #[inline]
+    fn length_floor(&mut self, g: u32, local: u32, or: bool) -> Result<u32> {
+        match self.held_code(or)? {
+            Some(code) => Ok(code_floor(code)),
+            None => self.class_floor(g, local),
+        }
+    }
+
+    /// The length class of the candidate at slot `local` of group `g`, in a
+    /// segment with classes (whose floors are
+    /// [`segment::tinshape::docs::LENGTH_CLASSES`]'s, as a code's are): from
+    /// a held term's length code, else from the class plane
+    /// ([`Walk::class_of`]).
+    #[inline]
+    fn length_class(&mut self, g: u32, local: u32, or: bool) -> Result<usize> {
+        match self.held_code(or)? {
+            Some(code) => Ok(usize::from(code) % 4),
+            None => self.class_of(g, local),
+        }
     }
 
     /// The shortest length of the length class of the document at slot
@@ -3736,6 +3902,155 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         self.touch.touch(Part::DlSidecar, header, 8);
         self.touch.touch(Part::DlSidecar, bits, 4);
         self.segment.lengths.get(rank)
+    }
+
+    /// Reports to the census a bucket read of scoring term `i`, posting
+    /// `index` of its block `block` ([`Touch::census_tf`]).
+    #[cold]
+    #[inline(never)]
+    fn census_tf_one(&mut self, i: usize, block: usize, index: u32) {
+        let s = &self.sc[i];
+        let set = self.terms[s.term].as_ref().expect("scoring");
+        let (start_bit, width, first, _) = s.footer.census_layout(block, set.df);
+        let from_bit = start_bit + (index.saturating_sub(first) as usize) * width as usize;
+        self.touch.census_tf(&TfRead {
+            tf: set.at + set.postings.tf_at,
+            record: set.at,
+            start_bit,
+            width,
+            first,
+            from_bit,
+            to_bit: from_bit + width as usize,
+            tail: set.max_bucket > 0,
+            df: set.df,
+        });
+    }
+
+    /// What the census knows of held scoring term `i`, its posting index in
+    /// [`Walk::held_index`] (a disjunction's block in [`Walk::blocks`]).
+    #[cold]
+    fn census_held(&self, i: usize) -> HeldTf {
+        let s = &self.sc[i];
+        let set = self.terms[s.term].as_ref().expect("scoring");
+        let index = self.held_index[i];
+        let block = if self.present_list.is_empty() {
+            s.block_of(index, self.mems[s.term].entry)
+        } else {
+            self.blocks[i]
+        };
+        let (start_bit, width, first, count) = s.footer.census_layout(block, set.df);
+        HeldTf {
+            tf: set.at + set.postings.tf_at,
+            record: set.at,
+            start_bit,
+            width,
+            first,
+            count,
+            index,
+            df: set.df,
+            tail: set.max_bucket > 0,
+            single: matches!(set.postings.form, Form::Single(_)),
+            carrier: set.postings.lengths.is_some(),
+            read: usize::from(self.buckets[i]) < BUCKET_COUNT,
+            bound: self.held_bound.get(i).copied().unwrap_or(0.0),
+        }
+    }
+
+    /// Keeps for the census what it knows of the candidate being staged's
+    /// held terms ([`Walk::census_held`]), as its buckets are kept.
+    #[cold]
+    #[inline(never)]
+    fn census_stage(&mut self) {
+        for i in 0..self.sc.len() {
+            let h = if self.buckets[i] == NO_BUCKET {
+                HeldTf::default()
+            } else {
+                self.census_held(i)
+            };
+            self.census_staged.push(h);
+        }
+    }
+
+    /// Reports a length-class or DL read of the candidate at slot `local` of
+    /// group `g` to the census ([`Touch::census_length`]): the scoring
+    /// terms it holds, its length, and the shortest length at which it is
+    /// cut as read so far (its length at least `floor`).
+    #[cold]
+    #[inline(never)]
+    fn census_length(&mut self, g: u32, local: u32, kind: LengthKind, floor: u32) {
+        let n = self.sc.len();
+        let rank = self
+            .segment
+            .docs
+            .rank_in(g as usize, local)
+            .expect("a scored document");
+        let length = self.segment.lengths.get(rank).expect("a length");
+        let (at, at2) = match kind {
+            LengthKind::Dl => self.segment.length_at(rank),
+            _ => {
+                let c = self.segment.class_at(rank);
+                (c, c)
+            }
+        };
+        let mut held = Vec::new();
+        let mut later = false;
+        if matches!(kind, LengthKind::ClassOrFirst | LengthKind::ClassOrAfter) {
+            for &h in &self.held_list {
+                held.push(self.census_held(h));
+            }
+        } else {
+            for i in 0..n {
+                let b = self.buckets[i];
+                if b == NO_BUCKET {
+                    continue;
+                }
+                later |= b == LATER;
+                held.push(match self.census_now.get(i) {
+                    Some(h) => *h,
+                    None => self.census_held(i),
+                });
+            }
+        }
+        let geometry = self.geometry;
+        let tid = || geometry.tid_in(g as usize, local);
+        let bound_at = |w: &Self, l: u32| -> f32 {
+            if kind == LengthKind::ClassOrFirst {
+                let mut sum = 0.0_f32;
+                for &h in &w.held_list {
+                    let s = &w.sc[h];
+                    let most = TfBucket::new(s.max_bucket(w.blocks[h])).expect("a valid bucket");
+                    sum += lower(w.held_bound[h], s.scorer.bound_through(most, l));
+                }
+                sum
+            } else {
+                w.reach(
+                    (0..n).filter(|i| usize::from(w.buckets[*i]) < BUCKET_COUNT),
+                    l.max(floor),
+                )
+            }
+        };
+        let cut_at = if later || !self.cut(bound_at(self, length), tid) {
+            u32::MAX
+        } else {
+            let (mut lo, mut hi) = (0u32, length);
+            while lo < hi {
+                let mid = lo + (hi - lo) / 2;
+                if self.cut(bound_at(self, mid), tid) {
+                    hi = mid;
+                } else {
+                    lo = mid + 1;
+                }
+            }
+            lo
+        };
+        self.touch.census_length(&LengthRead {
+            kind,
+            at,
+            at2,
+            length,
+            cut_at,
+            held: &held,
+        });
     }
 
     /// The candidate's posting index in each span slot's term.
@@ -3947,6 +4262,9 @@ pub(super) fn walk_into<'s, 'a>(
         or_bounds: Vec::new(),
         or_sub: Vec::new(),
         or_held: Vec::new(),
+        or_order: Vec::new(),
+        or_heavy: Vec::new(),
+        or_counted: Vec::new(),
         held_bound: vec![0.0; n],
         buckets: vec![NO_BUCKET; n],
         held_index: vec![0; n],
@@ -3968,6 +4286,8 @@ pub(super) fn walk_into<'s, 'a>(
         span_index: Vec::new(),
         staged: Vec::new(),
         staged_buckets: Vec::new(),
+        census_staged: Vec::new(),
+        census_now: Vec::new(),
         staged_span: Vec::new(),
         staged_order: Vec::new(),
         cands: Vec::new(),
@@ -4163,6 +4483,147 @@ fn span_check<'a>(
 /// Words of a disjunction's sub-range: a group's members are bounded by
 /// their terms' blocks over this many words (1,024 slots) at a time.
 const SUB_WORDS: usize = 16;
+
+/// The fewest members of a disjunction group's mask its members' terms are
+/// counted for before they are weighed (see [`count_plan`]): below it the
+/// count cost more than the weighing it spared (M4, whole trace: at 64,
+/// 13% fewer `score` disjunction instructions, 19% fewer `full_score`;
+/// counted in every group, the cheapest forms' rose 1-2%). Tests count in
+/// every group.
+const COUNT_MIN: u64 = if cfg!(test) { 1 } else { 64 };
+/// The most terms a member is counted to: a filter asking for more asks for
+/// this many (weaker, still exact).
+const COUNT_MAX: usize = 4;
+/// The most weighed terms a group's count is planned for (its sums are
+/// exact well within [`Walk::plan_group`]'s slack up to many more).
+const COUNT_TERMS: usize = 64;
+
+/// Plans the term count of a disjunction's group whose weighed terms'
+/// group bounds are `bounds`, at bar `theta`: the terms counted, in
+/// `heavy`, and how many of them a member must hold, or `None` where no
+/// count can drop a member.
+///
+/// Leaving the `L` lightest terms out of the count and their bounds as
+/// slack, a member holding `k` of the others scores at most the `k`
+/// largest of their bounds plus every light bound. The fewest `k` where
+/// that reaches the bar, `m`, is how many heavy terms a member must hold;
+/// one holding fewer is cut by the weighing anyway, at bounds no higher
+/// (a member's sub-range bounds are at most the group's), so the count
+/// keeps a superset of what the weighing keeps. Sums are taken in `f64`
+/// with [`Walk::plan_group`]'s slack, and only members strictly below the
+/// bar are dropped (a tie may rank above it by its ctid).
+///
+/// Of the `L`, the count kept is the one asking each counted term to carry
+/// most, `min(m, COUNT_MAX) / (n - L)`, the fewest terms on a tie: in a
+/// `full_score` disjunction the common words' small bounds inflate a plain
+/// count (`L = 0`), which nearly every member then passes.
+fn count_plan(
+    bounds: &[f32],
+    theta: f32,
+    order: &mut Vec<usize>,
+    heavy: &mut Vec<usize>,
+) -> Option<usize> {
+    let n = bounds.len();
+    let t = f64::from(theta);
+    let usable = (2..=COUNT_TERMS).contains(&n)
+        && t > 0.0
+        && t.is_finite()
+        && bounds.iter().all(|b| *b >= 0.0 && b.is_finite());
+    if !usable {
+        return None;
+    }
+    let slack = 1.0 + f64::from(f32::EPSILON) * 256.0;
+    order.clear();
+    order.extend(0..n);
+    order.sort_unstable_by(|&a, &b| bounds[b].total_cmp(&bounds[a]));
+    // top[k]: the k largest bounds, summed.
+    let mut top = [0.0_f64; COUNT_TERMS + 1];
+    for k in 0..n {
+        top[k + 1] = top[k] + f64::from(bounds[order[k]]);
+    }
+    let reaches = |sum: f64| sum * slack >= t;
+    let mut best: Option<(usize, usize)> = None; // (m, heavy terms)
+    // light: the L lightest bounds, summed. m (the fewest heavy terms that
+    // reach the bar) only falls as L rises: each L starts from the last.
+    let (mut light, mut m) = (0.0_f64, n);
+    for l in 0..=n - 2 {
+        if l > 0 {
+            light += f64::from(bounds[order[n - l]]);
+        }
+        let h = n - l;
+        m = m.min(h);
+        if !reaches(top[m] + light) {
+            // Not even every term reaches it: the group's own check cuts it.
+            continue;
+        }
+        while m > 0 && reaches(top[m - 1] + light) {
+            m -= 1;
+        }
+        // m == 0: the light terms alone reach the bar, and m == 1: one
+        // heavy term does, which the mask (the essential terms' union, see
+        // `Walk::plan_group`) holds already; no larger L asks more.
+        if m < 2 {
+            break;
+        }
+        let asked = m.min(COUNT_MAX);
+        // asked / h larger, or equal with fewer terms counted.
+        if best.is_none_or(|(bm, bh)| asked * bh >= bm * h) {
+            best = Some((asked, h));
+        }
+    }
+    let (m, h) = best?;
+    heavy.clear();
+    heavy.extend_from_slice(&order[..h]);
+    Some(m)
+}
+
+/// Keeps the members of `mask` that at least `M` of `rows` hold: four
+/// words at a time (a vector or two), a block of four without members
+/// skipped.
+#[inline(never)]
+fn at_least<const M: usize>(mask: &mut [u64], rows: &[RowAt]) {
+    let mut chunks = mask.chunks_exact_mut(4);
+    let mut w = 0;
+    for chunk in &mut chunks {
+        let live: [u64; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        if live.iter().fold(0, |a, b| a | b) != 0 {
+            // seen[k]: members held by more than k of the rows so far.
+            let mut seen = [[0u64; 4]; M];
+            for row in rows {
+                let mut h = [0u64; 4];
+                for j in 0..4 {
+                    h[j] = row.word(w + j) & live[j];
+                }
+                let mut k = M - 1;
+                while k > 0 {
+                    for j in 0..4 {
+                        seen[k][j] |= h[j] & seen[k - 1][j];
+                    }
+                    k -= 1;
+                }
+                for j in 0..4 {
+                    seen[0][j] |= h[j];
+                }
+            }
+            chunk.copy_from_slice(&seen[M - 1]);
+        }
+        w += 4;
+    }
+    for (j, word) in chunks.into_remainder().iter_mut().enumerate() {
+        let live = *word;
+        let mut seen = [0u64; M];
+        for row in rows {
+            let h = row.word(w + j) & live;
+            let mut k = M - 1;
+            while k > 0 {
+                seen[k] |= h & seen[k - 1];
+                k -= 1;
+            }
+            seen[0] |= h;
+        }
+        *word = seen[M - 1];
+    }
+}
 
 /// Whether a disjunction's words and members are weighed in lanes, by the
 /// weighing kernels (`kernels::word_sums`, `kernels::member_sums`), rather
@@ -4457,7 +4918,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     r.at = grid_row(bytes, row)?;
                 } else {
                     row.fill(0);
-                    kernels::container_row(&e, bytes.all()?, geometry.starts(g as usize), row)?;
+                    // The group's slots from its entry in the geometry, read
+                    // for the bounds: its starts are read only for a
+                    // candidate's ctid, which most groups never reach.
+                    let starts = geometry.starts(g as usize);
+                    kernels::container_row_in(&e, bytes.all()?, group.slots(), starts, row)?;
                 }
             }
             Src::Locals { from, to } => {
@@ -4666,6 +5131,31 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut sums = [0.0_f32; SUB_WORDS];
         let mut member_sums = [0.0_f32; 64];
         let mut bits = [0u8; 64];
+        // A member must hold at least `m` of the heavier weighed terms (see
+        // `count_plan`): counted for every member of the mask at once, four
+        // words at a time, bit-sliced, before any member is weighed alone.
+        // It keeps every member the weighing below would keep, so it only
+        // spares the weighing those it would cut (research6).
+        if let Some(theta) = self.threshold()
+            && terms.len() >= 2
+            && kernels::popcount(&mask) >= COUNT_MIN
+        {
+            let mut order = std::mem::take(&mut self.or_order);
+            let mut heavy = std::mem::take(&mut self.or_heavy);
+            if let Some(m) = count_plan(&bounds, theta, &mut order, &mut heavy) {
+                let mut counted = std::mem::take(&mut self.or_counted);
+                counted.clear();
+                counted.extend(heavy.iter().map(|&t| rows[t]));
+                match m {
+                    2 => at_least::<2>(&mut mask, &counted),
+                    3 => at_least::<3>(&mut mask, &counted),
+                    _ => at_least::<COUNT_MAX>(&mut mask, &counted),
+                }
+                self.or_counted = counted;
+            }
+            self.or_order = order;
+            self.or_heavy = heavy;
+        }
         // The members left after the weighing below are sieved by their
         // buckets a chunk at a time before each is bounded alone, in a
         // group whose every weighed term is required (the disjunction is a
@@ -4920,6 +5410,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             self.staged.push((reach, local, length));
             self.staged_buckets.extend_from_slice(&self.buckets);
+            if self.touch.census() {
+                self.census_stage();
+            }
             if self.staged.len() >= STAGE_CHUNK {
                 self.finish_staged(g)?;
             }
@@ -5059,7 +5552,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         // if they leave it in reach (see `CLASS_FIRST_TERMS`).
         let class_first = self.held_list.len() >= CLASS_FIRST_TERMS;
         if class_first && self.threshold().is_some() {
-            let class = self.class_floor(g, local)?;
+            if self.touch.census() {
+                self.census_length(g, local, LengthKind::ClassOrFirst, 0);
+            }
+            let class = self.length_floor(g, local, true)?;
             if class > 0 {
                 floor = class;
                 reach = self.or_rebound(class);
@@ -5119,7 +5615,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 // buckets' floor.
                 if !class_first && self.threshold().is_some() && self.segment.lengths.has_classes()
                 {
-                    let c = self.class_of(g, local)?;
+                    if self.touch.census() {
+                        self.census_length(g, local, LengthKind::ClassOrAfter, floor);
+                    }
+                    let c = self.length_class(g, local, true)?;
                     if self.segment.lengths.floors()[c] > floor {
                         reach = self.class_reach(self.held_list.iter().copied(), c);
                         if self.cut(reach, tid) {
@@ -5188,6 +5687,9 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         let floor = s.floor_at(block, bucket);
         self.buckets[i] = bucket;
+        if self.touch.census() {
+            self.census_tf_one(i, block, index);
+        }
         Ok(floor)
     }
 
@@ -5236,6 +5738,64 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member [`count_plan`]'s count drops (fewer than `m` of the heavy
+    /// terms) scores below the bar whichever terms it holds, summed in any
+    /// order; and the plain count (no light terms) is what it asks for
+    /// where every bound is equal.
+    #[test]
+    fn count_plan_drops_only_members_below_the_bar() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut order, mut heavy) = (Vec::new(), Vec::new());
+        let mut planned = 0;
+        for _ in 0..4000 {
+            let n = 2 + (next() % 9) as usize;
+            let bounds: Vec<f32> = (0..n)
+                .map(|_| match next() % 4 {
+                    0 => (next() % 1000) as f32 / 997.0,
+                    1 => 0.25,
+                    _ => (next() % 100_000) as f32 / 9973.0,
+                })
+                .collect();
+            let total: f32 = bounds.iter().sum();
+            let theta = total * ((next() % 1000) as f32 / 1000.0);
+            let Some(m) = count_plan(&bounds, theta, &mut order, &mut heavy) else {
+                continue;
+            };
+            planned += 1;
+            assert!((2..=COUNT_MAX).contains(&m) && heavy.len() >= m);
+            for set in 0u32..1 << n {
+                let held = heavy.iter().filter(|&&t| set >> t & 1 == 1).count();
+                if held >= m {
+                    continue;
+                }
+                let (mut up, mut down) = (0.0_f32, 0.0_f32);
+                for t in 0..n {
+                    if set >> t & 1 == 1 {
+                        up += bounds[t];
+                    }
+                    if set >> (n - 1 - t) & 1 == 1 {
+                        down += bounds[n - 1 - t];
+                    }
+                }
+                assert!(
+                    up < theta && down < theta,
+                    "{bounds:?} {theta} m {m} heavy {heavy:?} set {set:b}"
+                );
+            }
+        }
+        assert!(planned > 500, "{planned}");
+        let m = count_plan(&[1.0; 6], 3.5, &mut order, &mut heavy);
+        assert_eq!((m, heavy.len()), (Some(4), 6));
+        assert_eq!(count_plan(&[1.0; 6], 0.5, &mut order, &mut heavy), None);
+        assert_eq!(count_plan(&[1.0], 0.5, &mut order, &mut heavy), None);
+    }
 
     #[test]
     fn a_group_entrys_bound_covers_its_postings() {
