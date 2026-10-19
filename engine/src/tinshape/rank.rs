@@ -1526,8 +1526,11 @@ struct Walk<'s, 'a, T: Touch> {
     or_bounds: Vec<f32>,
     or_sub: Vec<f32>,
     or_held: Vec<u64>,
-    /// The weighed terms' group bounds, largest first (research6).
-    or_sorted: Vec<f32>,
+    /// A disjunction group's term count (see [`count_plan`]): its weighed
+    /// terms by bound, the counted ones, and their rows.
+    or_order: Vec<usize>,
+    or_heavy: Vec<usize>,
+    or_counted: Vec<RowAt>,
     /// A disjunction's candidate at hand: per scoring term it holds, the
     /// bound of the block or, once its bucket is read, of the bucket (see
     /// [`Walk::or_stage`]).
@@ -3949,7 +3952,9 @@ pub(super) fn walk_into<'s, 'a>(
         or_bounds: Vec::new(),
         or_sub: Vec::new(),
         or_held: Vec::new(),
-        or_sorted: Vec::new(),
+        or_order: Vec::new(),
+        or_heavy: Vec::new(),
+        or_counted: Vec::new(),
         held_bound: vec![0.0; n],
         buckets: vec![NO_BUCKET; n],
         held_index: vec![0; n],
@@ -4167,24 +4172,136 @@ fn span_check<'a>(
 /// their terms' blocks over this many words (1,024 slots) at a time.
 const SUB_WORDS: usize = 16;
 
-/// Whether a disjunction's group counts its members' terms before weighing
-/// them (research6), and the most terms it counts to.
-const AT_LEAST: bool = true;
-/// The fewest members of a group's mask the count is taken for.
-const AT_LEAST_MIN: u64 = 128;
+/// The fewest members of a disjunction group's mask its members' terms are
+/// counted for before they are weighed (see [`count_plan`]): below it the
+/// count cost more than the weighing it spared (M4, whole trace: at 64,
+/// 13% fewer `score` disjunction instructions, 19% fewer `full_score`;
+/// counted in every group, the cheapest forms' rose 1-2%). Tests count in
+/// every group.
+const COUNT_MIN: u64 = if cfg!(test) { 1 } else { 64 };
+/// The most terms a member is counted to: a filter asking for more asks for
+/// this many (weaker, still exact).
+const COUNT_MAX: usize = 4;
+/// The most weighed terms a group's count is planned for (its sums are
+/// exact well within [`Walk::plan_group`]'s slack up to many more).
+const COUNT_TERMS: usize = 64;
 
-/// Keeps the members of `mask` that at least `M` of `rows` hold.
-#[inline(never)]
-fn at_least<const M: usize>(mask: &mut [u64], rows: &[RowAt]) {
-    for (w, word) in mask.iter_mut().enumerate() {
-        let live = *word;
-        if live == 0 {
+/// Plans the term count of a disjunction's group whose weighed terms'
+/// group bounds are `bounds`, at bar `theta`: the terms counted, in
+/// `heavy`, and how many of them a member must hold, or `None` where no
+/// count can drop a member.
+///
+/// Leaving the `L` lightest terms out of the count and their bounds as
+/// slack, a member holding `k` of the others scores at most the `k`
+/// largest of their bounds plus every light bound. The fewest `k` where
+/// that reaches the bar, `m`, is how many heavy terms a member must hold;
+/// one holding fewer is cut by the weighing anyway, at bounds no higher
+/// (a member's sub-range bounds are at most the group's), so the count
+/// keeps a superset of what the weighing keeps. Sums are taken in `f64`
+/// with [`Walk::plan_group`]'s slack, and only members strictly below the
+/// bar are dropped (a tie may rank above it by its ctid).
+///
+/// Of the `L`, the count kept is the one asking each counted term to carry
+/// most, `min(m, COUNT_MAX) / (n - L)`, the fewest terms on a tie: in a
+/// `full_score` disjunction the common words' small bounds inflate a plain
+/// count (`L = 0`), which nearly every member then passes.
+fn count_plan(
+    bounds: &[f32],
+    theta: f32,
+    order: &mut Vec<usize>,
+    heavy: &mut Vec<usize>,
+) -> Option<usize> {
+    let n = bounds.len();
+    let t = f64::from(theta);
+    let usable = (2..=COUNT_TERMS).contains(&n)
+        && t > 0.0
+        && t.is_finite()
+        && bounds.iter().all(|b| *b >= 0.0 && b.is_finite());
+    if !usable {
+        return None;
+    }
+    let slack = 1.0 + f64::from(f32::EPSILON) * 256.0;
+    order.clear();
+    order.extend(0..n);
+    order.sort_unstable_by(|&a, &b| bounds[b].total_cmp(&bounds[a]));
+    // top[k]: the k largest bounds, summed.
+    let mut top = [0.0_f64; COUNT_TERMS + 1];
+    for k in 0..n {
+        top[k + 1] = top[k] + f64::from(bounds[order[k]]);
+    }
+    let reaches = |sum: f64| sum * slack >= t;
+    let mut best: Option<(usize, usize)> = None; // (m, heavy terms)
+    // light: the L lightest bounds, summed. m (the fewest heavy terms that
+    // reach the bar) only falls as L rises: each L starts from the last.
+    let (mut light, mut m) = (0.0_f64, n);
+    for l in 0..=n - 2 {
+        if l > 0 {
+            light += f64::from(bounds[order[n - l]]);
+        }
+        let h = n - l;
+        m = m.min(h);
+        if !reaches(top[m] + light) {
+            // Not even every term reaches it: the group's own check cuts it.
             continue;
         }
-        // seen[k]: members held by more than k of the rows so far.
+        while m > 0 && reaches(top[m - 1] + light) {
+            m -= 1;
+        }
+        // m == 0: the light terms alone reach the bar, and m == 1: one
+        // heavy term does, which the mask (the essential terms' union, see
+        // `Walk::plan_group`) holds already; no larger L asks more.
+        if m < 2 {
+            break;
+        }
+        let asked = m.min(COUNT_MAX);
+        // asked / h larger, or equal with fewer terms counted.
+        if best.is_none_or(|(bm, bh)| asked * bh >= bm * h) {
+            best = Some((asked, h));
+        }
+    }
+    let (m, h) = best?;
+    heavy.clear();
+    heavy.extend_from_slice(&order[..h]);
+    Some(m)
+}
+
+/// Keeps the members of `mask` that at least `M` of `rows` hold: four
+/// words at a time (a vector or two), a block of four without members
+/// skipped.
+#[inline(never)]
+fn at_least<const M: usize>(mask: &mut [u64], rows: &[RowAt]) {
+    let mut chunks = mask.chunks_exact_mut(4);
+    let mut w = 0;
+    for chunk in &mut chunks {
+        let live: [u64; 4] = [chunk[0], chunk[1], chunk[2], chunk[3]];
+        if live.iter().fold(0, |a, b| a | b) != 0 {
+            // seen[k]: members held by more than k of the rows so far.
+            let mut seen = [[0u64; 4]; M];
+            for row in rows {
+                let mut h = [0u64; 4];
+                for j in 0..4 {
+                    h[j] = row.word(w + j) & live[j];
+                }
+                let mut k = M - 1;
+                while k > 0 {
+                    for j in 0..4 {
+                        seen[k][j] |= h[j] & seen[k - 1][j];
+                    }
+                    k -= 1;
+                }
+                for j in 0..4 {
+                    seen[0][j] |= h[j];
+                }
+            }
+            chunk.copy_from_slice(&seen[M - 1]);
+        }
+        w += 4;
+    }
+    for (j, word) in chunks.into_remainder().iter_mut().enumerate() {
+        let live = *word;
         let mut seen = [0u64; M];
         for row in rows {
-            let h = row.word(w) & live;
+            let h = row.word(w + j) & live;
             let mut k = M - 1;
             while k > 0 {
                 seen[k] |= h & seen[k - 1];
@@ -4698,44 +4815,37 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut sums = [0.0_f32; SUB_WORDS];
         let mut member_sums = [0.0_f32; 64];
         let mut bits = [0u8; 64];
+        // A member must hold at least `m` of the heavier weighed terms (see
+        // `count_plan`): counted for every member of the mask at once, four
+        // words at a time, bit-sliced, before any member is weighed alone.
+        // It keeps every member the weighing below would keep, so it only
+        // spares the weighing those it would cut (research6).
+        if let Some(theta) = self.threshold()
+            && terms.len() >= 2
+            && kernels::popcount(&mask) >= COUNT_MIN
+        {
+            let mut order = std::mem::take(&mut self.or_order);
+            let mut heavy = std::mem::take(&mut self.or_heavy);
+            if let Some(m) = count_plan(&bounds, theta, &mut order, &mut heavy) {
+                let mut counted = std::mem::take(&mut self.or_counted);
+                counted.clear();
+                counted.extend(heavy.iter().map(|&t| rows[t]));
+                match m {
+                    2 => at_least::<2>(&mut mask, &counted),
+                    3 => at_least::<3>(&mut mask, &counted),
+                    _ => at_least::<COUNT_MAX>(&mut mask, &counted),
+                }
+                self.or_counted = counted;
+            }
+            self.or_order = order;
+            self.or_heavy = heavy;
+        }
         // The members left after the weighing below are sieved by their
         // buckets a chunk at a time before each is bounded alone, in a
         // group whose every weighed term is required (the disjunction is a
         // conjunction there) and whose mask holds many (a `full_score`
         // disjunction of dense words; a `score` one's holds some 85, which
         // their own checks bound for less).
-        // A member must hold at least `m` of the weighed terms, `m` the
-        // fewest whose largest group bounds reach the bar (the sum of any
-        // fewer is cut): counted for every member of the mask at once, a
-        // word at a time, bit-sliced, before any member is weighed alone.
-        // It keeps every member the weighing below would keep (a member's
-        // bounds there are no higher than the group's), so it only spares
-        // the weighing those it would cut (research6).
-        if AT_LEAST
-            && terms.len() >= 2
-            && self.threshold().is_some()
-            && kernels::popcount(&mask) >= AT_LEAST_MIN
-        {
-            let mut sorted = std::mem::take(&mut self.or_sorted);
-            sorted.clear();
-            sorted.extend_from_slice(&bounds);
-            sorted.sort_unstable_by(|a, b| b.total_cmp(a));
-            let (mut acc, mut m) = (0.0_f32, 0usize);
-            while m < sorted.len() {
-                acc += sorted[m];
-                m += 1;
-                if !self.cut(acc, || geometry.tid_in(gi, 0)) {
-                    break;
-                }
-            }
-            self.or_sorted = sorted;
-            match m {
-                0 | 1 => {}
-                2 => at_least::<2>(&mut mask, &rows),
-                3 => at_least::<3>(&mut mask, &rows),
-                _ => at_least::<4>(&mut mask, &rows),
-            }
-        }
         let sieving = plan.required.len() == terms.len()
             && kernels::popcount(&mask) >= OR_SIEVE_MIN
             && self.or_sieve(&terms, &sb);
@@ -5300,6 +5410,64 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A member [`count_plan`]'s count drops (fewer than `m` of the heavy
+    /// terms) scores below the bar whichever terms it holds, summed in any
+    /// order; and the plain count (no light terms) is what it asks for
+    /// where every bound is equal.
+    #[test]
+    fn count_plan_drops_only_members_below_the_bar() {
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let (mut order, mut heavy) = (Vec::new(), Vec::new());
+        let mut planned = 0;
+        for _ in 0..4000 {
+            let n = 2 + (next() % 9) as usize;
+            let bounds: Vec<f32> = (0..n)
+                .map(|_| match next() % 4 {
+                    0 => (next() % 1000) as f32 / 997.0,
+                    1 => 0.25,
+                    _ => (next() % 100_000) as f32 / 9973.0,
+                })
+                .collect();
+            let total: f32 = bounds.iter().sum();
+            let theta = total * ((next() % 1000) as f32 / 1000.0);
+            let Some(m) = count_plan(&bounds, theta, &mut order, &mut heavy) else {
+                continue;
+            };
+            planned += 1;
+            assert!((2..=COUNT_MAX).contains(&m) && heavy.len() >= m);
+            for set in 0u32..1 << n {
+                let held = heavy.iter().filter(|&&t| set >> t & 1 == 1).count();
+                if held >= m {
+                    continue;
+                }
+                let (mut up, mut down) = (0.0_f32, 0.0_f32);
+                for t in 0..n {
+                    if set >> t & 1 == 1 {
+                        up += bounds[t];
+                    }
+                    if set >> (n - 1 - t) & 1 == 1 {
+                        down += bounds[n - 1 - t];
+                    }
+                }
+                assert!(
+                    up < theta && down < theta,
+                    "{bounds:?} {theta} m {m} heavy {heavy:?} set {set:b}"
+                );
+            }
+        }
+        assert!(planned > 500, "{planned}");
+        let m = count_plan(&[1.0; 6], 3.5, &mut order, &mut heavy);
+        assert_eq!((m, heavy.len()), (Some(4), 6));
+        assert_eq!(count_plan(&[1.0; 6], 0.5, &mut order, &mut heavy), None);
+        assert_eq!(count_plan(&[1.0], 0.5, &mut order, &mut heavy), None);
+    }
 
     #[test]
     fn a_group_entrys_bound_covers_its_postings() {
