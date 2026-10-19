@@ -347,3 +347,60 @@ pub fn replay() {
 pub(super) fn mode() -> u8 {
     MODE.with(Cell::get)
 }
+
+/// Lab counters for lane lightprobe (research6 L3): what the disjunction
+/// loads per group by the terms' roles. Offline only.
+pub static LP: [std::sync::atomic::AtomicU64; 64] = [const { std::sync::atomic::AtomicU64::new(0) }; 64];
+
+pub fn lp_add(i: usize, v: u64) {
+    LP[i].fetch_add(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+thread_local! {
+    pub static LP_KIND: std::cell::RefCell<Vec<u8>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+pub fn lp_kind(i: usize, k: u8) {
+    LP_KIND.with(|v| {
+        let mut v = v.borrow_mut();
+        if v.len() <= i {
+            v.resize(i + 1, 0);
+        }
+        v[i] = k;
+    });
+}
+
+pub fn lp_dump() {
+    let g = |i: usize| LP[i].load(std::sync::atomic::Ordering::Relaxed);
+    let groups = g(0).max(1) as f64;
+    println!("lpcensus groups {} counted {} with_S {}", g(0), g(1), g(38));
+    for (c, name) in ["M(mask)", "H(heavy)", "S(rest)"].iter().enumerate() {
+        let b = 8 + c * 8;
+        println!(
+            "lpcensus {name}: terms/group {:.2} postings/group {:.1} grid {} ef {} array {} paged {} locals {} sparse {}",
+            g(b) as f64 / groups,
+            g(b + 1) as f64 / groups,
+            g(b + 2),
+            g(b + 3),
+            g(b + 4),
+            g(b + 5),
+            g(b + 6),
+            g(b + 7)
+        );
+    }
+    println!(
+        "lpcensus per group: after count {:.1}, exact pass {:.2}, slack pass {:.2}, candidates {:.2}, probes(slack x S) {:.2}",
+        g(32) as f64 / groups,
+        g(33) as f64 / groups,
+        g(34) as f64 / groups,
+        g(35) as f64 / groups,
+        g(37) as f64 / groups
+    );
+    println!(
+        "lpcensus groups: exact>0 {:.1}%, slack>0 {:.1}%; S terms skippable lazily {:.1}% (of S terms), S postings skippable {:.1}%",
+        100.0 * g(39) as f64 / groups,
+        100.0 * g(40) as f64 / groups,
+        100.0 * g(42) as f64 / g(24).max(1) as f64,
+        100.0 * g(41) as f64 / g(43).max(1) as f64
+    );
+}

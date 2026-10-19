@@ -1573,6 +1573,8 @@ struct Walk<'s, 'a, T: Touch> {
     /// The sub-range census, when built and enabled.
     #[cfg(feature = "census")]
     sub: Option<Box<super::census::SubWalk>>,
+    #[cfg(feature = "census")]
+    lp_counted: bool,
     verify: Verify<'a>,
     /// A span's candidate at hand: its posting index in each span slot's
     /// term.
@@ -1629,6 +1631,97 @@ impl<T: Touch> Walk<'_, '_, T> {
     /// The census at group `g`, which the walk visits next, before it is
     /// bounded: the group before it is closed, and each window `g` enters
     /// is checked against the threshold now.
+    /// Lane lightprobe's per-group tally (see `census::lp_dump`), after the
+    /// count: the weighed terms by role, and the members a weighing at the
+    /// group's bounds keeps exactly and with the rest's bounds as slack.
+    fn lp_group(&mut self, g: u32, mask: &[u64], terms: &[usize], rows: &[RowAt], bounds: &[f32]) {
+        use super::census::{LP_KIND, lp_add};
+        lp_add(0, 1);
+        let counted = self.lp_counted;
+        if counted {
+            lp_add(1, 1);
+        }
+        let mut role = vec![2usize; terms.len()];
+        for (t, &i) in terms.iter().enumerate() {
+            if self.row_loaded[i] {
+                role[t] = 0;
+            }
+        }
+        if counted {
+            for &h in &self.or_heavy {
+                if role[h] != 0 {
+                    role[h] = 1;
+                }
+            }
+        }
+        let words = mask.len();
+        let mut s_count = 0u64;
+        let mut s_post = 0u64;
+        let mut s_slack = 0.0_f32;
+        for (t, &i) in terms.iter().enumerate() {
+            let b = 8 + role[t] * 8;
+            lp_add(b, 1);
+            let p: u64 = (0..words).map(|w| u64::from(rows[t].word(w).count_ones())).sum();
+            lp_add(b + 1, p);
+            let k = LP_KIND.with(|v| v.borrow().get(i).copied().unwrap_or(5));
+            lp_add(b + usize::from(k), 1);
+            if role[t] == 2 {
+                s_post += p;
+                s_count += 1;
+                s_slack += bounds[t];
+            }
+        }
+        if s_count > 0 {
+            lp_add(38, 1);
+        }
+        let Some(_) = self.threshold() else { return };
+        let Some(bar) = BarKey::of(self.bar) else { return };
+        let geometry = self.geometry;
+        let mut after = 0u64;
+        let mut exact = 0u64;
+        let mut slack = 0u64;
+        for w in 0..words {
+            let mut word = mask[w];
+            while word != 0 {
+                let bit = word.trailing_zeros();
+                word &= word - 1;
+                after += 1;
+                let mut e = 0.0_f32;
+                let mut l = 0.0_f32;
+                for t in 0..terms.len() {
+                    let held = rows[t].word(w) >> bit & 1 == 1;
+                    if held {
+                        e += bounds[t];
+                    }
+                    if role[t] != 2 && held {
+                        l += bounds[t];
+                    }
+                }
+                l += s_slack;
+                if bar.keeps(e, || geometry.tid_in(g as usize, (w * 64) as u32 + bit)) {
+                    exact += 1;
+                }
+                if bar.keeps(l, || geometry.tid_in(g as usize, (w * 64) as u32 + bit)) {
+                    slack += 1;
+                }
+            }
+        }
+        if exact > 0 {
+            lp_add(39, 1);
+        }
+        if slack > 0 {
+            lp_add(40, 1);
+        } else {
+            lp_add(41, s_post);
+            lp_add(42, s_count);
+        }
+        lp_add(43, s_post);
+        lp_add(32, after);
+        lp_add(33, exact);
+        lp_add(34, slack);
+        lp_add(37, slack * s_count);
+    }
+
     fn census_group(&mut self, g: u32) {
         use super::census::{SHIFTS, SIZES};
         let Some(mut c) = self.census.take() else {
@@ -4005,6 +4098,8 @@ pub(super) fn walk_into<'s, 'a>(
         census: super::census::WalkCensus::start(),
         #[cfg(feature = "census")]
         sub: super::census::SubWalk::start(),
+        #[cfg(feature = "census")]
+        lp_counted: false,
     };
     walk.term_sc = vec![usize::MAX; walk.terms.len()];
     for i in 0..n {
@@ -4584,6 +4679,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             let end = group.slot_base + group.slots();
             let mut out = kernels::RowPut::new();
             cursor.drain_below(end, |slot| out.put(row, slot - group.slot_base));
+            #[cfg(feature = "census")]
+            super::census::lp_kind(i, 7);
             return Ok(());
         }
         // The entry `run_or`'s seek found for the group, in the hint.
@@ -4602,6 +4699,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 self.touch.touch(Part::Payload, at, bytes.len());
                 self.mems[t].used += 1;
                 r.first = e.first;
+                #[cfg(feature = "census")]
+                super::census::lp_kind(i, match e.kind { 0 => 2, 1 => 3, 3 => 4, _ => 5 });
                 if e.kind == KIND_GRID {
                     r.at = grid_row(bytes, row)?;
                 } else {
@@ -4610,6 +4709,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 }
             }
             Src::Locals { from, to } => {
+                #[cfg(feature = "census")]
+                super::census::lp_kind(i, 6);
                 r.first = from;
                 row.fill(0);
                 kernels::set_ascending(&set.locals[from as usize..to as usize], row);
@@ -4812,6 +4913,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         held.resize(terms.len(), 0);
         // The sums the kernels weigh a sub-range's words and a word's members
         // by, lanes at a time (`kernels::word_sums`, `kernels::member_sums`).
+        #[cfg(feature = "census")]
+        {
+            self.lp_counted = false;
+        }
         let mut sums = [0.0_f32; SUB_WORDS];
         let mut member_sums = [0.0_f32; 64];
         let mut bits = [0u8; 64];
@@ -4826,7 +4931,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         {
             let mut order = std::mem::take(&mut self.or_order);
             let mut heavy = std::mem::take(&mut self.or_heavy);
+            #[cfg(feature = "census")]
+            let mut counted_ran = false;
             if let Some(m) = count_plan(&bounds, theta, &mut order, &mut heavy) {
+                #[cfg(feature = "census")]
+                {
+                    counted_ran = true;
+                }
                 let mut counted = std::mem::take(&mut self.or_counted);
                 counted.clear();
                 counted.extend(heavy.iter().map(|&t| rows[t]));
@@ -4839,7 +4950,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             }
             self.or_order = order;
             self.or_heavy = heavy;
+            #[cfg(feature = "census")]
+            {
+                self.lp_counted = counted_ran;
+            }
         }
+        #[cfg(feature = "census")]
+        self.lp_group(g, &mask, &terms, &rows, &bounds);
         // The members left after the weighing below are sieved by their
         // buckets a chunk at a time before each is bounded alone, in a
         // group whose every weighed term is required (the disjunction is a
@@ -5176,6 +5293,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let local = (w * 64) as u32 + bit;
         let slot = base + local;
         self.answer.candidates += 1;
+        #[cfg(feature = "census")]
+        super::census::lp_add(35, 1);
         // Its ctid only breaks a tie with the threshold's: most candidates
         // never need it.
         let geometry = self.geometry;
