@@ -176,15 +176,27 @@ pub fn container_row(
     starts: &[u32],
     row: &mut [u64],
 ) -> Result<()> {
+    container_row_in(entry, bytes, group_slots(starts), starts, row)
+}
+
+/// [`container_row`] in a group of `slots` slots (its `starts`' last), which
+/// an array or Elias-Fano container takes from the caller rather than from
+/// `starts`, left unread: a group's starts are a cache miss of their own.
+#[inline]
+pub fn container_row_in(
+    entry: &GroupEntry,
+    bytes: &[u8],
+    slots: u32,
+    starts: &[u32],
+    row: &mut [u64],
+) -> Result<()> {
+    debug_assert_eq!(slots, group_slots(starts));
     if entry.kind == KIND_ARRAY {
-        array_into_row(array_bytes(bytes, entry.count, group_slots(starts))?, row);
+        array_into_row(array_bytes(bytes, entry.count, slots)?, row);
         return Ok(());
     }
     if entry.kind == KIND_EF {
-        ef_into_row(
-            Ef::parse(bytes, entry.count as usize, group_slots(starts))?,
-            row,
-        );
+        ef_into_row(Ef::parse(bytes, entry.count as usize, slots)?, row);
         return Ok(());
     }
     let mut put = RowPut::new();
