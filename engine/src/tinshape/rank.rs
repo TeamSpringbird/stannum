@@ -4918,7 +4918,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                     r.at = grid_row(bytes, row)?;
                 } else {
                     row.fill(0);
-                    kernels::container_row(&e, bytes.all()?, geometry.starts(g as usize), row)?;
+                    // The group's slots from its entry in the geometry, read
+                    // for the bounds: its starts are read only for a
+                    // candidate's ctid, which most groups never reach.
+                    let starts = geometry.starts(g as usize);
+                    kernels::container_row_in(&e, bytes.all()?, group.slots(), starts, row)?;
                 }
             }
             Src::Locals { from, to } => {
