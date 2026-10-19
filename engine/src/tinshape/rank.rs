@@ -401,6 +401,14 @@ pub(super) struct Sc<'s, 'a> {
     /// at most at the class's shortest length: [`Walk::class_reach`] sums
     /// them where a candidate's class bounds it.
     class_scores: [[f32; BUCKET_COUNT]; 4],
+    /// Lab (sparsebound): a sparse record's per-group entries, the entry
+    /// at hand and its bound for the group at hand.
+    #[cfg(any(feature = "sbcensus", feature = "sbuse"))]
+    lab: Option<std::rc::Rc<super::sparsebound::Gb>>,
+    #[cfg(any(feature = "sbcensus", feature = "sbuse"))]
+    lab_k: usize,
+    #[cfg(any(feature = "sbcensus", feature = "sbuse"))]
+    lab_gv: f32,
 }
 
 /// A footer block past what a walk could reach was asked for, or a block
@@ -452,6 +460,12 @@ impl<'s, 'a> Sc<'s, 'a> {
             floors_block: u32::MAX,
             common: None,
             class_scores: [[0.0; BUCKET_COUNT]; 4],
+            #[cfg(any(feature = "sbcensus", feature = "sbuse"))]
+            lab: None,
+            #[cfg(any(feature = "sbcensus", feature = "sbuse"))]
+            lab_k: 0,
+            #[cfg(any(feature = "sbcensus", feature = "sbuse"))]
+            lab_gv: f32::INFINITY,
         })
     }
 
@@ -4538,13 +4552,23 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 *bound = if s.grouped() {
                     s.entry_bound(self.mems[s.term].hint)
                 } else {
-                    s.range_bound(g, base, end)
+                    #[cfg(not(feature = "sbuse"))]
+                    let v = s.range_bound(g, base, end);
+                    #[cfg(feature = "sbuse")]
+                    let v = {
+                        let set = self.terms[s.term].as_ref().expect("scoring");
+                        let c = s.lab_bound(self.segment, set, g);
+                        lower(s.range_bound(g, base, end), c)
+                    };
+                    v
                 };
                 total += *bound;
             }
         }
         let geometry = self.geometry;
         let gi = g as usize;
+        #[cfg(feature = "sbcensus")]
+        let lab_new_c = self.lab_census(g, &sb, total);
         if self.cut(total, || geometry.tid_in(gi, 0)) {
             self.answer.windows_pruned += 1;
             self.sub_bounds = sb;
@@ -4607,6 +4631,13 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         }
         if !kernels::any_set(&mask) {
             self.answer.windows_pruned += 1;
+            #[cfg(feature = "sbcensus")]
+            {
+                super::sparsebound::add(9, 1);
+                if lab_new_c {
+                    super::sparsebound::add(10, 1);
+                }
+            }
             self.words = mask;
             self.row_loaded = loaded;
             self.sub_bounds = sb;
@@ -4737,6 +4768,10 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                             for (&i, bound) in terms.iter().zip(sub.iter_mut()) {
                                 if !self.sc[i].grouped() {
                                     *bound = self.sc[i].range_bound(g, from, to);
+                                    #[cfg(feature = "sbuse")]
+                                    {
+                                        *bound = lower(*bound, self.sc[i].lab_gv);
+                                    }
                                 }
                                 total += *bound;
                             }
@@ -5029,6 +5064,8 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 debug_assert_eq!(Some(b), s.block_at(g, slot));
                 self.blocks[i] = b;
                 let v = s.bound(b);
+                #[cfg(feature = "sbuse")]
+                let v = if s.grouped() { v } else { lower(v, s.lab_gv) };
                 self.held_bound[i] = v;
                 bound += v;
             }
@@ -5477,5 +5514,140 @@ mod tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(any(feature = "sbcensus", feature = "sbuse"))]
+impl Sc<'_, '_> {
+    /// Lab (sparsebound): a sparse term's bound over group `g`, which it
+    /// holds, from its per-(term, group) frontier (the entry a TIN-shaped
+    /// sparse record would hold), kept in `lab_gv` for the group's
+    /// sub-ranges and candidates.
+    #[inline]
+    fn lab_bound(&mut self, segment: &Segment<'_>, set: &super::TermSet<'_>, g: u32) -> f32 {
+        if self.lab.is_none() {
+            self.lab = Some(super::sparsebound::get(segment, set));
+            self.lab_k = 0;
+        }
+        let gb = self.lab.as_deref().expect("set above");
+        let mut k = self.lab_k;
+        if k >= gb.groups.len() || gb.groups[k] > g {
+            k = gb.groups.partition_point(|x| *x < g);
+        } else {
+            while gb.groups[k] < g {
+                k += 1;
+            }
+        }
+        debug_assert_eq!(gb.groups.get(k), Some(&g));
+        self.lab_k = k;
+        let scorer = &self.scorer;
+        let bucket = |b: u8| TfBucket::new(b).expect("a valid bucket");
+        let at = gb.foff[k] as usize;
+        let v = if scorer.rises() {
+            fold_group_frontier(&gb.fbytes, at, true, |b, l| scorer.score_bucket(bucket(b), l))
+        } else {
+            fold_group_frontier(&gb.fbytes, at, true, |b, l| scorer.bound_through(bucket(b), l))
+        };
+        self.lab_gv = v;
+        v
+    }
+}
+
+#[cfg(feature = "sbcensus")]
+impl<'a, T: Touch> Walk<'_, 'a, T> {
+    /// Lab (sparsebound) census of group `g`, its present terms' bounds
+    /// `sb` (today's) summing to `total`: whether it would be pruned with
+    /// its sparse terms bounded by each candidate per-group bound. Returns
+    /// whether the per-(term, group) frontier (C) prunes a group today's
+    /// bounds do not.
+    fn lab_census(&mut self, g: u32, sb: &[f32], total: f32) -> bool {
+        use super::sparsebound::add;
+        add(0, 1);
+        let geometry = self.geometry;
+        let gi = g as usize;
+        let a_cut = self.cut(total, || geometry.tid_in(gi, 0));
+        if a_cut {
+            add(3, 1);
+        }
+        let floors = self.segment.lengths.floors();
+        let classes = self.segment.lengths.has_classes();
+        // Per variant B, I, K, C, Z: the bounds summed in the scorer's order.
+        let mut sums = [0.0_f32; 5];
+        let mut any = false;
+        for i in 0..self.sc.len() {
+            if !self.present[i] {
+                continue;
+            }
+            let s = &mut self.sc[i];
+            if s.grouped() {
+                for v in &mut sums {
+                    *v += sb[i];
+                }
+                continue;
+            }
+            any = true;
+            add(2, 1);
+            let set = self.terms[s.term].as_ref().expect("scoring");
+            let c = s.lab_bound(self.segment, set, g);
+            let gb = s.lab.clone().expect("built");
+            let k = s.lab_k;
+            if gb.groups.get(k) != Some(&g) {
+                add(20, 1);
+            }
+            // C must bound every posting's score at its exact length.
+            let posts = &gb.posts[gb.posts_at[k] as usize..gb.posts_at[k + 1] as usize];
+            for p in posts {
+                let bucket = TfBucket::new(p.bucket).expect("a valid bucket");
+                if s.scorer.score_bucket(bucket, p.length) > c {
+                    add(21, 1);
+                }
+            }
+            add(12, posts.len() as u64);
+            if gb.inline {
+                add(13, 1);
+            }
+            let (mut b, mut kk) = (0.0_f32, 0.0_f32);
+            for p in posts {
+                let bucket = TfBucket::new(p.bucket).expect("a valid bucket");
+                let floor = s.floor_at(p.block as usize, p.bucket);
+                b = higher(b, s.scorer.bound_through(bucket, floor));
+                let cf = if classes { floors[usize::from(p.class) % 4] } else { 0 };
+                kk = higher(kk, s.scorer.bound_through(bucket, cf));
+            }
+            let a = sb[i];
+            let (bv, cv, kv) = (lower(a, b), lower(a, c), lower(a, kk));
+            let iv = if gb.inline { cv } else { bv };
+            sums[0] += bv;
+            sums[1] += iv;
+            sums[2] += kv;
+            sums[3] += cv;
+            if a > 0.0 {
+                add(14, (f64::from(cv / a) * 1e6) as u64);
+                add(15, (f64::from(bv / a) * 1e6) as u64);
+            }
+            if cv < a {
+                add(16, 1);
+            }
+        }
+        if !any {
+            return false;
+        }
+        add(1, 1);
+        if a_cut {
+            add(18, 1);
+        }
+        let mut c_cut = false;
+        for (j, idx) in [(0, 4), (1, 5), (2, 6), (3, 7), (4, 8)] {
+            if self.cut(sums[j], || geometry.tid_in(gi, 0)) {
+                add(idx, 1);
+                if j == 3 {
+                    c_cut = true;
+                }
+            }
+        }
+        if c_cut {
+            add(19, 1);
+        }
+        c_cut && !a_cut
     }
 }

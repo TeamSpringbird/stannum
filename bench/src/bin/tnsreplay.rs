@@ -2394,10 +2394,14 @@ fn run() -> Result<bool, String> {
             engine::tinshape::census::take_sub();
             engine::tinshape::census::record();
         }
+        #[cfg(feature = "sbcensus")]
+        engine::tinshape::sparsebound::take();
         let Some(answer) = reader.ranked(&scorer, args.k) else {
             unsupported += 1;
             continue;
         };
+        #[cfg(feature = "sbcensus")]
+        println!("sbq\t{}\t{}", q.name, engine::tinshape::sparsebound::take());
         #[cfg(feature = "census")]
         census
             .entry(q.style.clone())

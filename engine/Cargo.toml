@@ -23,6 +23,10 @@ kernels = []
 # counts nothing unless STANNUM_WIN_CENSUS is set; the extension never
 # enables it.
 census = []
+# Lab only (lane sparsebound): per-(sparse term, group) bounds, census and
+# timed use; the extension never enables them.
+sbcensus = []
+sbuse = []
 
 [dependencies]
 boldi-vigna = { path = "../boldi-vigna" }

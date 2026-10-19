@@ -28,6 +28,8 @@ use crate::bm25::TermScorer;
 
 #[cfg(feature = "census")]
 pub mod census;
+#[cfg(any(feature = "sbcensus", feature = "sbuse"))]
+pub mod sparsebound;
 mod rank;
 
 /// The parts of a segment a query reads, named as TIN's EXPLAIN names its
