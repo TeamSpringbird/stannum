@@ -33,7 +33,7 @@ use segment::tinshape::ef::{Ef, EfCursor};
 use segment::tinshape::positions::{Block, Positions};
 use segment::tinshape::postings::{
     Directory, Form, GroupEntry, GroupFrontier, InOrder, KIND_ARRAY, KIND_EF, KIND_GRID,
-    LazyFooter, SUB_NONE, SubCodes, array_bytes, fold_group_frontier, higher, lower,
+    LazyFooter, SUB_NONE, SubCodes, array_bytes, fold_group_frontier, group_slots, higher, lower,
     rounded_length,
 };
 use segment::tinshape::segment::Segment;
@@ -1514,6 +1514,10 @@ struct Walk<'s, 'a, T: Touch> {
     /// [`RowAt`]), and its row and index cursor.
     rows: Vec<u64>,
     row_state: Vec<Row>,
+    /// What each term's part of `rows` holds (see [`Dirt`]), at the group
+    /// words `rows_words` the parts were laid out for.
+    row_dirt: Vec<Dirt>,
+    rows_words: usize,
     /// Per scoring term, whether its row holds the group at hand.
     row_loaded: Vec<bool>,
     /// A disjunction's group at hand: per present term with a positive
@@ -3946,6 +3950,8 @@ pub(super) fn walk_into<'s, 'a>(
         plan: Plan::default(),
         rows: Vec::new(),
         row_state: vec![Row::default(); n],
+        row_dirt: vec![Dirt::any(); n],
+        rows_words: 0,
         row_loaded: Vec::new(),
         or_terms: Vec::new(),
         or_rows: Vec::new(),
@@ -4471,6 +4477,46 @@ fn grid_row(grid: Bytes<'_>, row: &mut [u64]) -> Result<RowAt> {
     Ok(RowAt::of(row))
 }
 
+/// What a scoring term's part of [`Walk::rows`] holds after its last
+/// load, so the next one clears no more than it must: the words a short
+/// list set there (noted as they were set), or any. Clearing a row whole is
+/// a 576-byte `memset` a load at 4,608 slots, most of them for a sparse
+/// term's or a small array's few members.
+#[derive(Clone, Copy)]
+struct Dirt {
+    /// How many of `at` hold the words set, or more than [`Dirt::NOTED`]:
+    /// any word may be set.
+    n: usize,
+    at: [u16; Dirt::NOTED],
+}
+
+impl Dirt {
+    /// Words noted at most: a list of up to this many members is noted.
+    const NOTED: usize = 16;
+    const ANY: usize = usize::MAX;
+
+    /// Any word may be set (as after a part is moved or made).
+    const fn any() -> Self {
+        Self {
+            n: Self::ANY,
+            at: [0; Self::NOTED],
+        }
+    }
+
+    /// Clears what `row` holds, all of it.
+    #[inline(always)]
+    fn clear(&mut self, row: &mut [u64]) {
+        if self.n <= Self::NOTED {
+            for &w in &self.at[..self.n] {
+                row[usize::from(w)] = 0;
+            }
+        } else {
+            row.fill(0);
+        }
+        self.n = 0;
+    }
+}
+
 impl<'a, T: Touch> Walk<'_, 'a, T> {
     /// Block-max MaxScore over the scoring terms, a group at a time: a
     /// group whose terms' bounds cannot reach the threshold is skipped; else
@@ -4556,12 +4602,17 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
 
     /// Scoring term `i`'s members in group `g`, which it holds, as its row
     /// of `words` words ([`Row::at`]).
+    ///
+    /// A decoded row is set into the term's part of [`Walk::rows`], clear
+    /// first: of the words the last short list set there, as noted then
+    /// ([`Dirt`]), or whole. A grid read in place leaves the part as it was.
     #[inline(never)]
     fn or_load(&mut self, i: usize, g: u32, words: usize) -> Result<()> {
         let t = self.sc[i].term;
         let geometry = self.geometry;
         let group = geometry.groups[g as usize];
         let row = &mut self.rows[i * words..(i + 1) * words];
+        let dirt = &mut self.row_dirt[i];
         let set = self.terms[t].as_mut().expect("scoring");
         let r = &mut self.row_state[i];
         r.w = 0;
@@ -4570,7 +4621,7 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         r.at = RowAt::of(row);
         r.tf = TfRun::default();
         if let Form::Sparse(list) = &set.postings.form {
-            row.fill(0);
+            dirt.clear(row);
             let cursor = set.sparse.get_or_insert_with(|| {
                 self.touch.touch(
                     Part::Payload,
@@ -4583,7 +4634,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             r.first = cursor.rank() as u32;
             let end = group.slot_base + group.slots();
             let mut out = kernels::RowPut::new();
-            cursor.drain_below(end, |slot| out.put(row, slot - group.slot_base));
+            let mut n = 0;
+            cursor.drain_below(end, |slot| {
+                out.put_noting(row, slot - group.slot_base, &mut dirt.at, &mut n);
+            });
+            dirt.n = n;
             return Ok(());
         }
         // The entry `run_or`'s seek found for the group, in the hint.
@@ -4604,14 +4659,30 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
                 r.first = e.first;
                 if e.kind == KIND_GRID {
                     r.at = grid_row(bytes, row)?;
+                    if r.at.bytes().as_ptr() == row.as_ptr().cast() {
+                        dirt.n = Dirt::ANY;
+                    }
+                } else if e.kind == KIND_ARRAY && e.count as usize <= Dirt::NOTED {
+                    let starts = geometry.starts(g as usize);
+                    let values = array_bytes(bytes.all()?, e.count, group_slots(starts))?;
+                    dirt.clear(row);
+                    let mut out = kernels::RowPut::new();
+                    let mut n = 0;
+                    for v in values.chunks_exact(2) {
+                        let v = u32::from(u16::from_le_bytes([v[0], v[1]]));
+                        out.put_noting(row, v, &mut dirt.at, &mut n);
+                    }
+                    dirt.n = n;
                 } else {
-                    row.fill(0);
+                    dirt.clear(row);
+                    dirt.n = Dirt::ANY;
                     kernels::container_row(&e, bytes.all()?, geometry.starts(g as usize), row)?;
                 }
             }
             Src::Locals { from, to } => {
                 r.first = from;
-                row.fill(0);
+                dirt.clear(row);
+                dirt.n = Dirt::ANY;
                 kernels::set_ascending(&set.locals[from as usize..to as usize], row);
             }
         }
@@ -4700,9 +4771,14 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
             return Ok(());
         }
         let words = group.words();
-        // Rows are overwritten where read: only present terms' are.
+        // Rows are overwritten where read: only present terms' are. Each
+        // term's part moves with the group's words: what it held is lost.
         if self.rows.len() < n * words {
             self.rows.resize(n * words, 0);
+        }
+        if self.rows_words != words {
+            self.rows_words = words;
+            self.row_dirt.fill(Dirt::any());
         }
         let dead = self.segment.liveness.groups[g as usize].as_deref();
         let mut plan = std::mem::take(&mut self.plan);
@@ -4718,9 +4794,11 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         let mut loaded = std::mem::take(&mut self.row_loaded);
         loaded.clear();
         loaded.resize(n, false);
+        // Every word of the mask is written below (all set, or the first
+        // filter's row loaded): only its length is set here.
         let mut mask = std::mem::take(&mut self.words);
-        mask.clear();
         mask.resize(words, 0);
+        mask.truncate(words);
         let filters = plan.required.len()
             + if plan.by_essential {
                 plan.essential.len()
@@ -4730,16 +4808,20 @@ impl<'a, T: Touch> Walk<'_, 'a, T> {
         if filters == 0 {
             mask.fill(!0);
         }
-        // The essential terms ORed into the mask, cleared above, then the
-        // required terms ANDed in; without essential terms the first
-        // required one is the mask to start from.
+        // The essential terms ORed into the mask, the first loaded into it,
+        // then the required terms ANDed in; without essential terms the
+        // first required one is the mask to start from.
         let mut required = plan.required.iter();
         if plan.by_essential && !plan.essential.is_empty() {
             for e in 0..plan.essential.len() {
                 let i = plan.essential[e];
                 self.or_load(i, g, words)?;
                 loaded[i] = true;
-                kernels::or_bytes(&mut mask, self.row_state[i].at.bytes());
+                if e == 0 {
+                    kernels::load(&mut mask, self.row_state[i].at.bytes());
+                } else {
+                    kernels::or_bytes(&mut mask, self.row_state[i].at.bytes());
+                }
             }
         } else if let Some(&first) = required.next() {
             self.or_load(first, g, words)?;

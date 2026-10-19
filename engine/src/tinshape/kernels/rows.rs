@@ -70,6 +70,21 @@ impl RowPut {
         row[w] = self.bits;
     }
 
+    /// [`Self::put`], noting the word set in `note` at `*n`, which counts
+    /// the distinct words set so far: past `note`'s length, the last place
+    /// is overwritten (and `*n` exceeds the length), without a branch.
+    #[inline(always)]
+    pub(crate) fn put_noting(&mut self, row: &mut [u64], v: u32, note: &mut [u16], n: &mut usize) {
+        let w = v as usize / 64;
+        let fresh = w != self.w;
+        let kept = if fresh { 0 } else { self.bits };
+        self.bits = kept | 1 << (v % 64);
+        self.w = w;
+        row[w] = self.bits;
+        note[(*n).min(note.len() - 1)] = w as u16;
+        *n += usize::from(fresh);
+    }
+
     /// [`Self::put`] of a value within the row.
     ///
     /// # Safety
