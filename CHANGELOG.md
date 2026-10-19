@@ -172,6 +172,34 @@ The first Stannum release baseline, `0.1.0-dev` (`stannum.version()` returns
 
 ### Changed
 
+- A record of at most a twentieth of its segment's documents carries a
+  two-bit length-class code per posting in its TF tail (page layout 19; an
+  index of an earlier layout must be rebuilt). A ranked walk scoring such a
+  term reads its candidates' length classes from the tail it already reads
+  for their buckets, rather than the document-length pages; rarer terms are
+  where a disjunction's candidates mostly hold one term. At 150 million
+  rows the index is 2.6% larger, and with PostgreSQL on one Sapphire Rapids
+  core's two hyperthreads (no PGO, the same database rewritten both ways)
+  it answers 2.6% more queries per cycle over the six styles (score
+  disjunctions 4.6%), with 4-23% fewer L2 misses (on two fresh builds,
+  score disjunctions 3.8%); the same answers.
+- A disjunction group whose candidate mask holds at least 64 documents
+  first counts, bit-sliced four words at a time, how many of its heavier
+  terms each candidate holds, and keeps only the candidates holding enough
+  of them to reach the bar (with the bounds of the lightest terms, chosen
+  per group, as slack), before weighing any of them. The
+  answers are the same by construction. Score and `full_score`
+  disjunctions answer 9.8% and 9.6% more queries per cycle (no PGO), their
+  25 slowest forms in 20-34% fewer cycles; other styles never reach it.
+- A disjunction's container reads find their page by a multiply rather
+  than a division, and take a group's slot count from the group rather
+  than its starts: disjunctions 2.7-2.8% more queries per cycle.
+- Together, with the loader's x86-64-v4 build and PGO on both sides, this
+  release answers 7.6% more queries per cycle than the last over the six
+  styles (score disjunctions 20.1%, `full_score` disjunctions 21.0%, score
+  conjunctions 3.1%, phrases 2.0%, `full_score` phrases 0.9%,
+  conjunctions 0.8%), and reads 4-16% fewer shared buffers a query (score
+  disjunctions 16%).
 - A dense term's grouped record (a term in at least a tenth of its
   segment's documents) holds a sub-range code for each 64-slot word of each
   grid, per pair of its group frontier: the least rounded length of the
