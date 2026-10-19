@@ -322,6 +322,8 @@ pub struct LazyBlob {
     source: Box<dyn Source>,
     /// The source's bytes per page, zero when it pins none.
     page_len: usize,
+    /// `page_len`'s reciprocal for [`Self::page_of`].
+    page_inv: u64,
     /// Open [`Self::open_span`]s.
     spans: Cell<u32>,
     /// The outermost span open or last opened, numbering them from 1.
@@ -362,6 +364,18 @@ impl std::fmt::Debug for LazyBlob {
     }
 }
 
+/// `ceil(2^64 / n)` for [`LazyBlob::page_of`] (0 for `n` of 0 or 1: no
+/// pages, or pages of a byte, divided by `n` itself). With
+/// `e = inv * n - 2^64 < n`, `floor(x * inv / 2^64)` is
+/// `floor(x / n + x * e / (n * 2^64))`, which is `x / n` for every
+/// `x < 2^64 / n`: a blob's offsets, far below.
+fn page_inverse(n: usize) -> u64 {
+    if n <= 1 {
+        return 0;
+    }
+    (u64::MAX / n as u64) + 1
+}
+
 impl LazyBlob {
     /// A blob of `source`'s bytes, none loaded yet.
     pub fn new(source: Box<dyn Source>) -> Self {
@@ -370,6 +384,7 @@ impl LazyBlob {
         let data = NonNull::new(Box::into_raw(bytes).cast::<u8>()).expect("a boxed slice");
         let page_len = source.page_len();
         Self {
+            page_inv: page_inverse(page_len),
             data,
             len,
             chunks: (0..len.div_ceil(CHUNK).div_ceil(64))
@@ -580,6 +595,20 @@ impl LazyBlob {
         self.page_len
     }
 
+    /// The page holding byte `at` (`at / page_len`, `page_len` nonzero),
+    /// by a multiply rather than a division: 10-20 cycles of a
+    /// disjunction's container read on x86-64, twice per container.
+    #[inline(always)]
+    fn page_of(&self, at: usize) -> usize {
+        debug_assert!(self.page_len > 0 && at <= self.len);
+        if self.page_inv == 0 {
+            return at / self.page_len;
+        }
+        let page = ((at as u128 * u128::from(self.page_inv)) >> 64) as usize;
+        debug_assert_eq!(page, at / self.page_len);
+        page
+    }
+
     /// The page pinned `i`th of those the open span holds (see
     /// [`Self::pin_mark`]).
     #[inline]
@@ -710,7 +739,7 @@ impl LazyBlob {
     fn get_kind(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         if self.spans.get() > 0 && from < to && self.page_len > 0 {
             let n = self.page_len;
-            let page = from / n;
+            let page = self.page_of(from);
             let known = self.pages[page % PAGE_MEMO].get();
             if known.page == page && known.span == self.span.get() && to <= page * n + known.len {
                 self.touch(page);
@@ -782,8 +811,8 @@ impl LazyBlob {
     /// place on its page, else stitched.
     fn in_place(&self, from: usize, to: usize, kind: Kind) -> Result<&[u8]> {
         let n = self.page_len;
-        let first = from / n;
-        if (to - 1) / n == first
+        let first = self.page_of(from);
+        if self.page_of(to - 1) == first
             && let Some((data, len)) = self.page(first, kind)?
         {
             let within = from - first * n;
@@ -984,7 +1013,7 @@ impl<'a> Bytes<'a> {
                 if n == 0 {
                     return len;
                 }
-                ((at + from) / n * n + n - at).min(len)
+                (blob.page_of(at + from) * n + n - at).min(len)
             }
         }
     }
@@ -1172,6 +1201,40 @@ impl Source for PinningSource {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn page_inverse_divides_exactly() {
+        let at_most = 1usize << 44;
+        for n in (2..64).chain([
+            4096,
+            8000,
+            8136,
+            8160,
+            8168,
+            8192,
+            16_384,
+            32_744,
+            65_536,
+            1 << 20,
+        ]) {
+            let inv = u128::from(super::page_inverse(n));
+            let page = |x: usize| ((x as u128 * inv) >> 64) as usize;
+            let mut xs = vec![0, 1, n - 1, n, n + 1, at_most - 1, at_most];
+            for k in [1usize, 2, 3, 1000, 123_457, (at_most / n) - 1, at_most / n] {
+                xs.extend([k * n - 1, k * n, k * n + 1, k * n + n / 2]);
+            }
+            let mut x = 0x9e37_79b9_7f4a_7c15usize;
+            for _ in 0..2000 {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                xs.push(x % at_most);
+            }
+            for x in xs {
+                assert_eq!(page(x), x / n, "{x} / {n}");
+            }
+        }
+    }
+
     use super::*;
     use std::rc::Rc;
 

@@ -92,6 +92,10 @@
       "owner": "ben",
       "evidence": "Original Stannum implementation: reading script/dump-segments.py's dumps for the offline replay."
     },
+    "bench/src/lencode.rs": {
+      "owner": "ben",
+      "evidence": "Original Stannum implementation: a census of per-posting length codes kept beside TF buckets (variants of which postings carry one and how a length is kept), replaying a walk's length and bucket reads."
+    },
     "bench/src/lib.rs": {
       "owner": "ben",
       "evidence": "Original Stannum implementation: the offline replay and kernel benchmarks of the query engine."

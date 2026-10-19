@@ -35,8 +35,8 @@ PAGE_SIZE = 8192
 PAGE_HEADER = 24
 SPECIAL_SIZE = 8
 MAGIC = 0x4C445032
-# Page layout 18 (17 and 18 changed the segments' records, not the pages).
-VERSION = 18
+# Page layout 19 (17 to 19 changed the segments' records, not the pages).
+VERSION = 19
 KIND_META = 1
 KIND_RUN = 3
 SPEC_BYTES = 8

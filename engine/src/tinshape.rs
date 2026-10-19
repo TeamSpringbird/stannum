@@ -79,6 +79,104 @@ impl Part {
 /// Where a query reads: `(part, blob offset, length)` per read.
 pub trait Touch {
     fn touch(&mut self, part: Part, at: usize, len: usize);
+
+    /// Whether the walk reports [`Touch::census_length`] and
+    /// [`Touch::census_tf`] (a lab census of what a length code kept in the
+    /// TF tail would save; off everywhere else, so the walk computes
+    /// nothing for it).
+    #[inline]
+    fn census(&self) -> bool {
+        false
+    }
+
+    /// A candidate reads its length class or its length (see
+    /// [`LengthRead`]).
+    #[inline]
+    fn census_length(&mut self, _read: &LengthRead<'_>) {}
+
+    /// The walk reads buckets from a TF tail (see [`TfRead`]).
+    #[inline]
+    fn census_tf(&mut self, _read: &TfRead) {}
+}
+
+/// Which length read a [`LengthRead`] is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LengthKind {
+    /// A led walk's class read, after the candidate's buckets.
+    ClassLed,
+    /// A disjunction's class read before its buckets (bounded by its
+    /// terms' blocks alone).
+    ClassOrFirst,
+    /// A disjunction's class read after its buckets.
+    ClassOrAfter,
+    /// A DL read, for the candidate's exact score.
+    Dl,
+}
+
+/// Where a scoring term the candidate holds keeps its bucket, and what its
+/// record is, for the census of length codes ([`Touch::census_length`]).
+#[derive(Clone, Copy, Debug, Default)]
+pub struct HeldTf {
+    /// The term's TF tail's offset in the blob, and its record's.
+    pub tf: usize,
+    pub record: usize,
+    /// The bit its block's (or group's) buckets start at in the TF tail,
+    /// their width (0: no bucket is stored there), and the block's first
+    /// posting index.
+    pub start_bit: usize,
+    pub width: u32,
+    pub first: u32,
+    /// The block's (or group's) postings.
+    pub count: u32,
+    /// The candidate's posting index in the term, and the term's postings.
+    pub index: u32,
+    pub df: u32,
+    /// Whether the term's buckets vary (its largest is above 0).
+    pub tail: bool,
+    /// Whether the record has no TF tail at all (one posting).
+    pub single: bool,
+    /// Whether the record carries its documents' lengths.
+    pub carrier: bool,
+    /// Whether the candidate's bucket in it was read.
+    pub read: bool,
+    /// The term's bound of the candidate (a disjunction reads the highest
+    /// first).
+    pub bound: f32,
+}
+
+/// A length-class or DL read, for the census of length codes in the TF
+/// tail ([`Touch::census_length`]).
+#[derive(Clone, Copy, Debug)]
+pub struct LengthRead<'r> {
+    pub kind: LengthKind,
+    /// The class byte, or the DL block header and the packed length.
+    pub at: usize,
+    pub at2: usize,
+    /// The document's length.
+    pub length: u32,
+    /// The shortest length at which the candidate, as read so far and
+    /// against the threshold of the moment, is cut; `u32::MAX` when it is
+    /// not cut at its own length.
+    pub cut_at: u32,
+    /// The scoring terms the candidate holds.
+    pub held: &'r [HeldTf],
+}
+
+/// A read of buckets from a TF tail ([`Touch::census_tf`]): bits
+/// `from_bit..to_bit` of the tail of the record at `record` (tail at
+/// `tf`), in the block whose buckets start at `start_bit`, `width` bits
+/// each, from posting `first`.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TfRead {
+    pub tf: usize,
+    pub record: usize,
+    pub start_bit: usize,
+    pub width: u32,
+    pub first: u32,
+    pub from_bit: usize,
+    pub to_bit: usize,
+    pub tail: bool,
+    pub df: u32,
 }
 
 /// Reads recorded nowhere, for timing.
@@ -3447,6 +3545,100 @@ mod tests {
                     .iter()
                     .all(|m| answers[1].iter().any(|(_, t)| t == m))
             );
+        }
+    }
+
+    /// A candidate holding a scoring term whose record carries length codes
+    /// (page layout 19, at most a twentieth of the documents) is bounded by its
+    /// length class read beside its buckets in the TF tail, not from the DL
+    /// sidecar's class plane; the answers are the same as without codes.
+    #[test]
+    fn length_codes_in_the_tf_tail_replace_class_reads() {
+        let n = 6_000u32;
+        let docs: Vec<Tid> = (0..n)
+            .map(|i| Tid {
+                block: i / 10,
+                offset: (i % 10) as u16 + 1,
+            })
+            .collect();
+        // Mostly long documents, a few short ones that win.
+        let lengths: Vec<u32> = (0..n).map(|i| if i % 97 == 0 { 3 } else { 300 }).collect();
+        // Term t holds positions 0..tf: "t0 t1" needs t1 at 1, so tf 2.
+        let members = vec![
+            (0..n as usize)
+                .filter(|r| r % 29 == 0 || r % 97 == 0)
+                .map(|r| (r, 1 + (r % 3) as u32))
+                .collect::<Vec<_>>(),
+            (0..n as usize)
+                .filter(|r| r % 37 == 0 || r % 97 == 0)
+                .map(|r| (r, 2 + (r % 2) as u32))
+                .collect(),
+        ];
+        assert!(
+            members
+                .iter()
+                .all(|m| m.len() as u64 * segment::tinshape::postings::CODE_SHARE <= u64::from(n))
+        );
+        let all: Vec<usize> = (0..n as usize).collect();
+        let names = vec!["t0".to_owned(), "t1".to_owned()];
+        let scorers: Vec<(String, TermScorer)> = members
+            .iter()
+            .enumerate()
+            .map(|(t, m)| {
+                let scorer = TermScorer::from_statistics(
+                    u64::from(n),
+                    m.len() as u64,
+                    1.0,
+                    Bm25Params::default(),
+                    250.0,
+                )
+                .unwrap();
+                (names[t].clone(), scorer)
+            })
+            .collect();
+        let nodes = [
+            Node::And(vec![Node::Term(0), Node::Term(1)]),
+            Node::Or(vec![Node::Term(0), Node::Term(1)]),
+            Node::Span {
+                slots: vec![0, 1],
+                query: SpanQuery::phrase([0, 1]),
+            },
+        ];
+        for node in &nodes {
+            let mut answers = Vec::new();
+            for length_codes in [false, true] {
+                let options = Options {
+                    grid_min_postings: 0,
+                    inline_lengths_min_documents: u32::MAX,
+                    length_codes,
+                    ..Options::default()
+                };
+                let blob = build_part(
+                    &docs,
+                    &lengths,
+                    &members,
+                    &all,
+                    &vec![false; n as usize],
+                    options,
+                );
+                let segment = Segment::parse(&blob).unwrap();
+                let mut reads = AreaReads::default();
+                let got = top_k(&segment, node, &names, &scorers, 10, &mut reads).unwrap();
+                let classes = reads.reads[Part::DlClasses as usize];
+                if length_codes {
+                    assert_eq!(classes, 0, "{node:?}: {classes} class reads with codes");
+                } else {
+                    assert!(classes > 0, "{node:?}: no class read without codes");
+                }
+                answers.push(
+                    got.rows
+                        .iter()
+                        .map(|(s, t)| (s.to_bits(), *t))
+                        .collect::<Vec<_>>(),
+                );
+            }
+            assert_eq!(answers[0], answers[1], "{node:?}");
+            assert_eq!(answers[0].len(), 10, "{node:?}");
         }
     }
 
